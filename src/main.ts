@@ -188,6 +188,129 @@ export default class WitnessPlugin extends Plugin {
 				};
 			}
 		);
+
+		// Register edit_file tool
+		this.mcpServer.tool(
+			'edit_file',
+			'Find and replace text in a file (surgical edits)',
+			{
+				path: z.string().describe('Path to the file relative to vault root'),
+				find: z.string().describe('Text to find (exact match)'),
+				replace: z.string().describe('Text to replace with'),
+			},
+			async ({ path, find, replace }) => {
+				const file = this.app.vault.getAbstractFileByPath(path);
+				if (!file) {
+					throw new Error('File not found');
+				}
+				const content = await this.app.vault.read(file as any);
+
+				// Check if find text exists
+				if (!content.includes(find)) {
+					throw new Error(`Text not found in file: "${find}"`);
+				}
+
+				// Replace all occurrences
+				const newContent = content.replace(new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), replace);
+				const occurrences = (content.match(new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+
+				await this.app.vault.modify(file as any, newContent);
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Successfully replaced ${occurrences} occurrence(s) in ${path}`,
+						},
+					],
+				};
+			}
+		);
+
+		// Register search tool
+		this.mcpServer.tool(
+			'search',
+			'Search for text across all files in the vault',
+			{
+				query: z.string().describe('Text to search for'),
+				caseSensitive: z.boolean().optional().describe('Case sensitive search (default: false)'),
+				path: z.string().optional().describe('Limit search to specific folder (default: entire vault)'),
+			},
+			async ({ query, caseSensitive = false, path }) => {
+				const allFiles = this.app.vault.getMarkdownFiles();
+				const results: Array<{ file: string; line: number; text: string }> = [];
+
+				// Filter by path if specified
+				const filesToSearch = path
+					? allFiles.filter(f => f.path.startsWith(path))
+					: allFiles;
+
+				const searchRegex = new RegExp(
+					query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+					caseSensitive ? 'g' : 'gi'
+				);
+
+				for (const file of filesToSearch) {
+					const content = await this.app.vault.read(file);
+					const lines = content.split('\n');
+
+					lines.forEach((lineText, index) => {
+						if (searchRegex.test(lineText)) {
+							results.push({
+								file: file.path,
+								line: index + 1,
+								text: lineText.trim(),
+							});
+						}
+					});
+				}
+
+				const summary = `Found ${results.length} match(es) across ${filesToSearch.length} file(s)`;
+				const resultText = results.length > 0
+					? results.map(r => `${r.file}:${r.line} - ${r.text}`).join('\n')
+					: 'No matches found';
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `${summary}\n\n${resultText}`,
+						},
+					],
+				};
+			}
+		);
+
+		// Register execute_command tool
+		this.mcpServer.tool(
+			'execute_command',
+			'Execute an Obsidian command by ID',
+			{
+				commandId: z.string().describe('Command ID to execute (e.g., "editor:toggle-bold")'),
+			},
+			async ({ commandId }) => {
+				// Get all available commands
+				const commands = (this.app as any).commands.commands;
+
+				if (!commands[commandId]) {
+					// List available commands if the requested one doesn't exist
+					const availableCommands = Object.keys(commands).slice(0, 20).join(', ');
+					throw new Error(`Command not found: ${commandId}. Available commands (first 20): ${availableCommands}...`);
+				}
+
+				// Execute the command
+				await (this.app as any).commands.executeCommandById(commandId);
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Successfully executed command: ${commandId}`,
+						},
+					],
+				};
+			}
+		);
 	}
 
 	private async handleMCPRequest(req: IncomingMessage, res: ServerResponse) {
