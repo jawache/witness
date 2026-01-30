@@ -281,6 +281,42 @@ export default class WitnessPlugin extends Plugin {
 			}
 		);
 
+		// Register find_files tool
+		this.mcpServer.tool(
+			'find_files',
+			'Find files by filename pattern (fast, name-only search)',
+			{
+				pattern: z.string().describe('Pattern to match in filename (case-insensitive)'),
+				path: z.string().optional().describe('Limit search to specific folder (default: entire vault)'),
+			},
+			async ({ pattern, path }) => {
+				const allFiles = this.app.vault.getMarkdownFiles();
+
+				// Filter by path if specified
+				const filesToSearch = path
+					? allFiles.filter(f => f.path.startsWith(path))
+					: allFiles;
+
+				// Search in filename only (not content)
+				const searchRegex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+				const matches = filesToSearch.filter(f => searchRegex.test(f.name) || searchRegex.test(f.path));
+
+				const summary = `Found ${matches.length} file(s) matching "${pattern}"`;
+				const resultText = matches.length > 0
+					? matches.map(f => f.path).join('\n')
+					: 'No matching files found';
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `${summary}\n\n${resultText}`,
+						},
+					],
+				};
+			}
+		);
+
 		// Register execute_command tool
 		this.mcpServer.tool(
 			'execute_command',
