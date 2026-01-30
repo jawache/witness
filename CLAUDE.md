@@ -351,6 +351,85 @@ cat test-vault/.obsidian/community-plugins.json
 - `README.md` - User-facing documentation
 - `CLAUDE.md` - This file (technical guide for AI assistants)
 - `src/main.ts` - Main plugin implementation
+- `DEVLOG` - Development log with dated entries
+- `PHASE1-COMPLETE.md` - Phase 1 completion summary
+
+## Development Process
+
+### Session Wrap-Up Protocol
+
+At the end of each development session, use the `/wrap-up` slash command or follow this process:
+
+1. **Update DEVLOG**
+   - Add new dated entry at the bottom
+   - Format: `## YYYY-MM-DD - Session Title`
+   - Include: objectives, what was built, challenges, learnings, statistics
+   - Write narratively, capturing the journey not just the commits
+
+2. **Update CLAUDE.md**
+   - Add new learnings to relevant sections
+   - Update Phase status if changed
+   - Document any new patterns or pitfalls discovered
+
+3. **Update README.md** (if needed)
+   - Add new features to feature list
+   - Update installation instructions if changed
+   - Add new examples or usage patterns
+
+4. **Commit Everything**
+   - Review all changes with `git status`
+   - Create comprehensive commit message
+   - Include Co-Authored-By line
+
+5. **Create Session Summary**
+   - Statistics (commits, files changed, lines added)
+   - Key achievements
+   - Blockers encountered and resolved
+   - Next session priorities
+
+### DEVLOG Format
+
+```markdown
+## YYYY-MM-DD - Session Title
+
+**Objective**: Clear statement of what we set out to do
+
+### What We Built
+
+Bulleted list of concrete deliverables
+
+### The Journey
+
+Narrative of the development process, including:
+- Key decisions and why
+- Problems encountered
+- Debugging process
+- Breakthroughs and insights
+
+### Technical Achievements
+
+Specific technical wins
+
+### Key Learnings
+
+Lessons that will help future development
+
+### Statistics
+
+Quantitative measures of progress
+
+### Next Steps
+
+What's coming in the next session
+
+### Reflections
+
+Meta-observations about the process
+
+---
+
+*End of log entry*
+```
 
 ## Development Log
 

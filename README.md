@@ -15,12 +15,23 @@ The plugin helps you move information from chaos to order, with AI assistance to
 
 ## Features
 
-### Current (Phase 1)
+### Current (Phase 1) ✅ COMPLETE
 
 - **MCP Server**: Runs inside Obsidian, no external dependencies
-- **File Operations**: Read, write, and list files in your vault via AI
+- **File Operations**: Read, write, edit, and list files in your vault via AI
+- **Full-Text Search**: Search across all markdown files with optional filters
+- **Command Execution**: Execute any Obsidian command via AI
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
 - **Privacy First**: Everything runs locally, no external API calls
+
+**6 MCP Tools Available**:
+
+- `read_file` - Read file contents
+- `write_file` - Create/modify files
+- `list_files` - Browse directories
+- `edit_file` - Find and replace text
+- `search` - Full-text search with filters
+- `execute_command` - Run Obsidian commands
 
 ### Coming Soon
 

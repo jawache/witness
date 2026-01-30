@@ -1,0 +1,132 @@
+# Witness Development Log
+
+This log chronicles the development journey of Witness, an Obsidian plugin that implements the Model Context Protocol (MCP) to enable AI-assisted vault management.
+
+---
+
+## 2026-01-30 - Phase 1: MCP Server Implementation
+
+**Objective**: Create an Obsidian plugin that acts as an MCP server running inside Obsidian, enabling Claude Desktop to interact with the vault.
+
+### What We Built
+
+Implemented a complete MCP server with 6 core tools:
+
+1. **read_file** - Read any file from the vault
+2. **write_file** - Create or modify files
+3. **list_files** - Browse directory contents
+4. **edit_file** - Find and replace text (surgical edits)
+5. **search** - Full-text search across all markdown files
+6. **execute_command** - Execute any Obsidian command by ID
+
+### The Journey
+
+**Morning: Architecture Decision**
+
+Started with a critical architectural choice: Should the plugin BE the MCP server (Approach A) or should it be an external server connecting via REST API (Approach B)?
+
+Decision: **Approach A** - Plugin runs the MCP server directly inside Obsidian. This means:
+- Zero dependencies on other plugins
+- Direct access to Obsidian's Vault API
+- HTTP server running in Electron process
+- More complex but more powerful
+
+**Early Development: Initial Implementation**
+
+First attempt was manual JSON-RPC message handling. Messy and error-prone. Quickly pivoted to using the official `@modelcontextprotocol/sdk` package for proper protocol compliance.
+
+Initial tools: read_file, write_file, list_files working with manual testing via curl.
+
+**The Great Session Management Mystery**
+
+Hit a major blocker: "Server already initialized" error on every connection attempt from Claude Desktop. Spent considerable time investigating:
+
+1. **Red Herring #1**: Node version issues
+   - mcp-remote showed "File is not defined" errors
+   - Tried forcing Node v24 via PATH environment
+   - Turned out to be irrelevant - still works with Node v18
+
+2. **The Real Problem**: Session Management
+   - Was creating a new transport for EVERY HTTP request
+   - Should create ONE transport per SESSION
+   - Maintain a `Map<sessionId, transport>`
+   - Only call `mcpServer.connect(transport)` once per session
+   - Reuse transport for all subsequent requests in that session
+
+**Breakthrough**: Found the pattern in SDK examples at `node_modules/@modelcontextprotocol/sdk/dist/esm/examples/server/simpleStreamableHttp.js`. The key insight: StreamableHTTP is stateful. Sessions span multiple HTTP requests.
+
+**Second Major Issue**: SSE Stream 404 Errors
+
+Tools were listing successfully, but then Claude Desktop couldn't establish the SSE (Server-Sent Events) stream for receiving notifications.
+
+Problem: Only handling POST requests to `/mcp`, not GET requests.
+
+Solution: StreamableHTTP uses dual endpoints:
+- POST for sending JSON-RPC messages
+- GET for SSE streams (receiving)
+
+Also had to handle GET requests differently - no body to parse.
+
+**Late Afternoon: Completing the Tool Set**
+
+With the connection working, implemented the remaining three tools:
+
+1. **edit_file**: Find/replace with proper regex escaping for literal matching
+2. **search**: Full-text search with optional case sensitivity and path filtering
+3. **execute_command**: Direct access to Obsidian's command system
+
+All tools use Zod schemas for parameter validation, letting the SDK auto-generate JSON Schema.
+
+### Technical Achievements
+
+- **Proper Session Management**: Map-based transport tracking
+- **SSE Support**: Bidirectional communication working
+- **Type Safety**: Zod validation for all parameters
+- **Error Handling**: Clear error messages with helpful suggestions
+- **Zero External Dependencies**: No REST API plugins needed
+
+### Documentation Created
+
+- **README.md**: User-facing installation and usage guide
+- **CLAUDE.md**: Technical implementation details for AI assistants
+- **PHASE1-COMPLETE.md**: Comprehensive tool reference with examples
+- **test-tools.sh**: Testing verification script
+- **DEVLOG**: This file
+
+### Key Learnings
+
+1. **StreamableHTTP is stateful**: Don't create new transports per request
+2. **Dual endpoints matter**: Handle both POST and GET for full functionality
+3. **Read the SDK examples**: The answers are often in the source code
+4. **Test methodically**: Health endpoint + logs + screenshots = debugging trinity
+5. **Document as you go**: Future you will thank present you
+
+### Statistics
+
+- **4 commits** in main branch
+- **452 lines** of TypeScript
+- **6 tools** implemented
+- **100%** Phase 1 objectives met
+
+### Next Steps
+
+Phase 2: Remote Access
+- Cloudflare Tunnel integration
+- WhatsApp/Telegram bot connection
+- Mobile support
+- Multi-user authentication
+- Security hardening
+
+### Reflections
+
+The session management bug was frustrating but educational. It reinforced the importance of:
+- Reading official examples thoroughly
+- Not assuming the first error message is the real problem
+- Systematic debugging rather than guessing
+- Writing documentation that captures the "why" not just the "what"
+
+Phase 1 is complete and working beautifully. The foundation is solid for Phase 2 expansion.
+
+---
+
+*End of log entry*
