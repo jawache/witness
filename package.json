@@ -1,0 +1,35 @@
+{
+  "name": "witness-obsidian-plugin",
+  "version": "0.1.0",
+  "description": "AI companion for managing your Obsidian vault - Chaos to Order",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "mcp",
+    "ai",
+    "knowledge-management"
+  ],
+  "author": "Asim Hussain",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@typescript-eslint/eslint-plugin": "^6.15.0",
+    "@typescript-eslint/parser": "^6.15.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.19.10",
+    "obsidian": "latest",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.3",
+    "raw-body": "^3.0.0",
+    "zod": "^4.3.6"
+  }
+}
