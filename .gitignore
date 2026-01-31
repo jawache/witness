@@ -19,3 +19,11 @@ main.js.map
 
 # Local settings (not shared)
 .claude/settings.local.json
+
+# Obsidian workspace state (changes frequently, not needed in repo)
+**/workspace.json
+
+# Test outputs (created by integration tests, not fixtures)
+test/vault/*-temp.md
+test/vault/move-conflict-*.md
+test/vault/subfolder/moved-file.md
