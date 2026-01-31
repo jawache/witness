@@ -6,5 +6,7 @@
   "orientationPath": "README.md",
   "customCommands": [],
   "coreToolDescriptions": {},
-  "enableCommandFallback": false
+  "enableCommandFallback": false,
+  "enableTunnel": true,
+  "tunnelUrl": "https://bought-funky-charges-reservation.trycloudflare.com"
 }
