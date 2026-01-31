@@ -1,5 +1,18 @@
 {
   "mcpPort": 3000,
   "mcpEnabled": true,
-  "authToken": ""
+  "authToken": "",
+  "serverInstructions": "Before performing any operations, use get_orientation to load the orientation document. This helps understand the chaos/order system and current vault state.",
+  "orientationPath": "README.md",
+  "customCommands": [
+    {
+      "name": "copy-obsidian-url",
+      "description": "Copies the internal obsidian URL for the current file to the clipboard",
+      "commandId": "workspace:copy-url",
+      "readOnly": true,
+      "enabled": true
+    }
+  ],
+  "coreToolDescriptions": {},
+  "enableCommandFallback": false
 }
