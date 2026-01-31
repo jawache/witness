@@ -41,7 +41,8 @@ The plugin will eventually have native understanding of this structure to surfac
 - HTTP server running inside Obsidian
 - MCP protocol implementation
 - Core file operations: read, write, edit, list, search
-- Test using `test-vault/` directory
+- Demo vault at `demo-vault/` for manual testing
+- Integration tests in `test/` directory
 
 **Phase 2:** Chat Interface Integration
 - Connect to WhatsApp/Telegram
@@ -58,24 +59,44 @@ The plugin will eventually have native understanding of this structure to surfac
 
 ## Testing Strategy
 
-**Automated Testing with MCP Servers:**
+**Two Vaults:**
+
+- `demo-vault/` - For manual testing, playing around, development demos
+- `test/vault/` - Minimal, stable vault for automated integration tests
+
+**Integration Test Suite:**
+Located in `test/integration/`, uses Vitest to test MCP endpoints against a running Obsidian instance.
+
+```bash
+# 1. Build and install plugin in test vault
+npm run test:install-plugin
+
+# 2. Launch Obsidian with test vault (port 3001)
+npm run test:start-obsidian
+
+# 3. Run integration tests
+npm test
+```
+
+**Test Vault Requirements:**
+- Uses port 3001 (different from demo-vault's 3000)
+- Contains files with known, fixed content for assertions
+- Should not be modified during normal development
+- Can be reset via git if needed
+
+**MCP Automation Tools (for UI testing):**
+
 - `applescript-mcp` - Launch/quit Obsidian programmatically
 - `peekaboo` - Capture screenshots of Obsidian UI for verification
 - MCP servers configured in `~/.claude/claude_code_config.json`
 
-**Test Vault:**
-- Located at `test-vault/` with proper chaos/order structure
-- Use for development and testing file operations
-- Sample files demonstrate the organizational system
+**Manual Testing Flow:**
 
-**Critical Testing Flow:**
-1. Build plugin: `source ~/.zshrc && npm run build`
-2. Install in test vault: `cp main.js manifest.json test-vault/.obsidian/plugins/witness/`
-3. Enable plugin: `echo '["witness"]' > test-vault/.obsidian/community-plugins.json`
-4. Launch Obsidian with test-vault
-5. Verify plugin loads and HTTP server responds
-6. Test MCP endpoints
-7. Capture screenshots to verify UI state
+1. Build plugin: `npm run build`
+2. Install in demo vault: `cp main.js manifest.json demo-vault/.obsidian/plugins/witness/`
+3. Launch Obsidian with demo-vault
+4. Verify plugin loads and HTTP server responds
+5. Test MCP endpoints manually
 
 ### Phase 1 Status: ✅ COMPLETE
 
@@ -229,7 +250,7 @@ osascript -e 'tell application "Obsidian" to quit'
 open -a Obsidian
 
 # Open specific vault (use path, not vault name)
-open "obsidian://open?path=$(pwd)/test-vault"
+open "obsidian://open?path=$(pwd)/demo-vault"
 
 # Check if Obsidian is running
 osascript << 'EOF'
@@ -318,10 +339,10 @@ curl -s http://localhost:3000/health
 # Should return: {"status":"ok","plugin":"witness"}
 
 # Check if plugin created data file (indicates it loaded)
-cat test-vault/.obsidian/plugins/witness/data.json
+cat demo-vault/.obsidian/plugins/witness/data.json
 
 # Check enabled plugins
-cat test-vault/.obsidian/community-plugins.json
+cat demo-vault/.obsidian/community-plugins.json
 ```
 
 **Developer Console:**
@@ -347,7 +368,8 @@ cat test-vault/.obsidian/community-plugins.json
 ## Key Files
 
 - `witness-overview.md` - Complete vision, architecture, and requirements document
-- `test-vault/` - Test vault with chaos/order structure
+- `demo-vault/` - Demo vault for manual testing (chaos/order structure)
+- `test/` - Integration test suite and minimal test vault
 - `README.md` - User-facing documentation
 - `CLAUDE.md` - This file (technical guide for AI assistants)
 - `src/main.ts` - Main plugin implementation

@@ -1,0 +1,10 @@
+{
+  "mcpPort": 3001,
+  "mcpEnabled": true,
+  "authToken": "",
+  "serverInstructions": "Test vault for integration testing.",
+  "orientationPath": "README.md",
+  "customCommands": [],
+  "coreToolDescriptions": {},
+  "enableCommandFallback": false
+}

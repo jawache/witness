@@ -129,4 +129,100 @@ Phase 1 is complete and working beautifully. The foundation is solid for Phase 2
 
 ---
 
+## 2026-01-31 - Integration Test Suite
+
+**Objective**: Build automated testing infrastructure to verify MCP tools work correctly end-to-end.
+
+### What We Built
+
+A complete integration test suite using Vitest that tests all MCP tools against a running Obsidian instance.
+
+**Test Infrastructure:**
+- `test/vault/` - Minimal, stable test vault with known fixed content
+- `test/integration/mcp-client.ts` - MCP protocol client for testing
+- `test/integration/mcp.test.ts` - 17 integration tests covering all tools
+- `test/vitest.config.ts` - Test configuration
+
+**Vault Reorganization:**
+- Renamed `test-vault/` → `demo-vault/` for manual testing and development
+- Created `test/vault/` for automated tests (port 3001)
+- Clear separation: demo vault can change freely, test vault stays stable
+
+**NPM Scripts:**
+- `npm test` - Run integration tests
+- `npm run test:watch` - Watch mode
+- `npm run test:start-obsidian` - Launch Obsidian with test vault
+- `npm run test:install-plugin` - Build and install plugin
+
+### The Journey
+
+**Design Decision: Integration vs Unit Tests**
+
+Considered two approaches:
+1. Mock-based unit tests - Fast but doesn't test real integration
+2. Integration tests against running Obsidian - Slower but tests actual behavior
+
+Chose integration tests because:
+- Most plugin logic is tightly coupled to Obsidian's API
+- Mocking the vault would be complex and fragile
+- We need to verify files are actually created/modified
+- MCP protocol nuances are hard to unit test
+
+**Test Verification Strategy**
+
+Made sure tests actually verify results, not just check for errors:
+- `write_file`: Writes content, then reads it back to verify
+- `edit_file`: Performs edit, then reads file to confirm change
+- `read_file`: Checks returned content matches known file content
+- `search`: Verifies correct files appear in results
+
+**Initial Test Failures**
+
+First run: 14/17 tests passed. The 3 failures were because MCP returns errors via `isError: true` flag rather than throwing exceptions. Updated tests to check `result.isError` instead of `expect(...).rejects.toThrow()`.
+
+Second run: 17/17 tests pass.
+
+### Technical Achievements
+
+- **True End-to-End Testing**: Tests run against real Obsidian instance
+- **All Tools Covered**: 17 tests for 8 MCP tools
+- **Error Case Coverage**: Tests both success and error paths
+- **Result Verification**: Tests read back data to verify operations worked
+- **Clean Separation**: Test vault isolated from demo/development vault
+
+### Test Coverage Summary
+
+| Tool | Tests | Verification |
+|------|-------|--------------|
+| read_file | 2 | Content matches known file |
+| write_file | 2 | Read back verifies content |
+| edit_file | 2 | Read back verifies changes |
+| list_files | 2 | Expected files present |
+| search | 2 | Correct files in results |
+| find_files | 2 | Pattern matching works |
+| get_orientation | 1 | Returns orientation doc |
+| execute_command | 2 | Success/error handling |
+
+### Key Learnings
+
+1. **MCP error handling**: Errors return `isError: true`, not exceptions
+2. **TypeScript config**: Need to exclude test directory from main build
+3. **Vitest config**: `sequence.concurrent: false` for sequential tests
+4. **Port separation**: Test vault uses 3001 to avoid conflicts with demo
+
+### Statistics
+
+- **17 tests** all passing
+- **166ms** test duration
+- **2 vaults** (demo + test)
+- **4 npm scripts** for testing workflow
+
+### Next Steps
+
+- Consider adding GitHub Actions CI
+- Add more edge case tests as bugs are found
+- Potential: Screenshot tests for UI verification
+
+---
+
 *End of log entry*

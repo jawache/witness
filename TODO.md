@@ -6,14 +6,19 @@
 Build automated testing for the MCP server and plugin functionality. We've implemented a lot of features without proper test coverage.
 
 ### MCP Server Logging to File
-Store MCP server logs in the Obsidian plugin folder (`test-vault/.obsidian/plugins/witness/logs/`). Benefits:
+Store MCP server logs in the Obsidian plugin folder (e.g., `.obsidian/plugins/witness/logs/`). Benefits:
 - Claude Code can read logs directly to debug issues
 - End users can easily access and share logs for bug reports
 - No need to dig through system logs or Developer Console
 
 ## Features
 
+### Move/Rename File Tool
+
+Add `move_file` MCP tool to move or rename files within the vault. Currently would require delete + create which loses metadata and is error-prone. Obsidian has `vault.rename()` API for this.
+
 ### Remote Access via Internet Tunnel
+
 Implement Cloudflare Tunnel or similar for remote access to the MCP server from Claude Desktop/Mobile when away from home network. See `docs/features/remote-access-tunneling.md` for details.
 
 ## Completed
