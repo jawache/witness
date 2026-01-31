@@ -2,9 +2,6 @@
 
 ## High Priority
 
-### Testing Infrastructure
-Build automated testing for the MCP server and plugin functionality. We've implemented a lot of features without proper test coverage.
-
 ### MCP Server Logging to File
 Store MCP server logs in the Obsidian plugin folder (e.g., `.obsidian/plugins/witness/logs/`). Benefits:
 - Claude Code can read logs directly to debug issues
@@ -32,3 +29,4 @@ Implement Cloudflare Tunnel or similar for remote access to the MCP server from 
 - [x] File picker for orientation document
 - [x] Server instructions configuration
 - [x] Debug logging for MCP requests
+- [x] Integration test suite (17 tests, all MCP tools covered)
