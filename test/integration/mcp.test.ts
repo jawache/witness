@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { MCPClient, isServerRunning, getTextContent } from './mcp-client';
+import * as fs from 'fs';
+import * as path from 'path';
 
 describe('MCP Server Integration Tests', () => {
   let client: MCPClient;
@@ -222,6 +224,60 @@ describe('MCP Server Integration Tests', () => {
       });
       expect(result.isError).toBe(true);
       expect(getTextContent(result)).toContain('not found');
+    });
+  });
+
+  describe('logging', () => {
+    // Helper to get log file path
+    const getLogPath = () => {
+      const today = new Date().toISOString().split('T')[0];
+      // Tests run from test/ directory, so go up one level to find test/vault
+      return path.resolve(
+        __dirname,
+        '..',
+        'vault',
+        '.obsidian',
+        'plugins',
+        'witness',
+        'logs',
+        `mcp-${today}.log`
+      );
+    };
+
+    it('should write logs to file', async () => {
+      // Wait a moment for logs to flush (buffer flushes every second)
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      const logPath = getLogPath();
+      expect(fs.existsSync(logPath)).toBe(true);
+
+      // Read and verify log content
+      const logContent = fs.readFileSync(logPath, 'utf-8');
+
+      // Should contain MCP-related entries from our test session
+      expect(logContent).toContain('[MCP]');
+      expect(logContent).toContain('POST /mcp');
+      expect(logContent).toContain('initialize');
+
+      // Should contain tool calls we made
+      expect(logContent).toContain('read_file');
+
+      // Should have proper log format with timestamps
+      expect(logContent).toMatch(/\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    });
+
+    it('should log error cases', async () => {
+      // Wait for logs to flush
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      const logPath = getLogPath();
+      const logContent = fs.readFileSync(logPath, 'utf-8');
+
+      // Should log when file lookups fail
+      expect(logContent).toContain('NOT FOUND');
+
+      // Should log the path that wasn't found
+      expect(logContent).toContain('does-not-exist.md');
     });
   });
 });
