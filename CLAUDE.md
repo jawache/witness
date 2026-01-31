@@ -110,15 +110,16 @@ All Core MCP Tools Implemented:
 - ✅ `search` - Full-text search across vault
 - ✅ `execute_command` - Trigger Obsidian commands via MCP
 - ✅ `find_files` - Search files by name pattern
+- ✅ `move_file` - Move or rename files within vault
 - ✅ `get_orientation` - Load orientation document
 - ✅ HTTP health endpoint responding
 - ✅ Plugin loads in Obsidian on startup
 - ✅ Files created via MCP visible in Obsidian UI
 - ✅ Session management and SSE streams working correctly
 - ✅ File-based logging to `.obsidian/plugins/witness/logs/`
-- ✅ Integration test suite (19 tests)
+- ✅ Integration test suite (23 tests)
 
-Total: 8 MCP tools registered and available
+Total: 9 MCP tools registered and available
 
 ## MCP Implementation Details
 
