@@ -121,6 +121,18 @@ All Core MCP Tools Implemented:
 
 Total: 9 MCP tools registered and available
 
+### Phase 2 Status: 🚧 IN PROGRESS
+
+Remote Access via Cloudflare Tunnel:
+
+- ✅ Cloudflare Quick Tunnel integration
+- ✅ Auto-install cloudflared binary to `~/.witness/bin/`
+- ✅ Tunnel URL displayed in settings with copy button
+- ✅ Regenerate tunnel button in settings UI
+- ✅ Tunnel status indicator (connecting/connected/error)
+- ⏳ WhatsApp/Telegram bot (not started)
+- ⏳ Authentication token enforcement (not started)
+
 ## MCP Implementation Details
 
 ### StreamableHTTP Protocol & Session Management
@@ -266,6 +278,54 @@ this.mcpServer.tool(
 ```
 
 The SDK automatically generates JSON Schema from Zod definitions and handles request validation.
+
+### Cloudflare Quick Tunnel
+
+The plugin can expose the MCP server to the internet via Cloudflare's Quick Tunnel feature.
+
+**Implementation:**
+
+1. **Binary Management**: cloudflared binary is installed to `~/.witness/bin/` on first use
+2. **Tunnel Lifecycle**: Starts on plugin load (if enabled), stops on unload
+3. **URL Notification**: Logs URL to console and shows Obsidian notification
+4. **Settings UI**: Display URL with copy button, regenerate button, status indicator
+
+**Key Code Pattern:**
+
+```typescript
+// Ensure cloudflared is installed to a known location
+private getCloudflaredBinPath(): string {
+  const binDir = path.join(os.homedir(), '.witness', 'bin');
+  return path.join(binDir, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
+}
+
+// Install if needed, then tell the package where to find it
+const installed = await this.ensureCloudflaredInstalled();
+useCloudflared(binPath);  // Point package to our binary
+
+// Start quick tunnel
+const tunnel = Tunnel.quick(`http://localhost:${port}`);
+tunnel.once('url', (url) => { /* Save and display URL */ });
+```
+
+**Why Custom Binary Path:**
+Inside Obsidian's Electron environment, the cloudflared npm package can't resolve its default binary path correctly. We work around this by:
+
+1. Installing to `~/.witness/bin/cloudflared`
+2. Using `useCloudflared()` to point the package to our location
+
+**Testing Tunnel:**
+
+```bash
+# Check health via tunnel
+curl https://your-random-words.trycloudflare.com/health
+
+# Test MCP endpoint
+curl -X POST https://your-random-words.trycloudflare.com/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","method":"initialize",...}'
+```
 
 ## Obsidian Automation Guide
 

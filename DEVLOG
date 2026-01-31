@@ -373,4 +373,142 @@ this.mcpServer.tool(
 
 ---
 
+## 2026-01-31 - Cloudflare Quick Tunnel Integration
+
+**Objective**: Enable remote access to the Witness MCP server via Cloudflare's Quick Tunnel feature.
+
+### What We Built
+
+A complete tunneling solution that exposes the local MCP server to the internet, allowing Claude to connect from anywhere.
+
+**Key Features:**
+
+- **Zero-Config Tunneling**: Toggle "Enable Quick Tunnel" in settings and get a public URL
+- **Auto-Install**: cloudflared binary automatically downloads on first use to `~/.witness/bin/`
+- **Settings UI**: Display current URL with copy button, regenerate button, status indicator
+- **Notifications**: Toast notification when tunnel connects with URL
+
+**Architecture:**
+
+```text
+Claude (anywhere)
+    ↓ HTTPS
+Cloudflare Edge (random-words.trycloudflare.com)
+    ↓ Tunnel
+cloudflared binary (running on user's machine)
+    ↓ HTTP
+Witness Plugin (localhost:3000)
+    ↓
+Obsidian Vault
+```
+
+### The Journey
+
+**Challenge: Binary Path Resolution**
+
+Initial attempt failed with:
+
+```text
+spawn /Applications/Obsidian.app/Contents/Resources/electron.asar/bin/cloudflared ENOENT
+```
+
+The cloudflared npm package couldn't find its binary inside Obsidian's Electron environment. The package looks for the binary relative to its module location, but bundling breaks this.
+
+**Solution: Custom Binary Management**
+
+1. Install cloudflared to a known, stable location: `~/.witness/bin/cloudflared`
+2. Use the package's `use()` function to point to our binary location
+3. Handle first-run installation automatically
+
+```typescript
+private getCloudflaredBinPath(): string {
+  const binDir = path.join(os.homedir(), '.witness', 'bin');
+  return path.join(binDir, 'cloudflared');
+}
+
+await installCloudflared(binPath);  // Install to our location
+useCloudflared(binPath);            // Tell package where to find it
+```
+
+**esbuild Configuration**
+
+Also needed to update `esbuild.config.mjs` to handle `node:` prefixed module specifiers:
+
+```javascript
+const nodeBuiltins = builtins.flatMap(m => [m, `node:${m}`]);
+// Add platform: "node" for proper Node.js target
+```
+
+### Implementation Details
+
+**Settings Interface:**
+
+```typescript
+interface WitnessSettings {
+  // ... existing
+  enableTunnel: boolean;
+  tunnelUrl: string | null;
+}
+```
+
+**Tunnel Lifecycle:**
+
+1. On plugin load: Start tunnel if enabled
+2. On plugin unload: Stop tunnel gracefully
+3. Regenerate: Stop, wait, restart
+
+**Event Handling:**
+
+```typescript
+const tunnel = Tunnel.quick(localUrl);
+tunnel.once('url', async (url) => {
+  this.settings.tunnelUrl = url;
+  await this.saveSettings();
+  new Notice(`Tunnel connected: ${url}/mcp`);
+});
+tunnel.once('connected', (conn) => {
+  this.logger.info(`Connected to ${conn.location}`);
+});
+tunnel.on('exit', (code) => {
+  this.tunnelProcess = null;
+  this.tunnelStatus = 'disconnected';
+});
+```
+
+### Testing
+
+Verified end-to-end:
+
+```bash
+# Health check through tunnel
+curl https://bought-funky-charges-reservation.trycloudflare.com/health
+# {"status":"ok","plugin":"witness"}
+
+# MCP initialize through tunnel
+curl -X POST .../mcp -H "Accept: application/json, text/event-stream" -d '...'
+# {"result":{"protocolVersion":"2024-11-05",...}}
+```
+
+### Key Learnings
+
+1. **Electron bundling breaks module paths**: Can't rely on npm package default paths inside Obsidian
+2. **Quick Tunnels are truly zero-config**: No Cloudflare account needed
+3. **Binary installation is idempotent**: Package handles version checking
+4. **URL changes on restart**: Users must reconfigure Claude after Obsidian restart
+
+### Statistics
+
+- **1 npm package** added (cloudflared)
+- **~150 lines** of tunnel code
+- **4 new settings** (enableTunnel, tunnelUrl, status, UI elements)
+- **~50MB** cloudflared binary (downloaded on first use)
+
+### Next Steps
+
+- Authentication token enforcement for tunnel
+- WhatsApp/Telegram bot integration
+- Permanent URLs via Named Tunnel (documentation)
+
+---
+
 *End of log entry*

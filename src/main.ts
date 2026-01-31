@@ -1,10 +1,14 @@
-import { App, Plugin, PluginSettingTab, Setting, Modal, SuggestModal, normalizePath } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Modal, SuggestModal, normalizePath, Notice } from 'obsidian';
 import * as http from 'http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import getRawBody from 'raw-body';
+import { Tunnel, bin as cloudflaredBin, install as installCloudflared, use as useCloudflared } from 'cloudflared';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 /**
  * Logger that writes to both console and file.
@@ -150,6 +154,9 @@ interface WitnessSettings {
 	};
 	// Command fallback system (opt-in)
 	enableCommandFallback: boolean;
+	// Remote access via Cloudflare Tunnel
+	enableTunnel: boolean;
+	tunnelUrl: string | null;
 }
 
 const DEFAULT_SETTINGS: WitnessSettings = {
@@ -160,7 +167,9 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	orientationPath: '',
 	customCommands: [],
 	coreToolDescriptions: {},
-	enableCommandFallback: false
+	enableCommandFallback: false,
+	enableTunnel: false,
+	tunnelUrl: null,
 }
 
 export default class WitnessPlugin extends Plugin {
@@ -169,6 +178,9 @@ export default class WitnessPlugin extends Plugin {
 	private mcpServer: McpServer | null = null;
 	private transports: Map<string, StreamableHTTPServerTransport> = new Map();
 	private logger: MCPLogger;
+	private tunnelProcess: Tunnel | null = null;
+	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
+	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -190,10 +202,16 @@ export default class WitnessPlugin extends Plugin {
 		if (this.settings.mcpEnabled) {
 			await this.startMCPServer();
 		}
+
+		// Start tunnel if enabled (after MCP server is up)
+		if (this.settings.enableTunnel && this.settings.mcpEnabled) {
+			this.startTunnel();
+		}
 	}
 
 	async onunload() {
 		this.logger.info('Witness plugin unloading');
+		this.stopTunnel();
 		this.stopMCPServer();
 		await this.logger.close();
 	}
@@ -823,6 +841,186 @@ export default class WitnessPlugin extends Plugin {
 			this.httpServer = null;
 		}
 	}
+
+	/**
+	 * Get the path where we store the cloudflared binary
+	 */
+	private getCloudflaredBinPath(): string {
+		// Store cloudflared binary in a dedicated location in the user's home directory
+		// This avoids issues with Obsidian's bundled environment
+		const binDir = path.join(os.homedir(), '.witness', 'bin');
+		const binName = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
+		return path.join(binDir, binName);
+	}
+
+	/**
+	 * Ensure cloudflared binary is installed
+	 */
+	private async ensureCloudflaredInstalled(): Promise<boolean> {
+		const binPath = this.getCloudflaredBinPath();
+		const binDir = path.dirname(binPath);
+
+		// Create directory if it doesn't exist
+		if (!fs.existsSync(binDir)) {
+			this.logger.info(`Creating cloudflared bin directory: ${binDir}`);
+			fs.mkdirSync(binDir, { recursive: true });
+		}
+
+		// Check if binary already exists
+		if (fs.existsSync(binPath)) {
+			this.logger.info(`cloudflared binary found at: ${binPath}`);
+			useCloudflared(binPath);
+			return true;
+		}
+
+		// Install cloudflared
+		this.logger.info(`Installing cloudflared to: ${binPath}`);
+		new Notice('Installing cloudflared... This may take a moment.');
+
+		try {
+			await installCloudflared(binPath);
+			this.logger.info('cloudflared installed successfully');
+			useCloudflared(binPath);
+			return true;
+		} catch (err: any) {
+			this.logger.error('Failed to install cloudflared:', err.message);
+			new Notice(`Failed to install cloudflared: ${err.message}`);
+			return false;
+		}
+	}
+
+	/**
+	 * Start a Cloudflare Quick Tunnel to expose the MCP server
+	 */
+	async startTunnel() {
+		if (this.tunnelProcess) {
+			this.logger.info('Tunnel already running');
+			return;
+		}
+
+		if (!this.httpServer) {
+			this.logger.error('Cannot start tunnel: MCP server not running');
+			return;
+		}
+
+		this.tunnelStatus = 'connecting';
+		this.logger.info('Starting Cloudflare Quick Tunnel...');
+		if (this.tunnelStatusCallback) {
+			this.tunnelStatusCallback('connecting', null);
+		}
+
+		// Ensure cloudflared is installed
+		const installed = await this.ensureCloudflaredInstalled();
+		if (!installed) {
+			this.tunnelStatus = 'error';
+			if (this.tunnelStatusCallback) {
+				this.tunnelStatusCallback('error', null);
+			}
+			return;
+		}
+
+		try {
+			// Start quick tunnel pointing to our local MCP server
+			const localUrl = `http://localhost:${this.settings.mcpPort}`;
+			this.tunnelProcess = Tunnel.quick(localUrl);
+
+			// Listen for the URL event
+			this.tunnelProcess.once('url', async (url: string) => {
+				this.logger.info(`Cloudflare Tunnel URL: ${url}`);
+				this.logger.info(`MCP endpoint available at: ${url}/mcp`);
+				this.settings.tunnelUrl = url;
+				this.tunnelStatus = 'connected';
+				await this.saveSettings();
+
+				// Show notification
+				new Notice(`Tunnel connected: ${url}/mcp`);
+
+				if (this.tunnelStatusCallback) {
+					this.tunnelStatusCallback('connected', url);
+				}
+			});
+
+			// Listen for connected event
+			this.tunnelProcess.once('connected', (connection: { id: string; ip: string; location: string }) => {
+				this.logger.info(`Tunnel connected to ${connection.location} (${connection.ip})`);
+			});
+
+			// Handle tunnel errors
+			this.tunnelProcess.on('error', (err: Error) => {
+				this.logger.error('Tunnel error:', err.message);
+				this.tunnelStatus = 'error';
+				if (this.tunnelStatusCallback) {
+					this.tunnelStatusCallback('error', null);
+				}
+			});
+
+			// Handle tunnel exit
+			this.tunnelProcess.on('exit', (code: number | null) => {
+				this.logger.info(`Tunnel process exited with code: ${code}`);
+				this.tunnelProcess = null;
+				this.tunnelStatus = 'disconnected';
+				if (this.tunnelStatusCallback) {
+					this.tunnelStatusCallback('disconnected', null);
+				}
+			});
+
+		} catch (err) {
+			this.logger.error('Failed to start tunnel:', err);
+			this.tunnelStatus = 'error';
+			this.tunnelProcess = null;
+			if (this.tunnelStatusCallback) {
+				this.tunnelStatusCallback('error', null);
+			}
+		}
+	}
+
+	/**
+	 * Stop the Cloudflare tunnel
+	 */
+	stopTunnel() {
+		if (!this.tunnelProcess) {
+			return;
+		}
+
+		this.logger.info('Stopping Cloudflare Tunnel...');
+		try {
+			this.tunnelProcess.stop();
+			this.tunnelProcess = null;
+			this.tunnelStatus = 'disconnected';
+			this.settings.tunnelUrl = null;
+			this.logger.info('Tunnel stopped');
+		} catch (err) {
+			this.logger.error('Error stopping tunnel:', err);
+		}
+	}
+
+	/**
+	 * Regenerate the tunnel (stop and restart)
+	 */
+	async regenerateTunnel() {
+		this.logger.info('Regenerating tunnel...');
+		this.stopTunnel();
+		// Small delay to ensure clean shutdown
+		await new Promise(resolve => setTimeout(resolve, 500));
+		await this.startTunnel();
+	}
+
+	/**
+	 * Get current tunnel status
+	 */
+	getTunnelStatus(): { status: string; url: string | null } {
+		return {
+			status: this.tunnelStatus,
+			url: this.settings.tunnelUrl,
+		};
+	}
+
+	/**
+	 * Set a callback to be notified of tunnel status changes
+	 */
+	onTunnelStatusChange(callback: (status: string, url: string | null) => void) {
+		this.tunnelStatusCallback = callback;
+	}
 }
 
 // File picker modal with search functionality
@@ -1186,6 +1384,95 @@ class WitnessSettingTab extends PluginSettingTab {
 					this.display(); // Refresh UI
 				}));
 		});
+
+		// ===== REMOTE ACCESS =====
+		containerEl.createEl('h3', {text: 'Remote Access'});
+
+		// Tunnel enable toggle
+		new Setting(containerEl)
+			.setName('Enable Quick Tunnel')
+			.setDesc('Create a Cloudflare tunnel to access your vault from anywhere (URL changes on restart)')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableTunnel)
+				.onChange(async (value) => {
+					this.plugin.settings.enableTunnel = value;
+					await this.plugin.saveSettings();
+
+					if (value) {
+						if (this.plugin.settings.mcpEnabled) {
+							await this.plugin.startTunnel();
+						} else {
+							new Notice('Enable MCP Server first to use tunnel');
+							this.plugin.settings.enableTunnel = false;
+							toggle.setValue(false);
+							await this.plugin.saveSettings();
+						}
+					} else {
+						this.plugin.stopTunnel();
+					}
+					this.display(); // Refresh to show/hide URL section
+				}));
+
+		// Show tunnel URL and controls when enabled
+		if (this.plugin.settings.enableTunnel) {
+			const { status, url } = this.plugin.getTunnelStatus();
+
+			// Status indicator
+			const statusText = status === 'connected' ? '● Connected' :
+				status === 'connecting' ? '○ Connecting...' :
+				status === 'error' ? '● Error' : '○ Disconnected';
+			const statusColor = status === 'connected' ? 'var(--text-success)' :
+				status === 'connecting' ? 'var(--text-warning)' :
+				status === 'error' ? 'var(--text-error)' : 'var(--text-muted)';
+
+			const statusSetting = new Setting(containerEl)
+				.setName('Status')
+				.setDesc(statusText);
+			statusSetting.descEl.style.color = statusColor;
+
+			// URL display with copy button
+			if (url) {
+				const mcpUrl = `${url}/mcp`;
+				const urlSetting = new Setting(containerEl)
+					.setName('Your MCP URL')
+					.setDesc(mcpUrl);
+
+				urlSetting.addButton(button => button
+					.setButtonText('Copy URL')
+					.onClick(() => {
+						navigator.clipboard.writeText(mcpUrl);
+						new Notice('URL copied to clipboard!');
+					}));
+			}
+
+			// Regenerate button
+			new Setting(containerEl)
+				.setName('Regenerate Tunnel')
+				.setDesc('Get a new tunnel URL')
+				.addButton(button => button
+					.setButtonText('Regenerate')
+					.onClick(async () => {
+						await this.plugin.regenerateTunnel();
+						// Wait a bit for the tunnel to come up
+						setTimeout(() => this.display(), 3000);
+					}));
+
+			// Warning note
+			const noteEl = containerEl.createEl('div', {
+				cls: 'setting-item-description',
+				text: '⚠️ This URL changes when Obsidian restarts. For a permanent URL, set up a Cloudflare Named Tunnel.'
+			});
+			noteEl.style.marginBottom = '20px';
+			noteEl.style.color = 'var(--text-warning)';
+
+			// Subscribe to status changes to refresh UI
+			this.plugin.onTunnelStatusChange((newStatus, newUrl) => {
+				// Refresh the display when status changes
+				if (newStatus === 'connected' || newStatus === 'error') {
+					this.display();
+				}
+			});
+		}
 
 		// ===== COMMAND FALLBACK =====
 		containerEl.createEl('h3', {text: 'Advanced Options'});

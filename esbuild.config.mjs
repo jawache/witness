@@ -11,6 +11,9 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 
+// Add node: prefixed versions of builtins for cloudflared and other packages
+const nodeBuiltins = builtins.flatMap(m => [m, `node:${m}`]);
+
 const context = await esbuild.context({
 	banner: {
 		js: banner,
@@ -31,13 +34,14 @@ const context = await esbuild.context({
 		"@lezer/common",
 		"@lezer/highlight",
 		"@lezer/lr",
-		...builtins],
+		...nodeBuiltins],
 	format: "cjs",
 	target: "es2018",
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
 	outfile: "main.js",
+	platform: "node",
 });
 
 if (prod) {
