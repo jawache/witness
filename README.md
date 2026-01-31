@@ -24,20 +24,22 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
 - **Privacy First**: Everything runs locally, no external API calls
 
-**6 MCP Tools Available**:
+**8 MCP Tools Available**:
 
 - `read_file` - Read file contents
 - `write_file` - Create/modify files
 - `list_files` - Browse directories
 - `edit_file` - Find and replace text
 - `search` - Full-text search with filters
+- `find_files` - Search files by name pattern
 - `execute_command` - Run Obsidian commands
+- `get_orientation` - Load your vault's orientation document
 
 ### Coming Soon
 
-- **Smart Editing**: Find/replace and semantic search
-- **Command Execution**: Trigger any Obsidian command via AI
+- **Move/Rename**: Move and rename files within the vault
 - **Chat Interface**: Connect via WhatsApp/Telegram for mobile access
+- **Remote Access**: Cloudflare Tunnel for access from anywhere
 - **Heartbeat Prompts**: Daily/weekly prompts to keep your vault fresh
 - **Chaos Monitoring**: Get notified when unprocessed items pile up
 
@@ -156,8 +158,14 @@ npm run dev            # Development mode with watch
 ### Testing
 
 ```bash
+# Build and install plugin in test vault
+npm run test:install-plugin
+
 # Start Obsidian with test vault
-open -a Obsidian test-vault/
+npm run test:start-obsidian
+
+# Run integration tests (19 tests)
+npm test
 
 # Check server status
 curl http://localhost:3000/health
@@ -165,6 +173,19 @@ curl http://localhost:3000/health
 
 ### Logs
 
+MCP server logs are written to your vault's plugin folder:
+
+```text
+.obsidian/plugins/witness/logs/mcp-YYYY-MM-DD.log
+```
+
+This makes it easy to:
+
+- Share logs for bug reports
+- Debug issues without Developer Console
+- Let AI assistants read logs directly
+
+Additional log locations:
 - Obsidian console: `Cmd+Option+I` → Console tab
 - Claude Desktop: `~/Library/Logs/Claude/mcp-server-witness.log`
 
@@ -220,13 +241,16 @@ This is different from other Obsidian MCP servers that run externally and connec
 ## Roadmap
 
 ### Phase 1: MCP Server ✅
+
 - [x] Basic plugin scaffold
 - [x] HTTP server implementation
-- [x] File operations (read, write, list)
+- [x] File operations (read, write, list, edit)
 - [x] Claude Desktop integration
-- [ ] Edit operations (find/replace)
-- [ ] Search functionality
-- [ ] Command execution
+- [x] Full-text search
+- [x] Command execution
+- [x] Orientation document system
+- [x] File-based logging
+- [x] Integration test suite (19 tests)
 
 ### Phase 2: Remote Access
 - [ ] Cloudflare Tunnel integration

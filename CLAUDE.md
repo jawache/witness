@@ -109,12 +109,16 @@ All Core MCP Tools Implemented:
 - ✅ `edit_file` - Find/replace for surgical file updates
 - ✅ `search` - Full-text search across vault
 - ✅ `execute_command` - Trigger Obsidian commands via MCP
+- ✅ `find_files` - Search files by name pattern
+- ✅ `get_orientation` - Load orientation document
 - ✅ HTTP health endpoint responding
 - ✅ Plugin loads in Obsidian on startup
 - ✅ Files created via MCP visible in Obsidian UI
 - ✅ Session management and SSE streams working correctly
+- ✅ File-based logging to `.obsidian/plugins/witness/logs/`
+- ✅ Integration test suite (19 tests)
 
-Total: 6 MCP tools registered and available
+Total: 8 MCP tools registered and available
 
 ## MCP Implementation Details
 
@@ -206,7 +210,37 @@ private async handleMCPRequest(req: IncomingMessage, res: ServerResponse) {
 5. SSE stream opened for receiving notifications
 6. Bidirectional communication established
 
-**Logs:** `~/Library/Logs/Claude/mcp-server-witness.log`
+**Logs:**
+
+- Plugin logs: `.obsidian/plugins/witness/logs/mcp-YYYY-MM-DD.log`
+- Claude Desktop logs: `~/Library/Logs/Claude/mcp-server-witness.log`
+
+### File-Based Logging
+
+The plugin writes logs to both console and file using the `MCPLogger` class:
+
+```typescript
+// Log levels available
+this.logger.info('Plugin loaded');      // [INFO] General information
+this.logger.error('Failed', err);       // [ERROR] Errors
+this.logger.debug('Button clicked');    // [DEBUG] Debug info
+this.logger.mcp('POST /mcp');           // [MCP] Protocol-level logs
+```
+
+**Log Format:**
+
+```text
+[2026-01-31T17:49:56.003Z] [INFO] Witness plugin loaded
+[2026-01-31T17:50:07.214Z] [MCP] POST /mcp
+[2026-01-31T17:50:07.242Z] [MCP] read_file called with path: "test.md"
+```
+
+**Implementation Details:**
+
+- Buffered writes (flushes every 1 second or 50 entries)
+- Date-based log files for easy management
+- Logs directory auto-created on first write
+- Graceful shutdown flushes remaining logs
 
 ### Tool Registration
 

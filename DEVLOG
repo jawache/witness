@@ -225,4 +225,74 @@ Second run: 17/17 tests pass.
 
 ---
 
+## 2026-01-31 - File-Based MCP Logging
+
+**Objective**: Implement file-based logging so logs are accessible without Obsidian's Developer Console.
+
+### What We Built
+
+A logging system that writes MCP server logs to files in the plugin directory.
+
+**MCPLogger Class:**
+
+- Writes to both console AND file simultaneously
+- Buffered writes (flushes every 1 second or 50 entries)
+- Date-based log files: `mcp-YYYY-MM-DD.log`
+- Log levels: INFO, ERROR, DEBUG, MCP
+- ISO timestamps for all entries
+- Graceful shutdown flushes remaining logs
+
+**Log Location:**
+
+```text
+.obsidian/plugins/witness/logs/mcp-2026-01-31.log
+```
+
+**Log Format:**
+
+```text
+[2026-01-31T17:49:56.003Z] [INFO] Witness plugin loaded
+[2026-01-31T17:50:07.214Z] [MCP] POST /mcp
+[2026-01-31T17:50:07.242Z] [MCP] read_file called with path: "test.md"
+```
+
+### Benefits
+
+1. **Debugging**: Claude Code can read logs directly to help debug issues
+2. **Bug Reports**: Users can easily share logs when reporting problems
+3. **No Console Required**: No need to open Developer Console to see what's happening
+4. **History**: Date-based files provide historical record
+
+### Testing
+
+Added 2 new integration tests (now 19 total):
+
+1. **should write logs to file** - Verifies log file exists and contains expected entries
+2. **should log error cases** - Verifies failed operations are logged
+
+### Implementation Details
+
+Replaced all `console.log` and `console.error` calls with `this.logger.*` calls:
+
+- `this.logger.info()` - General information
+- `this.logger.error()` - Error conditions
+- `this.logger.debug()` - Debug info
+- `this.logger.mcp()` - MCP protocol-level logging
+
+The logger buffers writes to avoid I/O overhead on every log call.
+
+### Statistics
+
+- **2 new tests** added
+- **19 tests** total, all passing
+- **~150 lines** of logging code
+- **1 new class** (MCPLogger)
+
+### Next Steps
+
+- Implement `move_file` tool for moving/renaming files
+- Consider log rotation for large vaults
+
+---
+
 *End of log entry*
