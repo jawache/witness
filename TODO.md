@@ -2,11 +2,7 @@
 
 ## High Priority
 
-### MCP Server Logging to File
-Store MCP server logs in the Obsidian plugin folder (e.g., `.obsidian/plugins/witness/logs/`). Benefits:
-- Claude Code can read logs directly to debug issues
-- End users can easily access and share logs for bug reports
-- No need to dig through system logs or Developer Console
+(None currently)
 
 ## Features
 
@@ -30,3 +26,4 @@ Implement Cloudflare Tunnel or similar for remote access to the MCP server from 
 - [x] Server instructions configuration
 - [x] Debug logging for MCP requests
 - [x] Integration test suite (17 tests, all MCP tools covered)
+- [x] MCP server logging to file (.obsidian/plugins/witness/logs/)

@@ -1,10 +1,123 @@
-import { App, Plugin, PluginSettingTab, Setting, Modal, SuggestModal } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Modal, SuggestModal, normalizePath } from 'obsidian';
 import * as http from 'http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import getRawBody from 'raw-body';
+
+/**
+ * Logger that writes to both console and file.
+ * Logs are stored in .obsidian/plugins/witness/logs/
+ */
+class MCPLogger {
+	private app: App;
+	private pluginId: string;
+	private buffer: string[] = [];
+	private flushTimeout: NodeJS.Timeout | null = null;
+	private readonly FLUSH_INTERVAL = 1000; // Flush every second
+	private readonly MAX_BUFFER = 50; // Or when buffer reaches 50 entries
+
+	constructor(app: App, pluginId: string) {
+		this.app = app;
+		this.pluginId = pluginId;
+	}
+
+	private getLogPath(): string {
+		const date = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+		return normalizePath(`.obsidian/plugins/${this.pluginId}/logs/mcp-${date}.log`);
+	}
+
+	private formatMessage(level: string, message: string, data?: any): string {
+		const timestamp = new Date().toISOString();
+		let line = `[${timestamp}] [${level}] ${message}`;
+		if (data !== undefined) {
+			line += ` ${typeof data === 'string' ? data : JSON.stringify(data)}`;
+		}
+		return line;
+	}
+
+	private scheduleFlush() {
+		if (this.flushTimeout) return;
+		this.flushTimeout = setTimeout(() => this.flush(), this.FLUSH_INTERVAL);
+	}
+
+	private async flush() {
+		this.flushTimeout = null;
+		if (this.buffer.length === 0) return;
+
+		const lines = this.buffer.join('\n') + '\n';
+		this.buffer = [];
+
+		try {
+			const logPath = this.getLogPath();
+			const adapter = this.app.vault.adapter;
+
+			// Ensure logs directory exists
+			const logsDir = normalizePath(`.obsidian/plugins/${this.pluginId}/logs`);
+			if (!await adapter.exists(logsDir)) {
+				await adapter.mkdir(logsDir);
+			}
+
+			// Append to log file
+			if (await adapter.exists(logPath)) {
+				const existing = await adapter.read(logPath);
+				await adapter.write(logPath, existing + lines);
+			} else {
+				await adapter.write(logPath, lines);
+			}
+		} catch (err) {
+			// Don't recurse - just log to console if file write fails
+			console.error('[MCPLogger] Failed to write log file:', err);
+		}
+	}
+
+	private log(level: string, message: string, data?: any) {
+		const formatted = this.formatMessage(level, message, data);
+
+		// Always log to console
+		if (level === 'ERROR') {
+			console.error(formatted);
+		} else {
+			console.log(formatted);
+		}
+
+		// Buffer for file write
+		this.buffer.push(formatted);
+
+		// Flush if buffer is full, otherwise schedule
+		if (this.buffer.length >= this.MAX_BUFFER) {
+			this.flush();
+		} else {
+			this.scheduleFlush();
+		}
+	}
+
+	info(message: string, data?: any) {
+		this.log('INFO', message, data);
+	}
+
+	error(message: string, data?: any) {
+		this.log('ERROR', message, data);
+	}
+
+	debug(message: string, data?: any) {
+		this.log('DEBUG', message, data);
+	}
+
+	mcp(message: string, data?: any) {
+		this.log('MCP', message, data);
+	}
+
+	// Force flush (call on plugin unload)
+	async close() {
+		if (this.flushTimeout) {
+			clearTimeout(this.flushTimeout);
+			this.flushTimeout = null;
+		}
+		await this.flush();
+	}
+}
 
 interface CustomCommandConfig {
 	name: string;           // MCP tool name
@@ -54,18 +167,22 @@ export default class WitnessPlugin extends Plugin {
 	private httpServer: http.Server | null = null;
 	private mcpServer: McpServer | null = null;
 	private transports: Map<string, StreamableHTTPServerTransport> = new Map();
+	private logger: MCPLogger;
 
 	async onload() {
 		await this.loadSettings();
 
-		console.log('Witness plugin loaded');
+		// Initialize logger
+		this.logger = new MCPLogger(this.app, this.manifest.id);
+
+		this.logger.info('Witness plugin loaded');
 
 		// Add settings tab
 		this.addSettingTab(new WitnessSettingTab(this.app, this));
 
 		// Add ribbon icon for quick access
 		this.addRibbonIcon('eye', 'Witness', () => {
-			console.log('Witness icon clicked');
+			this.logger.debug('Witness icon clicked');
 		});
 
 		// Start MCP server if enabled
@@ -74,9 +191,10 @@ export default class WitnessPlugin extends Plugin {
 		}
 	}
 
-	onunload() {
-		console.log('Witness plugin unloaded');
+	async onunload() {
+		this.logger.info('Witness plugin unloading');
 		this.stopMCPServer();
+		await this.logger.close();
 	}
 
 	async loadSettings() {
@@ -89,7 +207,7 @@ export default class WitnessPlugin extends Plugin {
 
 	async startMCPServer() {
 		if (this.httpServer || this.mcpServer) {
-			console.log('MCP server already running');
+			this.logger.info('MCP server already running');
 			return;
 		}
 
@@ -131,11 +249,11 @@ export default class WitnessPlugin extends Plugin {
 		});
 
 		this.httpServer.listen(this.settings.mcpPort, 'localhost', () => {
-			console.log(`Witness MCP server listening on http://localhost:${this.settings.mcpPort}`);
+			this.logger.info(`MCP server listening on http://localhost:${this.settings.mcpPort}`);
 		});
 
 		this.httpServer.on('error', (err) => {
-			console.error('MCP server error:', err);
+			this.logger.error('MCP server error:', err);
 		});
 	}
 
@@ -157,14 +275,14 @@ export default class WitnessPlugin extends Plugin {
 				readOnlyHint: true,
 			},
 			async ({ path }) => {
-				console.log(`[MCP] read_file called with path: "${path}"`);
+				this.logger.mcp(`read_file called with path: "${path}"`);
 				const file = this.app.vault.getAbstractFileByPath(path);
-				console.log(`[MCP] File lookup:`, file ? `Found: ${file.path}` : 'NOT FOUND');
+				this.logger.mcp(`File lookup:`, file ? `Found: ${file.path}` : 'NOT FOUND');
 				if (!file) {
 					throw new Error('File not found');
 				}
 				const content = await this.app.vault.read(file as any);
-				console.log(`[MCP] read_file success, length: ${content.length} chars`);
+				this.logger.mcp(`read_file success, length: ${content.length} chars`);
 				return {
 					content: [
 						{
@@ -424,25 +542,25 @@ export default class WitnessPlugin extends Plugin {
 				readOnlyHint: true,
 			},
 			async () => {
-				console.log('[MCP] get_orientation called');
+				this.logger.mcp('get_orientation called');
 				const orientationPath = this.settings.orientationPath;
-				console.log(`[MCP] orientationPath from settings: "${orientationPath}"`);
+				this.logger.mcp(`orientationPath from settings: "${orientationPath}"`);
 
 				if (!orientationPath) {
-					console.error('[MCP] No orientation document path configured');
+					this.logger.error('No orientation document path configured');
 					throw new Error('Orientation document path not configured in settings');
 				}
 
 				const file = this.app.vault.getAbstractFileByPath(orientationPath);
-				console.log(`[MCP] File lookup result:`, file ? `Found: ${file.path}` : 'NOT FOUND');
+				this.logger.mcp(`File lookup result:`, file ? `Found: ${file.path}` : 'NOT FOUND');
 
 				if (!file) {
-					console.error(`[MCP] File not found at path: ${orientationPath}`);
+					this.logger.error(`File not found at path: ${orientationPath}`);
 					throw new Error(`Orientation document not found at: ${orientationPath}. Please create this file or update the path in settings.`);
 				}
 
 				const content = await this.app.vault.read(file as any);
-				console.log(`[MCP] Successfully read file, length: ${content.length} chars`);
+				this.logger.mcp(`Successfully read file, length: ${content.length} chars`);
 
 				return {
 					content: [
@@ -554,16 +672,16 @@ export default class WitnessPlugin extends Plugin {
 	}
 
 	private async handleMCPRequest(req: IncomingMessage, res: ServerResponse) {
-		console.log(`[MCP] ${req.method} ${req.url}`);
-		console.log(`[MCP] Headers:`, JSON.stringify({
+		this.logger.mcp(`${req.method} ${req.url}`);
+		this.logger.mcp(`Headers:`, JSON.stringify({
 			'mcp-session-id': req.headers['mcp-session-id'],
 			'content-type': req.headers['content-type'],
 			'accept': req.headers['accept'],
 		}));
-		console.log(`[MCP] Active sessions: ${this.transports.size}`, Array.from(this.transports.keys()));
+		this.logger.mcp(`Active sessions: ${this.transports.size}`, Array.from(this.transports.keys()));
 
 		if (!this.mcpServer) {
-			console.error('[MCP] Server not initialized!');
+			this.logger.error('Server not initialized!');
 			res.writeHead(500);
 			res.end('MCP server not initialized');
 			return;
@@ -578,9 +696,9 @@ export default class WitnessPlugin extends Plugin {
 			if (req.method === 'POST') {
 				const bodyBuffer = await getRawBody(req);
 				body = JSON.parse(bodyBuffer.toString());
-				console.log(`[MCP] POST body method: ${body?.method}, id: ${body?.id}`);
+				this.logger.mcp(`POST body method: ${body?.method}, id: ${body?.id}`);
 			} else {
-				console.log(`[MCP] GET request (SSE stream) for session: ${sessionId}`);
+				this.logger.mcp(`GET request (SSE stream) for session: ${sessionId}`);
 			}
 
 			// Check if this is an initialize request
@@ -588,42 +706,42 @@ export default class WitnessPlugin extends Plugin {
 
 			// New session - create transport
 			if (!sessionId && isInitialize) {
-				console.log('[MCP] Creating new session (initialize request)');
+				this.logger.mcp('Creating new session (initialize request)');
 				const transport = new StreamableHTTPServerTransport({
 					sessionIdGenerator: () => `session-${Date.now()}-${Math.random()}`,
 					onsessioninitialized: (newSessionId) => {
-						console.log(`[MCP] Session initialized: ${newSessionId}`);
+						this.logger.mcp(`Session initialized: ${newSessionId}`);
 						this.transports.set(newSessionId, transport);
 					},
 				});
 
 				// Connect transport to server (only once per transport)
-				console.log('[MCP] Connecting transport to MCP server...');
+				this.logger.mcp('Connecting transport to MCP server...');
 				await this.mcpServer.connect(transport);
-				console.log('[MCP] Transport connected, handling initialize request...');
+				this.logger.mcp('Transport connected, handling initialize request...');
 
 				// Handle the initialize request
 				await transport.handleRequest(req, res, body);
-				console.log('[MCP] Initialize request handled');
+				this.logger.mcp('Initialize request handled');
 				return;
 			}
 
 			// Existing session - reuse transport
 			if (sessionId && this.transports.has(sessionId)) {
-				console.log(`[MCP] Using existing session: ${sessionId}`);
+				this.logger.mcp(`Using existing session: ${sessionId}`);
 				const transport = this.transports.get(sessionId)!;
 				await transport.handleRequest(req, res, body);
-				console.log(`[MCP] Request handled for session: ${sessionId}`);
+				this.logger.mcp(`Request handled for session: ${sessionId}`);
 				return;
 			}
 
 			// Unknown session
-			console.error(`[MCP] Unknown/expired session: ${sessionId}`);
-			console.error(`[MCP] Available sessions:`, Array.from(this.transports.keys()));
+			this.logger.error(`Unknown/expired session: ${sessionId}`);
+			this.logger.error(`Available sessions:`, Array.from(this.transports.keys()));
 			res.writeHead(400, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ error: 'Invalid or expired session' }));
 		} catch (err) {
-			console.error('[MCP] Error handling request:', err);
+			this.logger.error('Error handling request:', err);
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ error: 'Internal server error' }));
 		}
@@ -632,7 +750,7 @@ export default class WitnessPlugin extends Plugin {
 	stopMCPServer() {
 		// Close all transports
 		for (const [sessionId, transport] of this.transports) {
-			console.log(`Closing session: ${sessionId}`);
+			this.logger.info(`Closing session: ${sessionId}`);
 			transport.close();
 		}
 		this.transports.clear();
@@ -646,7 +764,7 @@ export default class WitnessPlugin extends Plugin {
 		// Close HTTP server
 		if (this.httpServer) {
 			this.httpServer.close(() => {
-				console.log('Witness MCP server stopped');
+				this.logger.info('MCP server stopped');
 			});
 			this.httpServer = null;
 		}
