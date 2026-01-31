@@ -145,6 +145,7 @@ interface WitnessSettings {
 		edit_file?: string;
 		search?: string;
 		find_files?: string;
+		move_file?: string;
 		execute_command?: string;
 	};
 	// Command fallback system (opt-in)
@@ -491,6 +492,59 @@ export default class WitnessPlugin extends Plugin {
 						{
 							type: 'text',
 							text: `${summary}\n\n${resultText}`,
+						},
+					],
+					isError: false,
+				};
+			}
+		);
+
+		// Register move_file tool (DESTRUCTIVE)
+		this.mcpServer.tool(
+			'move_file',
+			this.getToolDescription('move_file', 'Move or rename a file within the vault'),
+			{
+				from: z.string().describe('Current path of the file relative to vault root'),
+				to: z.string().describe('New path for the file relative to vault root'),
+			},
+			{
+				destructiveHint: true,
+			},
+			async ({ from, to }) => {
+				this.logger.mcp(`move_file called: "${from}" -> "${to}"`);
+				const file = this.app.vault.getAbstractFileByPath(from);
+
+				if (!file) {
+					this.logger.error(`move_file: source not found: ${from}`);
+					throw new Error(`Source file not found: ${from}`);
+				}
+
+				// Check if destination already exists
+				const existing = this.app.vault.getAbstractFileByPath(to);
+				if (existing) {
+					this.logger.error(`move_file: destination already exists: ${to}`);
+					throw new Error(`Destination already exists: ${to}`);
+				}
+
+				// Ensure parent directory exists for the destination
+				const destDir = to.substring(0, to.lastIndexOf('/'));
+				if (destDir) {
+					const parentFolder = this.app.vault.getAbstractFileByPath(destDir);
+					if (!parentFolder) {
+						// Create parent directories
+						this.logger.mcp(`Creating parent directory: ${destDir}`);
+						await this.app.vault.createFolder(destDir);
+					}
+				}
+
+				await this.app.vault.rename(file, to);
+				this.logger.mcp(`move_file success: "${from}" -> "${to}"`);
+
+				return {
+					content: [
+						{
+							type: 'text',
+							text: `Successfully moved ${from} to ${to}`,
 						},
 					],
 					isError: false,

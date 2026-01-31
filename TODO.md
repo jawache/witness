@@ -6,10 +6,6 @@
 
 ## Features
 
-### Move/Rename File Tool
-
-Add `move_file` MCP tool to move or rename files within the vault. Currently would require delete + create which loses metadata and is error-prone. Obsidian has `vault.rename()` API for this.
-
 ### Remote Access via Internet Tunnel
 
 Implement Cloudflare Tunnel or similar for remote access to the MCP server from Claude Desktop/Mobile when away from home network. See `docs/features/remote-access-tunneling.md` for details.
@@ -25,5 +21,6 @@ Implement Cloudflare Tunnel or similar for remote access to the MCP server from 
 - [x] File picker for orientation document
 - [x] Server instructions configuration
 - [x] Debug logging for MCP requests
-- [x] Integration test suite (17 tests, all MCP tools covered)
+- [x] Integration test suite (23 tests, all MCP tools covered)
 - [x] MCP server logging to file (.obsidian/plugins/witness/logs/)
+- [x] Move/rename file tool (move_file)

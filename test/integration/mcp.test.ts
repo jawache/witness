@@ -39,6 +39,7 @@ describe('MCP Server Integration Tests', () => {
       expect(toolNames).toContain('edit_file');
       expect(toolNames).toContain('search');
       expect(toolNames).toContain('find_files');
+      expect(toolNames).toContain('move_file');
       expect(toolNames).toContain('execute_command');
       expect(toolNames).toContain('get_orientation');
     });
@@ -193,6 +194,85 @@ describe('MCP Server Integration Tests', () => {
       const content = getTextContent(result);
 
       expect(content).toContain('nested.md');
+    });
+  });
+
+  describe('move_file', () => {
+    const moveTestFile = 'test-move-source.md';
+    const moveDestFile = 'test-move-dest.md';
+    const moveDestInFolder = 'subfolder/moved-file.md';
+
+    beforeAll(async () => {
+      // Create a file to move
+      await client.callTool('write_file', {
+        path: moveTestFile,
+        content: '# File to move\n\nThis will be moved.',
+      });
+    });
+
+    afterAll(async () => {
+      // Cleanup: try to remove test files (they may not exist)
+      // We can't delete, so just leave them - test vault can be reset via git
+    });
+
+    it('should move/rename a file', async () => {
+      const result = await client.callTool('move_file', {
+        from: moveTestFile,
+        to: moveDestFile,
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(getTextContent(result)).toContain('Successfully moved');
+
+      // Verify: old path should not exist (read should fail)
+      const oldResult = await client.callTool('read_file', { path: moveTestFile });
+      expect(oldResult.isError).toBe(true);
+
+      // Verify: new path should exist with correct content
+      const newResult = await client.callTool('read_file', { path: moveDestFile });
+      expect(newResult.isError).not.toBe(true);
+      expect(getTextContent(newResult)).toContain('File to move');
+    });
+
+    it('should move file to subfolder', async () => {
+      // First move back to original location for this test
+      await client.callTool('move_file', {
+        from: moveDestFile,
+        to: moveDestInFolder,
+      });
+
+      // Verify file is in subfolder
+      const result = await client.callTool('read_file', { path: moveDestInFolder });
+      expect(result.isError).not.toBe(true);
+      expect(getTextContent(result)).toContain('File to move');
+    });
+
+    it('should return error for non-existent source', async () => {
+      const result = await client.callTool('move_file', {
+        from: 'does-not-exist-for-move.md',
+        to: 'some-destination.md',
+      });
+      expect(result.isError).toBe(true);
+      expect(getTextContent(result)).toContain('not found');
+    });
+
+    it('should return error if destination exists', async () => {
+      // Create two files
+      await client.callTool('write_file', {
+        path: 'move-conflict-source.md',
+        content: 'Source',
+      });
+      await client.callTool('write_file', {
+        path: 'move-conflict-dest.md',
+        content: 'Destination exists',
+      });
+
+      const result = await client.callTool('move_file', {
+        from: 'move-conflict-source.md',
+        to: 'move-conflict-dest.md',
+      });
+      expect(result.isError).toBe(true);
+      expect(getTextContent(result)).toContain('already exists');
     });
   });
 

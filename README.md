@@ -24,7 +24,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
 - **Privacy First**: Everything runs locally, no external API calls
 
-**8 MCP Tools Available**:
+**9 MCP Tools Available**:
 
 - `read_file` - Read file contents
 - `write_file` - Create/modify files
@@ -32,12 +32,12 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - `edit_file` - Find and replace text
 - `search` - Full-text search with filters
 - `find_files` - Search files by name pattern
+- `move_file` - Move or rename files
 - `execute_command` - Run Obsidian commands
 - `get_orientation` - Load your vault's orientation document
 
 ### Coming Soon
 
-- **Move/Rename**: Move and rename files within the vault
 - **Chat Interface**: Connect via WhatsApp/Telegram for mobile access
 - **Remote Access**: Cloudflare Tunnel for access from anywhere
 - **Heartbeat Prompts**: Daily/weekly prompts to keep your vault fresh
@@ -164,7 +164,7 @@ npm run test:install-plugin
 # Start Obsidian with test vault
 npm run test:start-obsidian
 
-# Run integration tests (19 tests)
+# Run integration tests (23 tests)
 npm test
 
 # Check server status
@@ -250,7 +250,7 @@ This is different from other Obsidian MCP servers that run externally and connec
 - [x] Command execution
 - [x] Orientation document system
 - [x] File-based logging
-- [x] Integration test suite (19 tests)
+- [x] Integration test suite (23 tests)
 
 ### Phase 2: Remote Access
 - [ ] Cloudflare Tunnel integration

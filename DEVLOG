@@ -295,4 +295,82 @@ The logger buffers writes to avoid I/O overhead on every log call.
 
 ---
 
+## 2026-01-31 - Move/Rename File Tool
+
+**Objective**: Implement `move_file` MCP tool to move or rename files within the vault.
+
+### What We Built
+
+A new `move_file` MCP tool that enables AI assistants to move or rename files within the vault using Obsidian's native `vault.rename()` API.
+
+**Tool Implementation:**
+
+- Takes `from` (source path) and `to` (destination path) parameters
+- Uses Obsidian's `vault.rename()` for proper file system handling
+- Automatically creates parent directories if needed
+- Error handling for: source not found, destination already exists
+- Marked as destructive (destructiveHint: true)
+- Full logging integration
+
+**Test Coverage:**
+
+Added 4 new integration tests (23 total):
+1. Should move/rename a file
+2. Should move file to subfolder
+3. Should return error for non-existent source
+4. Should return error if destination exists
+
+### Technical Details
+
+```typescript
+this.mcpServer.tool(
+  'move_file',
+  'Move or rename a file within the vault',
+  {
+    from: z.string().describe('Current path of the file'),
+    to: z.string().describe('New path for the file'),
+  },
+  { destructiveHint: true },
+  async ({ from, to }) => {
+    const file = this.app.vault.getAbstractFileByPath(from);
+    if (!file) throw new Error(`Source file not found: ${from}`);
+
+    const existing = this.app.vault.getAbstractFileByPath(to);
+    if (existing) throw new Error(`Destination already exists: ${to}`);
+
+    // Create parent directories if needed
+    const destDir = to.substring(0, to.lastIndexOf('/'));
+    if (destDir) {
+      const parentFolder = this.app.vault.getAbstractFileByPath(destDir);
+      if (!parentFolder) {
+        await this.app.vault.createFolder(destDir);
+      }
+    }
+
+    await this.app.vault.rename(file, to);
+    return { content: [{ type: 'text', text: `Moved ${from} to ${to}` }] };
+  }
+);
+```
+
+### Key Features
+
+- **Preserves Metadata**: Unlike delete + create, rename preserves file creation date and other metadata
+- **Parent Directory Creation**: Automatically creates destination directories if they don't exist
+- **Conflict Prevention**: Fails safely if destination already exists
+- **Full Logging**: Integrated with MCPLogger for debugging
+
+### Statistics
+
+- **4 new tests** added
+- **23 tests** total, all passing
+- **~50 lines** of new tool code
+- **9 MCP tools** now available
+
+### Next Steps
+
+- Remote Access via Cloudflare Tunnel (Phase 2)
+
+---
+
 *End of log entry*
