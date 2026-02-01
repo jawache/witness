@@ -130,8 +130,8 @@ Remote Access via Cloudflare Tunnel:
 - ✅ Tunnel URL displayed in settings with copy button
 - ✅ Regenerate tunnel button in settings UI
 - ✅ Tunnel status indicator (connecting/connected/error)
+- ✅ Token authentication for remote access
 - ⏳ WhatsApp/Telegram bot (not started)
-- ⏳ Authentication token enforcement (not started)
 
 ## MCP Implementation Details
 
@@ -325,6 +325,66 @@ curl -X POST https://your-random-words.trycloudflare.com/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"initialize",...}'
+```
+
+### Token Authentication
+
+The plugin supports simple token-based authentication for protecting remote access.
+
+**How It Works:**
+
+1. When "Require Authentication" is enabled in Remote Access settings, all `/mcp` requests require a valid token
+2. Token can be provided via:
+   - Query parameter: `?token=xxx`
+   - Authorization header: `Bearer xxx`
+3. Token is auto-generated when auth is first enabled, or can be regenerated via the reset button
+4. The MCP URL in settings includes the token when auth is enabled
+
+**Implementation in [src/main.ts:946-984](src/main.ts#L946-L984):**
+
+```typescript
+private validateAuth(req: IncomingMessage): boolean {
+  const expectedToken = this.settings.authToken;
+
+  if (!expectedToken) {
+    return false; // Auth enabled but no token = deny
+  }
+
+  // Check query parameter first
+  const url = new URL(req.url || '', `http://localhost:${this.settings.mcpPort}`);
+  const queryToken = url.searchParams.get('token');
+  if (queryToken === expectedToken) return true;
+
+  // Check Authorization header
+  const authHeader = req.headers['authorization'];
+  if (authHeader?.startsWith('Bearer ')) {
+    if (authHeader.split(' ')[1] === expectedToken) return true;
+  }
+
+  return false;
+}
+```
+
+**Security Considerations:**
+
+- Query parameter tokens are encrypted in HTTPS transit but may appear in server logs
+- For maximum security, prefer the Authorization header method
+- Tokens should be kept private and regenerated if compromised
+- The `/health` endpoint does NOT require authentication (for monitoring)
+
+**Testing Authentication:**
+
+```bash
+# Without token (should fail with 401)
+curl -X POST https://tunnel-url/mcp -d '...'
+
+# With query parameter token
+curl -X POST "https://tunnel-url/mcp?token=YOUR_TOKEN" -d '...'
+
+# With Authorization header
+curl -X POST https://tunnel-url/mcp \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '...'
 ```
 
 ## Obsidian Automation Guide

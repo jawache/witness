@@ -511,4 +511,97 @@ curl -X POST .../mcp -H "Accept: application/json, text/event-stream" -d '...'
 
 ---
 
+## 2026-02-01 - Token Authentication for Remote Access
+
+**Objective**: Implement simple token-based authentication to protect the MCP endpoint when exposed via Cloudflare tunnel.
+
+### What We Built
+
+A simplified authentication system that protects remote access with a token, replacing the initial OAuth 2.0 implementation that proved incompatible with Claude Desktop.
+
+**Key Features:**
+
+- **Query Parameter Token**: Access via `?token=xxx` in the URL
+- **Authorization Header**: Also accepts `Authorization: Bearer xxx`
+- **Auto-Generate Token**: Token created automatically when enabling auth
+- **Settings UI**: Token field with regenerate button under Remote Access section
+- **URL Integration**: MCP URL displays with token included when auth is enabled
+
+### The Journey
+
+**Initial Approach: OAuth 2.0 Client Credentials**
+
+Started implementing full OAuth 2.0 Client Credentials Grant:
+- Added `/.well-known/oauth-authorization-server` metadata endpoint
+- Implemented `/oauth/token` endpoint
+- Generated client ID and secret on first run
+- Token issuance with expiration
+
+**The Problem: Claude Desktop OAuth Requirements**
+
+Discovered through web research that Claude Desktop requires OAuth 2.1 Authorization Code flow with PKCE, not the simpler Client Credentials grant we implemented. Claude's MCP authentication is designed for delegated authorization scenarios, not machine-to-machine authentication.
+
+Key findings:
+- Claude expects a full OAuth 2.1 flow with user consent screens
+- Client Credentials grant (machine-to-machine) isn't supported
+- Known bugs with OAuth in Claude Desktop as of late 2025
+
+**The Pivot: Simple Token Authentication**
+
+Decided to simplify to a query parameter token approach:
+
+1. **Security Trade-off**: Query params in HTTPS are encrypted in transit, but may appear in logs. Acceptable for personal vaults.
+2. **Dual Support**: Accept token via query param OR Authorization header for flexibility
+3. **UI Integration**: Token shown in the MCP URL for easy copy-paste
+
+### Technical Achievements
+
+**Token Validation Logic:**
+
+```typescript
+private validateAuth(req: IncomingMessage): boolean {
+  const expectedToken = this.settings.authToken;
+
+  // Check query parameter
+  const url = new URL(req.url || '', `http://localhost:${port}`);
+  const queryToken = url.searchParams.get('token');
+  if (queryToken === expectedToken) return true;
+
+  // Check Authorization header
+  const authHeader = req.headers['authorization'];
+  if (authHeader?.split(' ')[1] === expectedToken) return true;
+
+  return false;
+}
+```
+
+**Settings UI Changes:**
+
+- Moved "Require Authentication" toggle under Remote Access section
+- Only shows when tunnel is enabled (auth without tunnel is pointless)
+- Token field with regenerate button appears when auth is enabled
+- MCP URL automatically includes `?token=xxx` when both tunnel and auth are enabled
+
+### Key Learnings
+
+1. **Claude OAuth is complex**: Claude Desktop expects full OAuth 2.1 with PKCE, not simple client credentials
+2. **Simple beats complex**: For personal use, a query parameter token is perfectly adequate
+3. **HTTPS protects query params**: Query strings are encrypted in transit, only visible in logs
+4. **UI flow matters**: Showing the complete URL with token makes copy-paste seamless
+
+### Statistics
+
+- **~100 lines removed** (OAuth complexity)
+- **~50 lines added** (simple token auth)
+- **1 new setting** (moved authToken under Remote Access)
+- **Net simplification**: Fewer endpoints, cleaner code
+
+### Next Steps
+
+- WhatsApp/Telegram bot integration
+- Permanent URLs via Named Tunnel (documentation)
+- Consider rate limiting for public exposure
+
+---
+
 *End of log entry*

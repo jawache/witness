@@ -23,6 +23,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Command Execution**: Execute any Obsidian command via AI
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
 - **Remote Access**: Cloudflare Quick Tunnel for access from anywhere
+- **Token Authentication**: Protect your remote endpoint with a simple token
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
 **9 MCP Tools Available**:
@@ -136,24 +137,31 @@ Open Obsidian Settings → Witness:
 - **Enable MCP Server**: Turn the server on/off
 - **Port**: HTTP server port (default: 3000)
 - **Enable Quick Tunnel**: Expose your MCP server via Cloudflare tunnel
-- **Authentication Token**: (Coming soon) Secure your server
+- **Require Authentication**: Protect remote access with a token
 
 ### Remote Access
 
 Enable the Quick Tunnel feature to access your vault from anywhere:
 
-1. **Enable in Settings**
+1. **Enable Tunnel**
    - Go to Obsidian Settings → Witness
    - Toggle "Enable Quick Tunnel"
    - Wait for the tunnel URL to appear
 
-2. **Copy Your URL**
-   - The URL looks like: `https://random-words.trycloudflare.com/mcp`
-   - Click "Copy URL" to copy it to clipboard
+2. **Enable Authentication** (recommended)
+   - Toggle "Require Authentication"
+   - A token is auto-generated, or click the reset icon to regenerate
+   - The MCP URL now includes the token: `https://xxx.trycloudflare.com/mcp?token=xxx`
 
-3. **Connect Claude**
-   - Use the tunnel URL instead of localhost in your MCP configuration
+3. **Copy Your URL**
+   - Click "Copy URL" to copy the full URL with token
+   - The token can also be passed via `Authorization: Bearer xxx` header
+
+4. **Connect Claude**
+   - Use the tunnel URL in your MCP configuration
    - Works with Claude Desktop, Claude.ai web, and Claude mobile
+
+**Security Note**: The token is included in the URL query parameter. While HTTPS encrypts this in transit, be cautious about sharing URLs or logging them. For sensitive vaults, consider using a Cloudflare Named Tunnel with additional security layers.
 
 **Note**: The tunnel URL changes each time Obsidian restarts. For a permanent URL, you can set up a Cloudflare Named Tunnel (requires a Cloudflare account and domain).
 
@@ -274,6 +282,7 @@ This is different from other Obsidian MCP servers that run externally and connec
 
 ### Phase 2: Remote Access (In Progress)
 - [x] Cloudflare Quick Tunnel integration
+- [x] Token authentication for remote access
 - [ ] WhatsApp/Telegram bot
 - [ ] Mobile app support
 - [ ] Multi-user sessions

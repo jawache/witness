@@ -157,19 +157,35 @@ interface WitnessSettings {
 	// Remote access via Cloudflare Tunnel
 	enableTunnel: boolean;
 	tunnelUrl: string | null;
+	// Authentication (simple token)
+	enableAuth: boolean;
+}
+
+// Helper function to generate random credentials
+function generateRandomId(length: number = 32): string {
+	const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+	let result = '';
+	// Use Node's crypto module for compatibility
+	const nodeCrypto = require('crypto');
+	const randomBytes = nodeCrypto.randomBytes(length);
+	for (let i = 0; i < length; i++) {
+		result += chars[randomBytes[i] % chars.length];
+	}
+	return result;
 }
 
 const DEFAULT_SETTINGS: WitnessSettings = {
 	mcpPort: 3000,
 	mcpEnabled: false,
 	authToken: '',
-	serverInstructions: 'Before performing any operations, use get_orientation to load the orientation document. This helps understand the chaos/order system and current vault state.',
+	serverInstructions: 'Before performing any operations, use get_vault_context to load the vault structure and organizational context. This helps understand the chaos/order system and current vault state.',
 	orientationPath: '',
 	customCommands: [],
 	coreToolDescriptions: {},
 	enableCommandFallback: false,
 	enableTunnel: false,
 	tunnelUrl: null,
+	enableAuth: false,
 }
 
 export default class WitnessPlugin extends Plugin {
@@ -224,6 +240,14 @@ export default class WitnessPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	/**
+	 * Regenerate authentication token
+	 */
+	async regenerateAuthToken() {
+		this.settings.authToken = generateRandomId(32);
+		await this.saveSettings();
+	}
+
 	async startMCPServer() {
 		if (this.httpServer || this.mcpServer) {
 			this.logger.info('MCP server already running');
@@ -249,7 +273,19 @@ export default class WitnessPlugin extends Plugin {
 
 		// Create HTTP server
 		this.httpServer = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
-			// Health check endpoint
+			// CORS headers for cross-origin requests
+			res.setHeader('Access-Control-Allow-Origin', '*');
+			res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+			res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Mcp-Session-Id');
+
+			// Handle preflight requests
+			if (req.method === 'OPTIONS') {
+				res.writeHead(204);
+				res.end();
+				return;
+			}
+
+			// Health check endpoint (no auth required)
 			if (req.url === '/health') {
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ status: 'ok', plugin: 'witness' }));
@@ -257,7 +293,19 @@ export default class WitnessPlugin extends Plugin {
 			}
 
 			// MCP Streamable HTTP endpoint - handle both POST and GET (for SSE)
-			if (req.url?.startsWith('/mcp')) {
+			// Match /mcp or /mcp?token=xxx
+			const parsedUrl = new URL(req.url || '', `http://localhost:${this.settings.mcpPort}`);
+			if (parsedUrl.pathname === '/mcp') {
+				// Validate authentication if enabled
+				if (this.settings.enableAuth) {
+					const authValid = this.validateAuth(req);
+					if (!authValid) {
+						this.logger.mcp('Authentication failed for MCP request');
+						res.writeHead(401, { 'Content-Type': 'application/json' });
+						res.end(JSON.stringify({ error: 'Unauthorized', message: 'Invalid or missing access token' }));
+						return;
+					}
+				}
 				await this.handleMCPRequest(req, res);
 				return;
 			}
@@ -843,6 +891,50 @@ export default class WitnessPlugin extends Plugin {
 	}
 
 	/**
+	 * Validate authentication via query parameter or Authorization header
+	 * Accepts: ?token=xxx or Authorization: Bearer xxx
+	 */
+	private validateAuth(req: IncomingMessage): boolean {
+		const expectedToken = this.settings.authToken;
+
+		if (!expectedToken) {
+			this.logger.mcp('Auth enabled but no token configured - denying access');
+			return false;
+		}
+
+		// Check query parameter first
+		const url = new URL(req.url || '', `http://localhost:${this.settings.mcpPort}`);
+		const queryToken = url.searchParams.get('token');
+		if (queryToken) {
+			if (queryToken === expectedToken) {
+				this.logger.mcp('Token validated via query parameter');
+				return true;
+			}
+			this.logger.mcp('Invalid token in query parameter');
+			return false;
+		}
+
+		// Check Authorization header
+		const authHeader = req.headers['authorization'];
+		if (authHeader) {
+			const parts = authHeader.split(' ');
+			if (parts.length === 2 && parts[0].toLowerCase() === 'bearer') {
+				if (parts[1] === expectedToken) {
+					this.logger.mcp('Token validated via Authorization header');
+					return true;
+				}
+				this.logger.mcp('Invalid token in Authorization header');
+				return false;
+			}
+			this.logger.mcp('Invalid Authorization header format');
+			return false;
+		}
+
+		this.logger.mcp('No token provided (query param or header)');
+		return false;
+	}
+
+	/**
 	 * Get the path where we store the cloudflared binary
 	 */
 	private getCloudflaredBinPath(): string {
@@ -1244,17 +1336,6 @@ class WitnessSettingTab extends PluginSettingTab {
 					}
 				}));
 
-		new Setting(containerEl)
-			.setName('Authentication Token')
-			.setDesc('Token for authenticating MCP requests (leave empty to disable auth)')
-			.addText(text => text
-				.setPlaceholder('Enter token')
-				.setValue(this.plugin.settings.authToken)
-				.onChange(async (value) => {
-					this.plugin.settings.authToken = value;
-					await this.plugin.saveSettings();
-				}));
-
 		// ===== SERVER CONFIGURATION =====
 		containerEl.createEl('h3', {text: 'Server Configuration'});
 
@@ -1426,13 +1507,56 @@ class WitnessSettingTab extends PluginSettingTab {
 				status === 'error' ? 'var(--text-error)' : 'var(--text-muted)';
 
 			const statusSetting = new Setting(containerEl)
-				.setName('Status')
+				.setName('Tunnel Status')
 				.setDesc(statusText);
 			statusSetting.descEl.style.color = statusColor;
 
-			// URL display with copy button
+			// Auth enable toggle (under tunnel section)
+			new Setting(containerEl)
+				.setName('Require Authentication')
+				.setDesc('Protect your remote MCP endpoint with a token')
+				.addToggle(toggle => toggle
+					.setValue(this.plugin.settings.enableAuth)
+					.onChange(async (value) => {
+						this.plugin.settings.enableAuth = value;
+						// Auto-generate token if enabling auth and no token exists
+						if (value && !this.plugin.settings.authToken) {
+							this.plugin.settings.authToken = generateRandomId(32);
+						}
+						await this.plugin.saveSettings();
+						this.display(); // Refresh to show/hide token field
+					}));
+
+			// Show token field when auth is enabled
+			if (this.plugin.settings.enableAuth) {
+				const tokenSetting = new Setting(containerEl)
+					.setName('Authentication Token')
+					.setDesc('Token required for all MCP requests');
+
+				tokenSetting.addText(text => text
+					.setPlaceholder('Token')
+					.setValue(this.plugin.settings.authToken)
+					.onChange(async (value) => {
+						this.plugin.settings.authToken = value;
+						await this.plugin.saveSettings();
+					}));
+
+				tokenSetting.addButton(button => button
+					.setIcon('reset')
+					.setTooltip('Regenerate token')
+					.onClick(async () => {
+						await this.plugin.regenerateAuthToken();
+						new Notice('New token generated!');
+						this.display();
+					}));
+			}
+
+			// URL display with copy button (includes token if auth enabled)
 			if (url) {
-				const mcpUrl = `${url}/mcp`;
+				let mcpUrl = `${url}/mcp`;
+				if (this.plugin.settings.enableAuth && this.plugin.settings.authToken) {
+					mcpUrl += `?token=${this.plugin.settings.authToken}`;
+				}
 				const urlSetting = new Setting(containerEl)
 					.setName('Your MCP URL')
 					.setDesc(mcpUrl);
@@ -1445,7 +1569,7 @@ class WitnessSettingTab extends PluginSettingTab {
 					}));
 			}
 
-			// Regenerate button
+			// Regenerate tunnel button
 			new Setting(containerEl)
 				.setName('Regenerate Tunnel')
 				.setDesc('Get a new tunnel URL')

@@ -1,12 +1,13 @@
 {
   "mcpPort": 3001,
   "mcpEnabled": true,
-  "authToken": "",
+  "authToken": "71fJpsQcSkPu9KT2NlIi9Ve9nOgoqQZs",
   "serverInstructions": "Test vault for integration testing.",
   "orientationPath": "README.md",
   "customCommands": [],
   "coreToolDescriptions": {},
   "enableCommandFallback": false,
   "enableTunnel": true,
-  "tunnelUrl": "https://bought-funky-charges-reservation.trycloudflare.com"
+  "tunnelUrl": "https://dial-mart-wellington-puzzles.trycloudflare.com",
+  "enableAuth": true
 }
