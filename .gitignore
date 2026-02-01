@@ -27,3 +27,11 @@ main.js.map
 test/vault/*-temp.md
 test/vault/move-conflict-*.md
 test/vault/subfolder/moved-file.md
+
+# Test vault plugins (installed for testing, not part of repo)
+test/vault/.obsidian/plugins/smart-connections/
+test/vault/.smart-env/
+
+# Test vault runtime config (changes during testing)
+test/vault/.obsidian/plugins/witness/data.json
+test/vault/.obsidian/community-plugins.json
