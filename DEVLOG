@@ -604,4 +604,169 @@ private validateAuth(req: IncomingMessage): boolean {
 
 ---
 
+## 2026-02-01 - GitHub Repository & First Release
+
+**Objective**: Publish the Witness plugin to GitHub and create the first release for BRAT installation.
+
+### What We Built
+
+Made Witness publicly available on GitHub with a proper release for easy installation.
+
+**Repository**: [github.com/jawache/witness](https://github.com/jawache/witness)
+
+**Release**: v0.1.0 - Initial Release
+
+### Release Contents
+
+The v0.1.0 release includes:
+
+- `main.js` - Compiled plugin code (~2MB)
+- `manifest.json` - Plugin metadata
+
+**Features in this release:**
+
+- 9 MCP tools (read_file, write_file, list_files, edit_file, search, find_files, move_file, execute_command, get_vault_context)
+- Cloudflare Quick Tunnel for remote access
+- Token authentication for secure remote connections
+- Claude Desktop integration via mcp-remote bridge
+- File-based logging
+- Full settings UI
+
+### Installation via BRAT
+
+Users can now install Witness easily using the BRAT plugin:
+
+1. Install BRAT from Community Plugins
+2. Add Beta Plugin: `jawache/witness`
+3. Enable Witness in Community Plugins
+
+BRAT handles downloading the release assets and installing them in the correct location.
+
+### Documentation Updates
+
+Updated README.md with:
+
+- BRAT installation instructions (recommended method)
+- Manual installation from releases
+- Build from source instructions
+- Clear separation of installation methods
+
+### Statistics
+
+- **1 GitHub repository** created
+- **1 release** (v0.1.0) published
+- **2 release assets** (main.js, manifest.json)
+- **README.md** updated with new installation options
+
+### Next Steps
+
+- Submit to Obsidian Community Plugins (requires review)
+- WhatsApp/Telegram bot integration
+- Permanent URLs via Named Tunnel
+
+---
+
+## 2026-02-01 - Semantic Search Implementation (PAUSED)
+
+**Objective**: Add semantic search capability that finds files by meaning, not just keywords, leveraging Smart Connections embeddings.
+
+**Status**: ⏸️ PAUSED - ONNX WASM runtime doesn't initialize properly in Obsidian's Electron environment. Code preserved in `feature/semantic-search` branch.
+
+### What We Built
+
+Implemented a `semantic_search` MCP tool that:
+- Generates query embeddings using transformers.js with `TaylorAI/bge-micro-v2` model
+- Loads pre-computed embeddings from Smart Connections' `.smart-env/multi/*.ajson` files
+- Calculates cosine similarity between query and document vectors
+- Returns ranked list of semantically similar files
+
+### The Journey
+
+**Research Phase: Smart Connections Integration**
+
+Initially explored calling Smart Connections APIs directly, but discovered:
+- Obsidian commands are fire-and-forget (no return values)
+- Smart Connections doesn't expose a programmatic search API
+- Other MCP servers that integrate with SC all read the `.ajson` files directly
+
+This led to the decision to bundle transformers.js and generate query embeddings ourselves.
+
+**The Build Challenge: Native ONNX Bindings**
+
+First attempt with `@xenova/transformers` failed to build:
+- ES2018 target doesn't support BigInt literals (used by ONNX)
+- Native `.node` files can't be bundled by esbuild
+- Same issues with `@huggingface/transformers`
+
+**Solution: Browser Platform + WASM**
+
+Updated esbuild configuration:
+- Changed `platform` from "node" to "browser"
+- Upgraded `target` to "es2020" for BigInt support
+- Added `conditions: ["browser", "import"]` for WASM version
+- Aliased `onnxruntime-node` to `onnxruntime-web`
+- Marked native modules as external
+
+This forces transformers.js to use the WebAssembly backend instead of native ONNX bindings, which works in Obsidian's Electron environment.
+
+### Implementation Details
+
+**Helper Methods:**
+- `initEmbedder()` - Lazy-loads transformers.js pipeline on first use
+- `cosineSimilarity()` - Vector similarity calculation
+- `loadSmartConnectionsEmbeddings()` - Parses SC's `.ajson` format with caching
+- `clearEmbeddingsCache()` - Manual cache invalidation if needed
+
+**The semantic_search Tool:**
+```typescript
+semantic_search(query: string, limit?: number)
+// Returns: List of files ranked by semantic similarity
+// Example: "productivity systems" → finds notes about GTD, time management, etc.
+```
+
+### Technical Achievements
+
+- Successfully bundled transformers.js (4.2MB) for Obsidian
+- Compatible with Smart Connections' embedding format
+- Lazy loading prevents startup delay
+- Embeddings cached for fast subsequent searches
+
+### Key Learnings
+
+1. **Platform matters**: esbuild's `platform: "browser"` + conditions can force WASM builds
+2. **ES target versions**: BigInt requires ES2020 minimum
+3. **Smart Connections format**: AJSON files store embeddings keyed by `TaylorAI/bge-micro-v2`
+4. **Obsidian = Electron**: Browser APIs available, but Node.js require() still works
+
+### Statistics
+
+- **1 new MCP tool**: semantic_search
+- **4 helper methods** added
+- **Bundle size**: 4.2MB (increased from transformers.js)
+- **10 total MCP tools** now available
+
+### Why Paused
+
+Despite successful bundling, the ONNX WASM runtime fails to initialize in Obsidian's Electron environment:
+
+```text
+TypeError: Cannot read properties of undefined (reading 'create')
+at createInferenceSession
+```
+
+The model downloads correctly but `InferenceSession.create()` fails. The WASM files aren't loading properly in Electron's sandboxed environment.
+
+### Code Preserved
+
+All semantic search code is in the `feature/semantic-search` branch for future work when we find a solution.
+
+### Potential Future Approaches
+
+- Run embeddings in a separate Node.js process
+- Use a different model format (GGML/llama.cpp)
+- Wait for better Electron/WASM compatibility
+- External embedding service
+
+---
+
 *End of log entry*

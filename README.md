@@ -36,7 +36,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - `find_files` - Search files by name pattern
 - `move_file` - Move or rename files
 - `execute_command` - Run Obsidian commands
-- `get_orientation` - Load your vault's orientation document
+- `get_vault_context` - Load your vault's context document
 
 ### Coming Soon
 
@@ -52,11 +52,46 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - Node.js 20+ (for Claude Desktop connection)
 - Claude Desktop app (optional, for AI integration)
 
-### Install the Plugin
+### Install via BRAT (Recommended)
 
-1. **Download the plugin**
+The easiest way to install Witness is using the [BRAT plugin](https://github.com/TfTHacker/obsidian42-brat):
+
+1. Install BRAT from Obsidian's Community Plugins
+2. Open BRAT settings and click "Add Beta Plugin"
+3. Enter: `jawache/witness`
+4. Click "Add Plugin"
+5. Enable Witness in Community Plugins
+
+BRAT will automatically keep Witness updated when new releases are published.
+
+### Manual Installation
+
+If you prefer to install manually:
+
+1. **Download the latest release**
+   - Go to [Releases](https://github.com/jawache/witness/releases)
+   - Download `main.js` and `manifest.json`
+
+2. **Install in your vault**
    ```bash
-   # Clone the repository
+   # Create plugin folder
+   mkdir -p /path/to/your/vault/.obsidian/plugins/witness/
+
+   # Copy files
+   cp main.js manifest.json /path/to/your/vault/.obsidian/plugins/witness/
+   ```
+
+3. **Enable in Obsidian**
+   - Open Obsidian Settings → Community Plugins
+   - Disable Safe Mode if prompted
+   - Find "Witness" in the list and enable it
+
+### Build from Source
+
+For developers who want to build from source:
+
+1. **Clone the repository**
+   ```bash
    git clone https://github.com/jawache/witness.git
    cd witness
    ```
@@ -68,15 +103,10 @@ The plugin helps you move information from chaos to order, with AI assistance to
    ```
 
 3. **Install in your vault**
+
    ```bash
-   # Copy to your vault's plugins folder
    cp main.js manifest.json /path/to/your/vault/.obsidian/plugins/witness/
    ```
-
-4. **Enable in Obsidian**
-   - Open Obsidian Settings → Community Plugins
-   - Disable Safe Mode if prompted
-   - Find "Witness" in the list and enable it
 
 ### Connect to Claude Desktop
 
