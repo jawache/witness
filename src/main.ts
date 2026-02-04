@@ -1026,7 +1026,10 @@ export default class WitnessPlugin extends Plugin {
 				try {
 					// Initialize embedding service on first use (iframe mode - isolated browser context)
 					if (!this.embeddingService) {
-						this.embeddingService = new EmbeddingServiceIframe();
+						this.embeddingService = new EmbeddingServiceIframe({
+							gpuMode: 'auto',  // Try WebGPU first, fallback to WASM on errors
+							throttleMs: 50,   // Reduce memory pressure between calls
+						});
 						this.embeddingService.onProgress((info) => {
 							this.logger.info(`Embedding progress: ${info.status}`, info.progress);
 						});
@@ -1139,7 +1142,10 @@ export default class WitnessPlugin extends Plugin {
 				try {
 					// Initialize embedding service
 					if (!this.embeddingService) {
-						this.embeddingService = new EmbeddingServiceIframe();
+						this.embeddingService = new EmbeddingServiceIframe({
+							gpuMode: 'auto',  // Try WebGPU first, fallback to WASM on errors
+							throttleMs: 50,   // Reduce memory pressure between calls
+						});
 						this.embeddingService.onProgress((info) => {
 							this.logger.info(`Embedding progress: ${info.status}`, info.progress);
 						});

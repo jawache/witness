@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "provider": "iframe",
+  "model": "TaylorAI/bge-micro-v2",
+  "dimensions": 384,
+  "documentCount": 8,
+  "lastUpdated": "2026-02-04T11:55:56.810Z",
+  "excludePaths": [
+    ".witness/",
+    ".obsidian/",
+    "node_modules/"
+  ]
+}

@@ -966,4 +966,97 @@ The search returns both document-level and section-level results with similarity
 
 ---
 
+## 2026-02-04 - WebGPU Testing & Decision to Use Smart Connections
+
+**Objective**: Test WebGPU acceleration for embeddings and evaluate the overall iframe-based embedding approach.
+
+### What We Tested
+
+Extended the iframe embedding service with WebGPU support and tested on a real vault with 2000+ documents.
+
+**Changes Made:**
+
+1. **WebGPU Auto-Fallback** (`src/embedding-service-iframe.ts`)
+   - Added `gpuMode` option: 'auto' | 'always' | 'never'
+   - Auto mode tries WebGPU first, falls back to WASM after 5 errors
+   - Added throttling between calls to reduce memory pressure
+   - GPU error tracking for intelligent fallback
+
+2. **Filename Hashing** (`src/embedding-index.ts`)
+   - Fixed ENAMETOOLONG errors for long file paths
+   - Hash paths > 200 chars while keeping readable prefix
+   - `getVectorFiles()` and `loadAllEmbeddings()` for proper retrieval
+
+3. **Dependency Cleanup** (`package.json`)
+   - Removed unused `@xenova/transformers` npm package
+   - The iframe uses CDN-loaded `@huggingface/transformers@3.8.0`
+
+### Test Results
+
+**WebGPU Status:**
+- WebGPU configs (fp16, fp32) were **attempted but failed** in Obsidian
+- Console showed: `Config failed: {"device":"webgpu","dtype":"fp16",...}`
+- Auto-fallback correctly triggered: "A dtype was not specified for 'wasm'"
+- **Root cause**: Obsidian's Electron doesn't have WebGPU enabled by default
+
+**WASM Performance:**
+- WASM initialization succeeds via iframe isolation
+- Memory corruption errors persist (codes like 44383360, 44207896)
+- Iframe reset mechanism helps but ~200 files still fail
+- Errors appear random, not correlated with file size or content
+
+**Key Findings:**
+1. WebGPU is NOT available in Obsidian's Electron environment
+2. WASM works but has stability issues with large vaults
+3. Auto-fallback code works correctly (just nothing to fall back FROM)
+4. Hundreds of files fail indexing due to WASM memory corruption
+
+### Strategic Decision
+
+Given the persistent issues with our iframe-based approach, decided to **pivot to using Smart Connections** for embeddings instead:
+
+**Reasons:**
+1. Smart Connections already has a mature, stable embedding implementation
+2. Other MCP servers (obsidian-mcp, etc.) follow this pattern
+3. Avoids maintaining complex WASM/WebGPU infrastructure
+4. User already has Smart Connections installed
+5. Smart Connections handles all the edge cases we're hitting
+
+**New Approach:**
+- Drop `index_documents` MCP tool (SC handles indexing)
+- Keep `semantic_search` but read from Smart Connections' files
+- Return helpful warning if SC isn't configured
+- Much simpler, more reliable implementation
+
+### Code Preserved
+
+All iframe embedding work preserved in `feature/iframe-embeddings` branch:
+- `src/embedding-service-iframe.ts` - WebGPU/WASM with auto-fallback
+- `src/embedding-index.ts` - Storage with filename hashing
+- `src/document-indexer.ts` - Document processing
+- Changes to `src/main.ts` with gpuMode options
+
+### Key Learnings
+
+1. **WebGPU in Electron**: Not enabled by default in Obsidian's Electron build
+2. **WASM memory limits**: transformers.js WASM has stability issues with large batches
+3. **Don't reinvent the wheel**: Smart Connections has solved these problems
+4. **Know when to pivot**: Spending too much time on infrastructure vs features
+
+### Statistics
+
+- **WebGPU configs tested**: 2 (fp16, fp32) - both failed
+- **WASM success rate**: ~90% of files (still ~200 failures)
+- **Iframe resets triggered**: 284 during full vault indexing
+- **Lines of code preserved**: ~800 in feature branch
+
+### Next Steps
+
+1. Switch to main branch
+2. Implement Smart Connections integration for semantic search
+3. Add warning when SC not configured
+4. Simpler, more reliable approach
+
+---
+
 *End of log entry*
