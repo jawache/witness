@@ -13,9 +13,14 @@ const MODEL_NAME = 'TaylorAI/bge-micro-v2';
 const MODEL_DIMENSIONS = 384;
 const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.0';
 
+// Throttling configuration
+const DEFAULT_THROTTLE_MS = 50;  // Delay between embed calls
+const GPU_ERROR_THRESHOLD = 5;   // Switch to WASM after this many GPU errors
+
 interface ModelInfo {
   model: string;
   dimensions: number;
+  backend: 'webgpu' | 'wasm';
 }
 
 interface ProgressInfo {
@@ -26,6 +31,13 @@ interface ProgressInfo {
 interface PendingRequest {
   resolve: (value: any) => void;
   reject: (error: Error) => void;
+}
+
+export interface EmbeddingServiceOptions {
+  /** GPU mode: 'auto' tries GPU first with fallback, 'always' forces GPU, 'never' uses WASM only */
+  gpuMode?: 'auto' | 'always' | 'never';
+  /** Delay in ms between embed calls to reduce memory pressure (0 = no throttling) */
+  throttleMs?: number;
 }
 
 /**
@@ -152,7 +164,19 @@ export class EmbeddingServiceIframe {
   private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
 
-  constructor() {
+  // Configuration options
+  private gpuMode: 'auto' | 'always' | 'never';
+  private throttleMs: number;
+
+  // GPU error tracking for auto-fallback
+  private gpuErrors = 0;
+  private gpuDisabled = false;
+  private lastEmbedTime = 0;
+
+  constructor(options: EmbeddingServiceOptions = {}) {
+    this.gpuMode = options.gpuMode ?? 'auto';
+    this.throttleMs = options.throttleMs ?? DEFAULT_THROTTLE_MS;
+
     // Set up ready promise
     this.readyPromise = new Promise(resolve => {
       this.readyResolve = resolve;
@@ -296,6 +320,16 @@ export class EmbeddingServiceIframe {
     return this.modelInfo!;
   }
 
+  /**
+   * Determine if GPU should be used based on mode and error history
+   */
+  private shouldUseGpu(): boolean {
+    if (this.gpuMode === 'never') return false;
+    if (this.gpuMode === 'always') return true;
+    // Auto mode: use GPU unless we've hit too many errors
+    return !this.gpuDisabled;
+  }
+
   private async doInitialize(): Promise<void> {
     this.reportProgress('Creating iframe environment...');
 
@@ -304,23 +338,24 @@ export class EmbeddingServiceIframe {
 
     // Wait for iframe to be ready
     await this.readyPromise;
-    this.reportProgress('Iframe ready, loading model...');
+
+    const useGpu = this.shouldUseGpu();
+    const backend = useGpu ? 'webgpu' : 'wasm';
+    this.reportProgress(`Iframe ready, loading model (${backend} mode)...`);
 
     try {
-      // Load model in iframe
-      // NOTE: useGpu disabled - WebGPU fails under memory pressure with large vaults
-      // WASM is slower but much more reliable for indexing 1000+ documents
       await this.sendMessage('load', {
         modelKey: MODEL_NAME,
-        useGpu: false,  // Use WASM for reliability
+        useGpu,
       });
 
       this.modelInfo = {
         model: MODEL_NAME,
         dimensions: MODEL_DIMENSIONS,
+        backend: useGpu ? 'webgpu' : 'wasm',
       };
 
-      this.reportProgress('Model ready');
+      this.reportProgress(`Model ready (${this.modelInfo.backend})`);
     } catch (error) {
       this.reportProgress(`Model loading failed: ${error}`);
       throw new Error(`Failed to initialize embedding model: ${error}`);
@@ -359,19 +394,52 @@ export class EmbeddingServiceIframe {
   }
 
   /**
+   * Apply throttling delay between calls
+   */
+  private async throttle(): Promise<void> {
+    if (this.throttleMs <= 0) return;
+
+    const now = Date.now();
+    const elapsed = now - this.lastEmbedTime;
+    if (elapsed < this.throttleMs) {
+      await new Promise(resolve => setTimeout(resolve, this.throttleMs - elapsed));
+    }
+    this.lastEmbedTime = Date.now();
+  }
+
+  /**
+   * Handle GPU error and potentially switch to WASM
+   */
+  private async handleGpuError(): Promise<boolean> {
+    if (this.gpuMode !== 'auto' || this.gpuDisabled) return false;
+
+    this.gpuErrors++;
+    if (this.gpuErrors >= GPU_ERROR_THRESHOLD) {
+      this.reportProgress(`GPU hit ${this.gpuErrors} errors, switching to WASM fallback...`);
+      this.gpuDisabled = true;
+      await this.resetIframe();  // Reinitialize with WASM
+      return true;  // Caller should retry
+    }
+    return false;
+  }
+
+  /**
    * Generate embedding for text
    */
   async embed(text: string): Promise<number[]> {
     this.embedCallCount++;
-    this.reportProgress(`embed() call #${this.embedCallCount}, modelInfo exists: ${!!this.modelInfo}`);
+
+    // Apply throttling to reduce memory pressure
+    await this.throttle();
+
+    const backend = this.modelInfo?.backend ?? 'unknown';
+    this.reportProgress(`embed() #${this.embedCallCount} (${backend}), text length: ${text.length}`);
 
     if (!this.modelInfo) {
       this.reportProgress('Model not initialized, calling initialize()...');
-      await this.initialize();
-      this.reportProgress(`After initialize(), modelInfo: ${JSON.stringify(this.modelInfo)}`);
+      const info = await this.initialize();
+      this.reportProgress(`After initialize(), backend: ${info.backend}`);
     }
-
-    this.reportProgress(`Sending embed message for text length: ${text.length}`);
 
     try {
       const result = await this.sendMessage('embed', { text });
@@ -382,12 +450,20 @@ export class EmbeddingServiceIframe {
       }
 
       this.consecutiveErrors = 0;  // Reset error count on success
-      this.reportProgress(`embed() #${this.embedCallCount} success, length: ${result.length}`);
       return result;
     } catch (error) {
       this.consecutiveErrors++;
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.reportProgress(`embed() #${this.embedCallCount} failed (consecutive: ${this.consecutiveErrors}): ${errorMsg}`);
+
+      // Check if we should switch to WASM fallback (GPU auto mode)
+      if (this.modelInfo?.backend === 'webgpu') {
+        const switched = await this.handleGpuError();
+        if (switched) {
+          // Retry with WASM backend
+          return this.embed(text);
+        }
+      }
 
       // If we hit consecutive errors, reset the iframe and retry once
       if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS) {
@@ -399,7 +475,7 @@ export class EmbeddingServiceIframe {
         try {
           const result = await this.sendMessage('embed', { text });
           if (result && Array.isArray(result) && result.length === MODEL_DIMENSIONS) {
-            this.reportProgress(`embed() retry after reset success, length: ${result.length}`);
+            this.reportProgress(`embed() retry after reset success`);
             return result;
           }
         } catch (retryError) {
