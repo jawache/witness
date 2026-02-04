@@ -1043,7 +1043,8 @@ export default class WitnessPlugin extends Plugin {
 						this.documentIndexer = new DocumentIndexer(
 							this.app,
 							this.embeddingIndex,
-							this.embeddingService
+							this.embeddingService,
+							this.logger
 						);
 					}
 
@@ -1155,7 +1156,8 @@ export default class WitnessPlugin extends Plugin {
 						this.documentIndexer = new DocumentIndexer(
 							this.app,
 							this.embeddingIndex,
-							this.embeddingService
+							this.embeddingService,
+							this.logger
 						);
 						this.documentIndexer.onProgress((progress) => {
 							this.logger.info(`Indexing: ${progress.phase} ${progress.current}/${progress.total}`, progress.currentFile);

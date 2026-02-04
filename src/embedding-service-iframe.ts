@@ -46,10 +46,11 @@ async function loadModel(modelKey, useGpu) {
   }
 
   // Try WebGPU first, then fall back to WASM
+  // NOTE: q8 quantized has a bug with repeated calls, so we skip it and use non-quantized WASM
   const configs = [
     { device: 'webgpu', dtype: 'fp16', quantized: false },
     { device: 'webgpu', dtype: 'fp32', quantized: false },
-    { dtype: 'q8', quantized: true },
+    // { dtype: 'q8', quantized: true },  // DISABLED: WASM error on repeated calls
     { quantized: false },  // WASM auto fallback
   ];
 
@@ -131,7 +132,9 @@ window.addEventListener('message', async (event) => {
 
     window.parent.postMessage({ id, result }, '*');
   } catch (error) {
-    window.parent.postMessage({ id, error: error.message }, '*');
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    window.parent.postMessage({ type: 'progress', status: 'IFRAME ERROR: ' + errorMsg }, '*');
+    window.parent.postMessage({ id, error: errorMsg || 'Unknown error' }, '*');
   }
 });
 
@@ -230,6 +233,8 @@ export class EmbeddingServiceIframe {
       const { resolve, reject } = this.pending.get(data.id)!;
       this.pending.delete(data.id);
 
+      console.log('[EmbeddingService] Received response for id:', data.id, 'error:', data.error, 'result type:', typeof data.result, 'isArray:', Array.isArray(data.result), 'length:', data.result?.length);
+
       if (data.error) {
         reject(new Error(data.error));
       } else {
@@ -242,14 +247,18 @@ export class EmbeddingServiceIframe {
    * Send a message to the iframe and wait for response
    */
   private async sendMessage(method: string, params: any = {}): Promise<any> {
+    console.log('[EmbeddingService] sendMessage called:', method, 'iframe exists:', !!this.iframe, 'contentWindow exists:', !!this.iframe?.contentWindow);
     if (!this.iframe?.contentWindow) {
       throw new Error('Iframe not initialized');
     }
 
     // Wait for iframe to be ready
+    console.log('[EmbeddingService] Waiting for ready promise, ready state:', this.ready);
     await this.readyPromise;
+    console.log('[EmbeddingService] Ready promise resolved');
 
     const id = crypto.randomUUID();
+    console.log('[EmbeddingService] Posting message with id:', id, 'method:', method);
 
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -258,6 +267,7 @@ export class EmbeddingServiceIframe {
       // Timeout after 120 seconds (model download can be slow)
       setTimeout(() => {
         if (this.pending.has(id)) {
+          console.log('[EmbeddingService] Request timed out for id:', id);
           this.pending.delete(id);
           reject(new Error('Request timeout'));
         }
@@ -298,9 +308,11 @@ export class EmbeddingServiceIframe {
 
     try {
       // Load model in iframe
+      // NOTE: useGpu disabled - WebGPU fails under memory pressure with large vaults
+      // WASM is slower but much more reliable for indexing 1000+ documents
       await this.sendMessage('load', {
         modelKey: MODEL_NAME,
-        useGpu: true,  // Try GPU first, will fall back to WASM
+        useGpu: false,  // Use WASM for reliability
       });
 
       this.modelInfo = {
@@ -315,15 +327,88 @@ export class EmbeddingServiceIframe {
     }
   }
 
+  private embedCallCount = 0;
+  private consecutiveErrors = 0;
+  private readonly MAX_CONSECUTIVE_ERRORS = 2;
+
+  /**
+   * Reset the iframe completely (for WASM error recovery)
+   */
+  private async resetIframe(): Promise<void> {
+    this.reportProgress('Resetting iframe due to WASM errors...');
+
+    // Clean up old iframe
+    window.removeEventListener('message', this.handleMessage);
+    if (this.iframe) {
+      this.iframe.remove();
+      this.iframe = null;
+    }
+
+    // Reset state
+    this.modelInfo = null;
+    this.pending.clear();
+    this.ready = false;
+    this.readyPromise = new Promise(resolve => {
+      this.readyResolve = resolve;
+    });
+    this.initializing = null;
+
+    // Reinitialize
+    await this.initialize();
+    this.reportProgress('Iframe reset complete');
+  }
+
   /**
    * Generate embedding for text
    */
   async embed(text: string): Promise<number[]> {
+    this.embedCallCount++;
+    this.reportProgress(`embed() call #${this.embedCallCount}, modelInfo exists: ${!!this.modelInfo}`);
+
     if (!this.modelInfo) {
+      this.reportProgress('Model not initialized, calling initialize()...');
       await this.initialize();
+      this.reportProgress(`After initialize(), modelInfo: ${JSON.stringify(this.modelInfo)}`);
     }
 
-    return await this.sendMessage('embed', { text });
+    this.reportProgress(`Sending embed message for text length: ${text.length}`);
+
+    try {
+      const result = await this.sendMessage('embed', { text });
+
+      // Check if result is valid
+      if (!result || !Array.isArray(result) || result.length !== MODEL_DIMENSIONS) {
+        throw new Error(`Invalid embedding result: expected array of ${MODEL_DIMENSIONS}, got ${typeof result}`);
+      }
+
+      this.consecutiveErrors = 0;  // Reset error count on success
+      this.reportProgress(`embed() #${this.embedCallCount} success, length: ${result.length}`);
+      return result;
+    } catch (error) {
+      this.consecutiveErrors++;
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.reportProgress(`embed() #${this.embedCallCount} failed (consecutive: ${this.consecutiveErrors}): ${errorMsg}`);
+
+      // If we hit consecutive errors, reset the iframe and retry once
+      if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS) {
+        this.reportProgress('Multiple consecutive errors detected, resetting iframe...');
+        await this.resetIframe();
+        this.consecutiveErrors = 0;
+
+        // Retry once after reset
+        try {
+          const result = await this.sendMessage('embed', { text });
+          if (result && Array.isArray(result) && result.length === MODEL_DIMENSIONS) {
+            this.reportProgress(`embed() retry after reset success, length: ${result.length}`);
+            return result;
+          }
+        } catch (retryError) {
+          this.reportProgress(`embed() retry after reset also failed: ${retryError}`);
+        }
+      }
+
+      throw error;
+    }
   }
 
   /**

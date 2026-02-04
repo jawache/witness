@@ -22,6 +22,14 @@ export interface IndexingProgress {
 }
 
 /**
+ * Logger interface for file-based logging
+ */
+export interface IndexerLogger {
+  info(message: string, ...args: any[]): void;
+  error(message: string, ...args: any[]): void;
+}
+
+/**
  * Parsed section from a markdown document
  */
 interface ParsedSection {
@@ -38,17 +46,20 @@ export class DocumentIndexer {
   private index: EmbeddingIndex;
   private embeddingService: EmbeddingServiceIframe;
   private progressCallback: ((progress: IndexingProgress) => void) | null = null;
+  private logger: IndexerLogger | null = null;
   private isIndexing = false;
   private shouldCancel = false;
 
   constructor(
     app: App,
     index: EmbeddingIndex,
-    embeddingService: EmbeddingServiceIframe
+    embeddingService: EmbeddingServiceIframe,
+    logger?: IndexerLogger
   ) {
     this.app = app;
     this.index = index;
     this.embeddingService = embeddingService;
+    this.logger = logger || null;
   }
 
   /**
@@ -62,7 +73,12 @@ export class DocumentIndexer {
     if (this.progressCallback) {
       this.progressCallback(progress);
     }
-    console.log(`[Indexer] ${progress.phase}: ${progress.current}/${progress.total} ${progress.currentFile || ''}`);
+    const message = `[Indexer] ${progress.phase}: ${progress.current}/${progress.total} ${progress.currentFile || ''}`;
+    if (this.logger) {
+      this.logger.info(message);
+    } else {
+      console.log(message);
+    }
   }
 
   /**
@@ -242,6 +258,11 @@ export class DocumentIndexer {
       const docText = this.createDocumentText(file, content);
       const docEmbedding = await this.embeddingService.embed(docText);
 
+      // Debug: log embedding type and sample
+      if (this.logger) {
+        this.logger.info(`[Indexer] embed() returned type: ${typeof docEmbedding}, isArray: ${Array.isArray(docEmbedding)}, length: ${docEmbedding?.length}, sample: ${JSON.stringify(docEmbedding?.slice?.(0, 3))}`);
+      }
+
       // Create section embeddings
       const sectionEmbeddings: SectionEmbedding[] = [];
       for (const section of sections) {
@@ -282,7 +303,12 @@ export class DocumentIndexer {
       await this.index.saveDocumentEmbedding(embedding);
       return embedding;
     } catch (error) {
-      console.error(`[Indexer] Failed to index ${file.path}:`, error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (this.logger) {
+        this.logger.error(`[Indexer] Failed to index ${file.path}:`, errorMessage);
+      } else {
+        console.error(`[Indexer] Failed to index ${file.path}:`, error);
+      }
       return null;
     }
   }
@@ -371,7 +397,9 @@ export class DocumentIndexer {
     if (this.index.shouldExclude(file.path)) return;
     if (file.extension !== 'md') return;
 
-    console.log(`[Indexer] File changed: ${file.path}`);
+    if (this.logger) {
+      this.logger.info(`[Indexer] File changed: ${file.path}`);
+    }
     await this.indexFile(file);
   }
 
@@ -379,7 +407,9 @@ export class DocumentIndexer {
    * Handle file deletion
    */
   async onFileDelete(path: string): Promise<void> {
-    console.log(`[Indexer] File deleted: ${path}`);
+    if (this.logger) {
+      this.logger.info(`[Indexer] File deleted: ${path}`);
+    }
     await this.index.deleteDocumentEmbedding(path);
   }
 
@@ -387,7 +417,9 @@ export class DocumentIndexer {
    * Handle file rename
    */
   async onFileRename(file: TFile, oldPath: string): Promise<void> {
-    console.log(`[Indexer] File renamed: ${oldPath} -> ${file.path}`);
+    if (this.logger) {
+      this.logger.info(`[Indexer] File renamed: ${oldPath} -> ${file.path}`);
+    }
     await this.index.deleteDocumentEmbedding(oldPath);
     if (file.extension === 'md' && !this.index.shouldExclude(file.path)) {
       await this.indexFile(file);
