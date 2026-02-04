@@ -14,7 +14,8 @@ const prod = (process.argv[2] === "production");
 // Add node: prefixed versions of builtins for cloudflared and other packages
 const nodeBuiltins = builtins.flatMap(m => [m, `node:${m}`]);
 
-const context = await esbuild.context({
+// Main plugin build
+const mainContext = await esbuild.context({
 	banner: {
 		js: banner,
 	},
@@ -44,9 +45,41 @@ const context = await esbuild.context({
 	platform: "node",
 });
 
+// Embedding worker build (separate bundle for Web Worker)
+// Uses browser platform and ES2020 for BigInt support (required by ONNX)
+const workerContext = await esbuild.context({
+	banner: {
+		js: banner,
+	},
+	entryPoints: ["src/embedding-worker.ts"],
+	bundle: true,
+	format: "iife",
+	target: "es2020",
+	logLevel: "info",
+	sourcemap: prod ? false : "inline",
+	treeShaking: true,
+	outfile: "embedding-worker.js",
+	platform: "browser",
+	// Force WASM version of ONNX runtime
+	conditions: ["browser", "import"],
+	alias: {
+		"onnxruntime-node": "onnxruntime-web",
+	},
+	// External native modules that can't be bundled
+	external: [
+		"*.node",
+	],
+});
+
 if (prod) {
-	await context.rebuild();
+	await Promise.all([
+		mainContext.rebuild(),
+		workerContext.rebuild(),
+	]);
 	process.exit(0);
 } else {
-	await context.watch();
+	await Promise.all([
+		mainContext.watch(),
+		workerContext.watch(),
+	]);
 }

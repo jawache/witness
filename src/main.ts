@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, Modal, SuggestModal, normalizePath, Notice } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Modal, SuggestModal, normalizePath, Notice, TFile } from 'obsidian';
 import * as http from 'http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -9,6 +9,9 @@ import { Tunnel, bin as cloudflaredBin, install as installCloudflared, use as us
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { EmbeddingServiceIframe } from './embedding-service-iframe';
+import { EmbeddingIndex } from './embedding-index';
+import { DocumentIndexer } from './document-indexer';
 
 /**
  * Logger that writes to both console and file.
@@ -150,7 +153,11 @@ interface WitnessSettings {
 		search?: string;
 		find_files?: string;
 		move_file?: string;
+		create_folder?: string;
+		delete?: string;
+		copy_file?: string;
 		execute_command?: string;
+		semantic_search?: string;
 	};
 	// Command fallback system (opt-in)
 	enableCommandFallback: boolean;
@@ -197,6 +204,9 @@ export default class WitnessPlugin extends Plugin {
 	private tunnelProcess: Tunnel | null = null;
 	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
+	private embeddingService: EmbeddingServiceIframe | null = null;
+	private embeddingIndex: EmbeddingIndex | null = null;
+	private documentIndexer: DocumentIndexer | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -223,12 +233,46 @@ export default class WitnessPlugin extends Plugin {
 		if (this.settings.enableTunnel && this.settings.mcpEnabled) {
 			this.startTunnel();
 		}
+
+		// Set up file change listeners for incremental embedding updates
+		this.registerEvent(
+			this.app.vault.on('modify', async (file) => {
+				if (this.documentIndexer && file instanceof TFile) {
+					await this.documentIndexer.onFileChange(file);
+				}
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on('delete', async (file) => {
+				if (this.documentIndexer && file instanceof TFile) {
+					await this.documentIndexer.onFileDelete(file.path);
+				}
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on('rename', async (file, oldPath) => {
+				if (this.documentIndexer && file instanceof TFile) {
+					await this.documentIndexer.onFileRename(file, oldPath);
+				}
+			})
+		);
 	}
 
 	async onunload() {
 		this.logger.info('Witness plugin unloading');
 		this.stopTunnel();
 		this.stopMCPServer();
+		if (this.embeddingService) {
+			this.embeddingService.destroy();
+			this.embeddingService = null;
+		}
+		if (this.embeddingIndex) {
+			this.embeddingIndex.clearCache();
+			this.embeddingIndex = null;
+		}
+		this.documentIndexer = null;
 		await this.logger.close();
 	}
 
@@ -618,6 +662,179 @@ export default class WitnessPlugin extends Plugin {
 			}
 		);
 
+		// Register create_folder tool (DESTRUCTIVE)
+		this.mcpServer.tool(
+			'create_folder',
+			this.getToolDescription('create_folder', 'Create a folder in the vault'),
+			{
+				path: z.string().describe('Path to the folder to create, relative to vault root'),
+				parents: z.boolean().optional().describe('Create parent folders if they don\'t exist (default: true, like mkdir -p)'),
+			},
+			{
+				destructiveHint: true,
+			},
+			async ({ path, parents = true }) => {
+				this.logger.mcp(`create_folder called: "${path}" (parents: ${parents})`);
+
+				// Check if folder already exists
+				const existing = this.app.vault.getAbstractFileByPath(path);
+				if (existing) {
+					if ((existing as any).children !== undefined) {
+						// It's a folder, already exists
+						return {
+							content: [{ type: 'text', text: `Folder already exists: ${path}` }],
+							isError: false,
+						};
+					} else {
+						throw new Error(`A file already exists at path: ${path}`);
+					}
+				}
+
+				if (parents) {
+					// Create parent directories recursively
+					const parts = path.split('/').filter(p => p);
+					let currentPath = '';
+					for (const part of parts) {
+						currentPath = currentPath ? `${currentPath}/${part}` : part;
+						const folder = this.app.vault.getAbstractFileByPath(currentPath);
+						if (!folder) {
+							this.logger.mcp(`Creating folder: ${currentPath}`);
+							await this.app.vault.createFolder(currentPath);
+						}
+					}
+				} else {
+					// Check if parent exists
+					const parentPath = path.substring(0, path.lastIndexOf('/'));
+					if (parentPath) {
+						const parent = this.app.vault.getAbstractFileByPath(parentPath);
+						if (!parent) {
+							throw new Error(`Parent folder does not exist: ${parentPath}. Use parents: true to create it.`);
+						}
+					}
+					await this.app.vault.createFolder(path);
+				}
+
+				this.logger.mcp(`create_folder success: "${path}"`);
+				return {
+					content: [{ type: 'text', text: `Successfully created folder: ${path}` }],
+					isError: false,
+				};
+			}
+		);
+
+		// Register delete tool (DESTRUCTIVE)
+		this.mcpServer.tool(
+			'delete',
+			this.getToolDescription('delete', 'Delete a file or folder from the vault'),
+			{
+				path: z.string().describe('Path to the file or folder to delete, relative to vault root'),
+				recursive: z.boolean().optional().describe('Delete folder contents recursively (default: false, like rm without -r)'),
+				trash: z.boolean().optional().describe('Move to system trash instead of permanent delete (default: true, safer)'),
+			},
+			{
+				destructiveHint: true,
+			},
+			async ({ path, recursive = false, trash = true }) => {
+				this.logger.mcp(`delete called: "${path}" (recursive: ${recursive}, trash: ${trash})`);
+
+				const file = this.app.vault.getAbstractFileByPath(path);
+				if (!file) {
+					throw new Error(`Path not found: ${path}`);
+				}
+
+				const isFolder = (file as any).children !== undefined;
+
+				// If it's a non-empty folder and recursive is false, error
+				if (isFolder && !recursive) {
+					const children = (file as any).children;
+					if (children && children.length > 0) {
+						throw new Error(`Folder is not empty: ${path}. Use recursive: true to delete contents.`);
+					}
+				}
+
+				if (trash) {
+					// Move to system trash
+					await this.app.vault.trash(file, true);
+					this.logger.mcp(`delete success (trashed): "${path}"`);
+					return {
+						content: [{ type: 'text', text: `Successfully moved to trash: ${path}` }],
+						isError: false,
+					};
+				} else {
+					// Permanent delete
+					await this.app.vault.delete(file, true);
+					this.logger.mcp(`delete success (permanent): "${path}"`);
+					return {
+						content: [{ type: 'text', text: `Successfully deleted: ${path}` }],
+						isError: false,
+					};
+				}
+			}
+		);
+
+		// Register copy_file tool (DESTRUCTIVE)
+		this.mcpServer.tool(
+			'copy_file',
+			this.getToolDescription('copy_file', 'Copy a file to a new location in the vault'),
+			{
+				source: z.string().describe('Path to the source file, relative to vault root'),
+				destination: z.string().describe('Path for the copy, relative to vault root'),
+				overwrite: z.boolean().optional().describe('Overwrite destination if it exists (default: false)'),
+			},
+			{
+				destructiveHint: true,
+			},
+			async ({ source, destination, overwrite = false }) => {
+				this.logger.mcp(`copy_file called: "${source}" -> "${destination}" (overwrite: ${overwrite})`);
+
+				const sourceFile = this.app.vault.getAbstractFileByPath(source);
+				if (!sourceFile) {
+					throw new Error(`Source file not found: ${source}`);
+				}
+
+				if ((sourceFile as any).children !== undefined) {
+					throw new Error(`Cannot copy folders, only files: ${source}`);
+				}
+
+				// Check if destination exists
+				const existing = this.app.vault.getAbstractFileByPath(destination);
+				if (existing) {
+					if (!overwrite) {
+						throw new Error(`Destination already exists: ${destination}. Use overwrite: true to replace it.`);
+					}
+					// Delete existing file first
+					await this.app.vault.delete(existing, true);
+				}
+
+				// Ensure parent directory exists for the destination
+				const destDir = destination.substring(0, destination.lastIndexOf('/'));
+				if (destDir) {
+					const parentFolder = this.app.vault.getAbstractFileByPath(destDir);
+					if (!parentFolder) {
+						// Create parent directories
+						this.logger.mcp(`Creating parent directory: ${destDir}`);
+						const parts = destDir.split('/').filter(p => p);
+						let currentPath = '';
+						for (const part of parts) {
+							currentPath = currentPath ? `${currentPath}/${part}` : part;
+							const folder = this.app.vault.getAbstractFileByPath(currentPath);
+							if (!folder) {
+								await this.app.vault.createFolder(currentPath);
+							}
+						}
+					}
+				}
+
+				await this.app.vault.copy(sourceFile as any, destination);
+				this.logger.mcp(`copy_file success: "${source}" -> "${destination}"`);
+
+				return {
+					content: [{ type: 'text', text: `Successfully copied ${source} to ${destination}` }],
+					isError: false,
+				};
+			}
+		);
+
 		// Register execute_command tool (DESTRUCTIVE)
 		this.mcpServer.tool(
 			'execute_command',
@@ -789,6 +1006,194 @@ export default class WitnessPlugin extends Plugin {
 				}
 			);
 		}
+
+		// Semantic Search tool
+		this.mcpServer.tool(
+			'semantic_search',
+			this.settings.coreToolDescriptions?.semantic_search ||
+				'Search for documents by meaning using semantic similarity. Finds conceptually related notes even if they don\'t share exact keywords.',
+			{
+				query: z.string().describe('Natural language search query'),
+				limit: z.number().optional().default(10).describe('Maximum number of results to return'),
+				minScore: z.number().optional().default(0.3).describe('Minimum similarity score (0-1)'),
+				tags: z.array(z.string()).optional().describe('Filter results to documents with these tags'),
+				paths: z.array(z.string()).optional().describe('Filter results to documents in these paths'),
+			},
+			{
+				readOnlyHint: true,
+			},
+			async ({ query, limit, minScore, tags, paths }) => {
+				try {
+					// Initialize embedding service on first use (iframe mode - isolated browser context)
+					if (!this.embeddingService) {
+						this.embeddingService = new EmbeddingServiceIframe();
+						this.embeddingService.onProgress((info) => {
+							this.logger.info(`Embedding progress: ${info.status}`, info.progress);
+						});
+					}
+
+					// Initialize embedding index on first use
+					if (!this.embeddingIndex) {
+						this.embeddingIndex = new EmbeddingIndex(this.app);
+						await this.embeddingIndex.initialize();
+					}
+
+					// Initialize document indexer on first use
+					if (!this.documentIndexer) {
+						this.documentIndexer = new DocumentIndexer(
+							this.app,
+							this.embeddingIndex,
+							this.embeddingService
+						);
+					}
+
+					// Initialize the model if not already done
+					const modelInfo = await this.embeddingService.initialize();
+					this.logger.info(`Embedding model: ${modelInfo.model} (${modelInfo.dimensions} dims)`);
+
+					// Check if we have any indexed documents
+					const stats = this.embeddingIndex.getStats();
+					if (!stats || stats.documentCount === 0) {
+						return {
+							content: [
+								{
+									type: 'text',
+									text: `No documents indexed yet. Use the index_documents tool to build the semantic index first.\n\nModel ready: ${modelInfo.model} (${modelInfo.dimensions} dimensions)`,
+								},
+							],
+							isError: false,
+						};
+					}
+
+					// Generate embedding for query
+					const queryEmbedding = await this.embeddingService.embed(query);
+					this.logger.info(`Generated query embedding for: "${query}"`);
+
+					// Search the index
+					const results = await this.embeddingIndex.search(queryEmbedding, {
+						limit,
+						minScore,
+						tags,
+						paths,
+					});
+
+					// Format results
+					if (results.length === 0) {
+						return {
+							content: [
+								{
+									type: 'text',
+									text: `No results found for: "${query}"\n\nTry lowering the minScore (currently ${minScore}) or using different search terms.`,
+								},
+							],
+							isError: false,
+						};
+					}
+
+					const formattedResults = results.map((r, i) => {
+						const location = r.type === 'section' && r.section
+							? `${r.path}#${r.section.heading} (line ${r.section.line})`
+							: r.path;
+						const tagsStr = r.tags.length > 0 ? ` [${r.tags.join(', ')}]` : '';
+						return `${i + 1}. **${r.title}** (${(r.score * 100).toFixed(1)}%)${tagsStr}\n   ${location}`;
+					}).join('\n\n');
+
+					return {
+						content: [
+							{
+								type: 'text',
+								text: `Found ${results.length} result(s) for: "${query}"\n\n${formattedResults}`,
+							},
+						],
+						isError: false,
+					};
+				} catch (error) {
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					this.logger.error('Semantic search error:', errorMessage);
+
+					return {
+						content: [
+							{
+								type: 'text',
+								text: `Semantic search failed: ${errorMessage}`,
+							},
+						],
+						isError: true,
+					};
+				}
+			}
+		);
+
+		// Index Documents tool
+		this.mcpServer.tool(
+			'index_documents',
+			'Build or update the semantic search index. Processes all markdown files and generates embeddings for searching.',
+			{
+				force: z.boolean().optional().default(false).describe('Re-index all documents, even if unchanged'),
+			},
+			{
+				destructiveHint: true,
+			},
+			async ({ force }) => {
+				try {
+					// Initialize embedding service
+					if (!this.embeddingService) {
+						this.embeddingService = new EmbeddingServiceIframe();
+						this.embeddingService.onProgress((info) => {
+							this.logger.info(`Embedding progress: ${info.status}`, info.progress);
+						});
+					}
+
+					// Initialize embedding index
+					if (!this.embeddingIndex) {
+						this.embeddingIndex = new EmbeddingIndex(this.app);
+						await this.embeddingIndex.initialize();
+					}
+
+					// Initialize document indexer
+					if (!this.documentIndexer) {
+						this.documentIndexer = new DocumentIndexer(
+							this.app,
+							this.embeddingIndex,
+							this.embeddingService
+						);
+						this.documentIndexer.onProgress((progress) => {
+							this.logger.info(`Indexing: ${progress.phase} ${progress.current}/${progress.total}`, progress.currentFile);
+						});
+					}
+
+					// Ensure model is loaded
+					const modelInfo = await this.embeddingService.initialize();
+					this.logger.info(`Using model: ${modelInfo.model}`);
+
+					// Run indexing
+					const result = await this.documentIndexer.indexAll(force);
+
+					return {
+						content: [
+							{
+								type: 'text',
+								text: `Indexing complete!\n\n- Indexed: ${result.indexed} documents\n- Skipped (unchanged): ${result.skipped} documents\n- Errors: ${result.errors}\n\nModel: ${modelInfo.model} (${modelInfo.dimensions} dimensions)`,
+							},
+						],
+						isError: false,
+					};
+				} catch (error) {
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					this.logger.error('Indexing error:', errorMessage);
+
+					return {
+						content: [
+							{
+								type: 'text',
+								text: `Indexing failed: ${errorMessage}`,
+							},
+						],
+						isError: true,
+					};
+				}
+			}
+		);
 	}
 
 	private async handleMCPRequest(req: IncomingMessage, res: ServerResponse) {

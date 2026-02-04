@@ -81,6 +81,224 @@ Embedding Model: [Dropdown]
 
 **Implementation note:** Changing models requires full reindex since dimensions/quality differ
 
+## Embedding Provider Strategy
+
+### Primary Approach: Web Worker + WASM
+
+The default embedding provider uses a Web Worker running transformers.js with the ONNX WASM runtime. This works everywhere without external dependencies.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Default: Built-in WASM (works everywhere)                  │
+│                                                             │
+│  - No external dependencies                                 │
+│  - Pure JavaScript + WebAssembly                            │
+│  - Runs entirely within Obsidian                            │
+│  - ~25,000 tokens/sec on modern hardware                    │
+│                                                             │
+│  Optional: Ollama (for users who have it)                   │
+│                                                             │
+│  - Metal acceleration on Apple Silicon                      │
+│  - ~10x faster embedding generation                         │
+│  - Requires Ollama installed and running                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Provider 1: Web Worker + WASM (Default)
+
+**Why default:**
+- Zero external dependencies
+- Works on any machine that runs Obsidian
+- No installation required
+- Offline-capable
+
+**How it works:**
+- Web Worker runs transformers.js
+- ONNX WASM runtime executes model
+- Model downloaded once, cached locally
+- Runs entirely within Obsidian's Electron process
+
+**Performance:**
+- ~25,000 tokens/sec on modern CPUs
+- Initial model download: ~25MB
+- First load: 3-5 seconds (model initialization)
+- Subsequent queries: <500ms
+
+**Model:** `TaylorAI/bge-micro-v2`
+- 384 dimensions
+- 512 token context
+- Good quality, optimized for speed
+
+### Provider 2: Ollama (Optional Enhancement)
+
+For users who have Ollama installed, it can be enabled as an alternative provider for faster indexing.
+
+**Why Ollama:**
+- Uses Metal on Apple Silicon (GPU acceleration)
+- ~10x faster than WASM for embedding generation
+- Already popular with AI-focused users
+- Simple HTTP API
+
+**Detection:**
+```typescript
+async function isOllamaAvailable(): Promise<boolean> {
+  try {
+    const response = await fetch('http://localhost:11434/api/tags');
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+```
+
+**API Usage:**
+```typescript
+async function embedWithOllama(text: string): Promise<number[]> {
+  const response = await fetch('http://localhost:11434/api/embed', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'nomic-embed-text',  // Auto-downloads if not present
+      input: text
+    })
+  });
+
+  const data = await response.json();
+  return data.embeddings[0];  // Array of floats
+}
+```
+
+**Recommended Model:** `nomic-embed-text`
+- 768 dimensions, 8192 token context
+- ~274MB download
+- Excellent quality, optimized for Ollama
+
+### Settings UI for Provider
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Embedding Provider                                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ Provider: [Built-in (recommended) ▾]                        │
+│           ├─ Built-in (recommended)                         │
+│           └─ Ollama (faster, requires Ollama running)       │
+│                                                             │
+│ Status:                                                     │
+│ ● Using built-in embeddings (bge-micro-v2)                  │
+│   Ready - 1,234 documents indexed                           │
+│                                                             │
+│ OR (if Ollama selected but not running)                     │
+│                                                             │
+│ ⚠ Ollama not detected at localhost:11434                    │
+│   Make sure Ollama is running, or switch to Built-in.       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Implementation
+
+**Provider interface:**
+```typescript
+interface EmbeddingProvider {
+  name: string;
+  isAvailable(): Promise<boolean>;
+  embed(text: string): Promise<number[]>;
+  getModelInfo(): { name: string; dimensions: number };
+}
+
+class WasmProvider implements EmbeddingProvider {
+  name = 'wasm';
+  private worker: Worker;
+
+  async isAvailable(): Promise<boolean> {
+    return true;  // Always available
+  }
+
+  async embed(text: string): Promise<number[]> {
+    // Delegate to Web Worker (see Technical Implementation section)
+    return this.worker.embed(text);
+  }
+
+  getModelInfo() {
+    return { name: 'bge-micro-v2', dimensions: 384 };
+  }
+}
+
+class OllamaProvider implements EmbeddingProvider {
+  name = 'ollama';
+  private model = 'nomic-embed-text';
+
+  async isAvailable(): Promise<boolean> {
+    try {
+      const response = await fetch('http://localhost:11434/api/tags');
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async embed(text: string): Promise<number[]> {
+    const response = await fetch('http://localhost:11434/api/embed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: this.model, input: text })
+    });
+    const data = await response.json();
+    return data.embeddings[0];
+  }
+
+  getModelInfo() {
+    return { name: this.model, dimensions: 768 };
+  }
+}
+```
+
+**Provider selection:**
+```typescript
+class EmbeddingService {
+  private provider: EmbeddingProvider;
+
+  async initialize() {
+    const userPref = this.settings.embeddingProvider;
+
+    if (userPref === 'ollama') {
+      const ollama = new OllamaProvider();
+      if (await ollama.isAvailable()) {
+        this.provider = ollama;
+        console.log('Using Ollama for embeddings');
+        return;
+      }
+      console.warn('Ollama selected but not available, falling back to WASM');
+    }
+
+    // Default: WASM
+    this.provider = new WasmProvider();
+    console.log('Using built-in WASM for embeddings');
+  }
+}
+```
+
+### Dimension Compatibility
+
+**Important:** Ollama's `nomic-embed-text` produces 768-dimensional vectors, while the built-in WASM model produces 384-dimensional vectors. These are **not compatible** for searching.
+
+**Handling this:**
+- Store provider name with embeddings
+- On provider change → require full reindex
+- Warn user in settings when switching
+
+```json
+// .witness/embeddings/index.json
+{
+  "provider": "wasm",
+  "model": "bge-micro-v2",
+  "dimensions": 384,
+  "documentCount": 1234,
+  "lastUpdated": "2026-02-02T12:00:00Z"
+}
+```
+
 ## Feature Decisions
 
 ### Storage Format
