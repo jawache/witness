@@ -8,6 +8,7 @@ node_modules/
 # Build
 main.js
 main.js.map
+embedding-worker.js
 *.js.map
 
 # OS

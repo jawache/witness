@@ -769,4 +769,201 @@ All semantic search code is in the `feature/semantic-search` branch for future w
 
 ---
 
+## 2026-02-03 - Semantic Search WASM Deep Dive
+
+**Objective**: Get WASM-based embeddings working in Obsidian for semantic search
+
+### What We Tried
+
+Continued investigation into running transformers.js/ONNX in Obsidian's Electron environment. Systematically tested multiple approaches:
+
+1. **Web Worker with bundled transformers.js**
+   - Model downloads successfully (0-100%)
+   - Fails at ONNX session creation: "no available backend found"
+
+2. **Direct main thread with bundled transformers.js**
+   - TypeScript errors with fileURLToPath resolution
+   - Electron's hybrid Node.js/browser environment confuses module resolution
+
+3. **Dynamic import from CDN**
+   - `import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2')`
+   - Works in Electron's renderer process
+   - Model downloads successfully
+   - Same ONNX session creation failure: "Cannot read properties of undefined (reading 'create')"
+
+4. **Preloading onnxruntime-web separately**
+   - Load onnxruntime-web via script tag before transformers.js
+   - Set WASM paths explicitly
+   - Still fails at InferenceSession.create()
+
+5. **Various env configurations**
+   - `env.allowLocalModels = false`
+   - `env.useBrowserCache = true`
+   - `env.backends.onnx.wasm.wasmPaths = CDN_URL`
+   - None resolved the core issue
+
+### Root Cause Analysis
+
+The fundamental problem is that **Obsidian's Electron renderer process is a hybrid Node.js/browser environment** that confuses ONNX runtime's backend selection:
+
+1. ONNX detects Node.js APIs are available → tries Node backend
+2. Node backend requires native binaries → fails
+3. Falls back to WASM backend
+4. WASM backend can't initialize properly because of hybrid environment
+5. `InferenceSession.create` becomes undefined
+
+This is a **known limitation** with transformers.js in Electron environments. The library is designed for either pure Node.js OR pure browser, not Electron's hybrid.
+
+### THE SOLUTION: Iframe Isolation
+
+After examining the Smart Connections plugin codebase (which does WASM embeddings successfully), found the key insight: **use a hidden iframe to provide a clean browser context**.
+
+**How it works:**
+1. Create a hidden iframe with `srcdoc` containing a module script
+2. The iframe runs in a pure browser context without Node.js APIs
+3. Load transformers.js from CDN inside the iframe
+4. Communicate via `postMessage` between main plugin and iframe
+5. WASM initializes successfully in the clean browser environment!
+
+**Implementation:**
+```typescript
+// Create hidden iframe
+this.iframe = document.createElement('iframe');
+this.iframe.style.display = 'none';
+this.iframe.srcdoc = `
+  <script type="module">
+    const transformers = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.0');
+    // ... pipeline initialization works here!
+  </script>
+`;
+document.body.appendChild(this.iframe);
+```
+
+**Results:**
+- ✅ Model downloads successfully
+- ✅ WASM/ONNX runtime initializes
+- ✅ Embeddings generated (384 dimensions)
+- ✅ Sub-second response time after initial load
+
+### Code Changes
+
+- Created `embedding-service-iframe.ts` with iframe-based approach
+- Uses `@huggingface/transformers@3.8.0` from CDN
+- Tries WebGPU first, falls back to WASM
+- Updated `main.ts` to use `EmbeddingServiceIframe`
+
+### Key Learning
+
+**The iframe isolation pattern is the solution for running WASM in Obsidian plugins.** The iframe provides a clean browser environment where:
+- No Node.js APIs pollute the global scope
+- Module resolution follows browser rules
+- WASM backend initialization works correctly
+
+Credit to Smart Connections for pioneering this approach!
+
+### Next Steps
+
+1. ✅ WASM embeddings working via iframe
+2. Phase B: Implement storage & indexing in .witness/
+3. Phase C: Complete semantic_search tool with actual document search
+4. Phase D: Settings UI for semantic search
+5. Phase E: Obsidian Leaf View UI
+
+---
+
+## 2026-02-04 - Semantic Search Complete: Storage, Indexing & Search
+
+**Objective**: Complete the semantic search implementation with document indexing, storage, and actual search functionality.
+
+### What We Built
+
+Completed the full semantic search pipeline:
+
+1. **EmbeddingIndex** (`src/embedding-index.ts`)
+   - Storage in `.witness/embeddings/` folder
+   - Index metadata tracking model, version, document count
+   - Per-file vector storage in `vectors/` subdirectory
+   - Cosine similarity search with filtering by tags/paths
+   - Incremental update support
+
+2. **DocumentIndexer** (`src/document-indexer.ts`)
+   - Hierarchical chunking: document-level + H2 section embeddings
+   - Front matter extraction (tags, title)
+   - Content hashing for change detection
+   - Progress callbacks for UI feedback
+
+3. **MCP Tools**
+   - `semantic_search` - Find documents by meaning with filters
+   - `index_documents` - Build/update the embedding index
+
+4. **Incremental Updates**
+   - File change listeners (`modify`, `delete`, `rename`)
+   - Automatic re-indexing on file changes
+   - Skip unchanged files during batch indexing
+
+### The Journey
+
+**Challenge: Wrong Test Vault**
+
+Spent significant time debugging why `index_documents` tool wasn't appearing. Discovered there were TWO vaults:
+- `test-vault/` - where we were copying files
+- `test/vault/` - the actual vault open in Obsidian
+
+After copying to the correct location and restarting Obsidian, everything worked immediately.
+
+**Testing the Full Pipeline:**
+
+```bash
+# Initialize session
+curl -X POST http://localhost:3001/mcp ...
+
+# Index documents - SUCCESS!
+{"text":"Indexing complete!\n\n- Indexed: 8 documents\n- Skipped (unchanged): 0\n- Errors: 0\n\nModel: TaylorAI/bge-micro-v2 (384 dimensions)"}
+
+# Search by meaning - SUCCESS!
+{"text":"Found 9 result(s) for: \"chaos and order philosophy\"\n\n1. **move-conflict-source** (50.5%)\n..."}
+```
+
+The search returns both document-level and section-level results with similarity percentages.
+
+### Achievements
+
+- **Iframe Pattern Works**: transformers.js runs successfully in hidden iframe
+- **384-dimension embeddings**: Using TaylorAI/bge-micro-v2 model
+- **Sub-second queries**: After initial model load, search is fast
+- **Hierarchical results**: Section headings with line numbers returned
+- **Filter support**: Can filter by tags and folder paths
+
+### Learnings
+
+1. **Always verify the correct vault**: Development vs test vaults can cause confusion
+2. **Obsidian requires full restart**: Copying files isn't enough - JS must be reloaded
+3. **Iframe isolation is the key**: Clean browser context for WASM initialization
+4. **postMessage for communication**: Simple and reliable across iframe boundary
+
+### Session Stats
+
+- **3 new source files** created
+- **~600 lines** of new TypeScript
+- **2 new MCP tools** (semantic_search, index_documents)
+- **14 total MCP tools** now available
+- **8 documents indexed** in test vault
+
+### Files Changed
+
+- `src/embedding-service-iframe.ts` - Iframe WASM embeddings (created earlier)
+- `src/embedding-index.ts` - NEW: Storage and search
+- `src/document-indexer.ts` - NEW: Document processing
+- `src/main.ts` - Updated with new tools and file listeners
+- `README.md` - Updated feature list and roadmap
+- `CLAUDE.md` - Updated phase status and documentation
+
+### What's Next
+
+- Phase D: Settings UI for semantic search (exclude paths, index status)
+- Phase E: Obsidian Leaf View for visual search interface
+- Consider: Background indexing on vault open
+
+---
+
 *End of log entry*

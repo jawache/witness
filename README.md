@@ -15,18 +15,19 @@ The plugin helps you move information from chaos to order, with AI assistance to
 
 ## Features
 
-### Current (Phase 1 + 2) ✅
+### Current (Phase 1 + 2 + 3) ✅
 
 - **MCP Server**: Runs inside Obsidian, no external dependencies
 - **File Operations**: Read, write, edit, and list files in your vault via AI
 - **Full-Text Search**: Search across all markdown files with optional filters
+- **Semantic Search**: Find documents by meaning using local WASM embeddings
 - **Command Execution**: Execute any Obsidian command via AI
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
 - **Remote Access**: Cloudflare Quick Tunnel for access from anywhere
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
-**9 MCP Tools Available**:
+**14 MCP Tools Available**:
 
 - `read_file` - Read file contents
 - `write_file` - Create/modify files
@@ -35,8 +36,13 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - `search` - Full-text search with filters
 - `find_files` - Search files by name pattern
 - `move_file` - Move or rename files
+- `copy_file` - Copy files to new location
+- `create_folder` - Create folders (with mkdir -p support)
+- `delete` - Delete files/folders (with trash support)
 - `execute_command` - Run Obsidian commands
 - `get_vault_context` - Load your vault's context document
+- `semantic_search` - Find documents by meaning (NEW!)
+- `index_documents` - Build/update semantic search index (NEW!)
 
 ### Coming Soon
 
@@ -317,14 +323,23 @@ This is different from other Obsidian MCP servers that run externally and connec
 - [ ] Mobile app support
 - [ ] Multi-user sessions
 
-### Phase 3: Intelligence
+### Phase 3: Semantic Search ✅
+
+- [x] Local WASM embeddings (transformers.js in iframe)
+- [x] Document indexing with hierarchical chunking
+- [x] Cosine similarity search
+- [x] Incremental index updates on file changes
+- [x] Filter by tags and paths
+
+### Phase 4: Intelligence
+
 - [ ] Heartbeat scheduler (daily/weekly prompts)
 - [ ] Chaos monitoring (detect stale items)
 - [ ] Smart suggestions
 - [ ] Auto-categorization
 
-### Phase 4: Advanced Features
-- [ ] Semantic search (Smart Connections integration)
+### Phase 5: Advanced Features
+
 - [ ] Graph analysis
 - [ ] Template system
 - [ ] Workflow automation

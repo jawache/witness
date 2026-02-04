@@ -121,7 +121,7 @@ All Core MCP Tools Implemented:
 
 Total: 9 MCP tools registered and available
 
-### Phase 2 Status: 🚧 IN PROGRESS
+### Phase 2 Status: ✅ COMPLETE
 
 Remote Access via Cloudflare Tunnel:
 
@@ -131,7 +131,21 @@ Remote Access via Cloudflare Tunnel:
 - ✅ Regenerate tunnel button in settings UI
 - ✅ Tunnel status indicator (connecting/connected/error)
 - ✅ Token authentication for remote access
-- ⏳ WhatsApp/Telegram bot (not started)
+
+### Phase 3 Status: ✅ COMPLETE
+
+Semantic Search with Local Embeddings:
+
+- ✅ `semantic_search` MCP tool - find documents by meaning
+- ✅ `index_documents` MCP tool - build/update the embedding index
+- ✅ Iframe-based WASM embeddings (transformers.js)
+- ✅ TaylorAI/bge-micro-v2 model (384 dimensions)
+- ✅ Hierarchical chunking (document + H2 section embeddings)
+- ✅ Cosine similarity search with filtering
+- ✅ Incremental updates on file changes
+- ✅ Storage in `.witness/embeddings/` folder
+
+Total: 14 MCP tools registered and available
 
 ## MCP Implementation Details
 
@@ -326,6 +340,47 @@ curl -X POST https://your-random-words.trycloudflare.com/mcp \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"initialize",...}'
 ```
+
+### Semantic Search & Iframe WASM Pattern
+
+The plugin includes semantic search powered by local WASM embeddings. This was challenging to implement due to Obsidian's hybrid Electron environment.
+
+**The Problem:**
+Obsidian's Electron renderer has both Node.js and browser APIs available. This confuses ONNX runtime's backend selection - it detects Node.js, tries native bindings, fails, then can't properly initialize WASM fallback.
+
+**The Solution: Iframe Isolation**
+Create a hidden iframe with `srcdoc` to provide a clean browser-only context:
+
+```typescript
+// Create isolated browser context
+this.iframe = document.createElement('iframe');
+this.iframe.style.display = 'none';
+this.iframe.srcdoc = `
+  <script type="module">
+    const transformers = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.0');
+    // WASM initializes correctly in clean browser context!
+  </script>
+`;
+document.body.appendChild(this.iframe);
+```
+
+**Key Files:**
+
+- `src/embedding-service-iframe.ts` - Iframe-based embedding service
+- `src/embedding-index.ts` - Storage in `.witness/embeddings/`
+- `src/document-indexer.ts` - Hierarchical chunking and indexing
+
+**Storage Structure:**
+
+```text
+.witness/
+  embeddings/
+    index.json          # Index metadata (model, dimensions, count)
+    vectors/
+      path_to_file.json # Per-file embeddings
+```
+
+**Credit:** This pattern was learned from the Smart Connections plugin's approach.
 
 ### Token Authentication
 
