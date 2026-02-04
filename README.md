@@ -20,14 +20,14 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **MCP Server**: Runs inside Obsidian, no external dependencies
 - **File Operations**: Read, write, edit, and list files in your vault via AI
 - **Full-Text Search**: Search across all markdown files with optional filters
-- **Semantic Search**: Find documents by meaning using local WASM embeddings
+- **Semantic Search**: Find documents by meaning using Smart Connections embeddings
 - **Command Execution**: Execute any Obsidian command via AI
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
 - **Remote Access**: Cloudflare Quick Tunnel for access from anywhere
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
-**14 MCP Tools Available**:
+**13 MCP Tools Available**:
 
 - `read_file` - Read file contents
 - `write_file` - Create/modify files
@@ -41,8 +41,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - `delete` - Delete files/folders (with trash support)
 - `execute_command` - Run Obsidian commands
 - `get_vault_context` - Load your vault's context document
-- `semantic_search` - Find documents by meaning (NEW!)
-- `index_documents` - Build/update semantic search index (NEW!)
+- `semantic_search` - Find documents by meaning (requires Smart Connections plugin)
 
 ### Coming Soon
 
@@ -325,11 +324,11 @@ This is different from other Obsidian MCP servers that run externally and connec
 
 ### Phase 3: Semantic Search ✅
 
-- [x] Local WASM embeddings (transformers.js in iframe)
-- [x] Document indexing with hierarchical chunking
-- [x] Cosine similarity search
-- [x] Incremental index updates on file changes
-- [x] Filter by tags and paths
+- [x] Smart Connections integration for document embeddings
+- [x] Local WASM embeddings for query generation (transformers.js in iframe)
+- [x] Cosine similarity search with incremental caching
+- [x] Filter by paths
+- [x] Tested on 4,097-document vault
 
 ### Phase 4: Intelligence
 

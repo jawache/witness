@@ -967,3 +967,104 @@ The search returns both document-level and section-level results with similarity
 ---
 
 *End of log entry*
+
+## 2026-02-04 - Smart Connections Integration
+
+**Objective**: Replace custom iframe-based embedding indexing with Smart Connections' pre-built embeddings for semantic search.
+
+### The Problem
+
+The custom embedding approach (iframe + transformers.js + WASM) worked but had stability issues at scale. When indexing a vault with ~2000 documents, approximately 10% of files (~200) would fail to index due to WASM memory corruption. The iframe reset mechanism helped but didn't fully solve it. Rather than fight WASM instability, we pivoted to reading embeddings from the Smart Connections plugin, which has already solved these problems with its mature indexing system.
+
+### What We Built
+
+- **SmartConnectionsReader** (`src/smart-connections-reader.ts`): New class that reads and caches embeddings from Smart Connections' `.smart-env/multi/*.ajson` files
+  - Validates SC is installed with correct model (`TaylorAI/bge-micro-v2`)
+  - Parses AJSON format (append-only JSON, one entry per line with trailing commas)
+  - Incremental caching using mtime tracking per SC file
+  - Cosine similarity search against cached vectors
+
+- **Updated `semantic_search` tool**: Now uses SmartConnectionsReader for document embeddings while keeping iframe embedding service for query embeddings only
+
+- **Removed `index_documents` tool**: SC handles all indexing, so this tool is no longer needed
+
+- **Cleaned up old embedding code**: Removed 5 source files (~1,450 lines) that are no longer needed
+
+### The Journey
+
+**Feature branch preservation**: Before starting, we preserved all the iframe embedding work on the `feature/iframe-embeddings` branch in case we ever need it again.
+
+**SC file format discovery**: Smart Connections stores embeddings in `.smart-env/multi/*.ajson` files. The AJSON format is append-only JSON with one entry per line. Each line looks like:
+```
+"smart_sources:path/to/file.md": {"path":"path/to/file.md","embeddings":{"TaylorAI/bge-micro-v2":{"vec":[...384 floats...]}},...},
+```
+Key gotcha: lines end with a trailing comma which must be stripped before JSON parsing.
+
+**mtime caching bug**: The first implementation tried to map SC filenames back to vault paths for cache lookup (SC uses `!` for hidden paths like `.obsidian/`, while our conversion used `_`). This meant cache lookups failed and every search re-read all 4000+ files from disk (~7 seconds). Fixed by tracking mtimes directly keyed by SC file path, with a separate `scFileToVaultPath` map. After fix: cached searches complete in ~265ms.
+
+**Deleted files cleanup**: Also removed the esbuild worker configuration since we no longer build a separate Web Worker bundle.
+
+### Technical Details
+
+**Architecture**:
+```
+semantic_search request
+    → SmartConnectionsReader.validate() - check SC config & model
+    → SmartConnectionsReader.loadEmbeddings() - incremental, mtime-based
+    → EmbeddingServiceIframe.embed(query) - WASM query embedding
+    → SmartConnectionsReader.search() - cosine similarity
+    → Ranked results
+```
+
+**Performance on main vault (4,097 documents)**:
+- First search: ~14s (load all embeddings from disk + model init)
+- Subsequent searches: ~265ms (mtime checks + query embedding + search)
+- Memory: ~7MB for 4097 cached vectors (384 floats × 4 bytes × 4097)
+- Search execution: <10ms for cosine similarity against all vectors
+
+**Files removed** (1,451 lines deleted):
+- `src/embedding-index.ts` (418 lines) - Custom storage
+- `src/document-indexer.ts` (428 lines) - Custom indexing
+- `src/embedding-service.ts` (232 lines) - Web Worker approach
+- `src/embedding-service-direct.ts` (227 lines) - Direct approach
+- `src/embedding-worker.ts` (146 lines) - Worker file
+
+**Files kept**:
+- `src/embedding-service-iframe.ts` - Still used for query embedding generation
+
+### Key Learnings
+
+1. **Leverage existing plugins**: Smart Connections has years of development solving WASM/ONNX stability issues. Reading their embeddings is far more reliable than reimplementing indexing.
+2. **AJSON trailing commas**: SC's append-only JSON format has trailing commas on each line - must strip before parsing.
+3. **SC filename conventions**: Files starting with `.` get `!` prefix in SC filenames (e.g., `.obsidian/` → `!obsidian_`). Don't try to reverse-engineer this; track by SC file path directly.
+4. **mtime-based caching**: Track mtimes keyed by the actual file path you're checking (SC file path), not by a derived/converted path. Simple and reliable.
+
+### Session Stats
+
+- **1 new source file** created (`src/smart-connections-reader.ts`, ~360 lines)
+- **5 source files** deleted (~1,450 lines)
+- **Net: ~1,090 lines removed** while adding the same functionality
+- **13 MCP tools** (down from 14 - removed `index_documents`)
+- **4,097 documents** successfully searched in main vault
+
+### Files Changed
+
+- `src/smart-connections-reader.ts` - NEW: SC file reading and caching
+- `src/main.ts` - Updated semantic_search, removed index_documents
+- `esbuild.config.mjs` - Removed worker build configuration
+- `docs/features/smart-connections-integration.md` - NEW: Feature specification
+- `src/embedding-index.ts` - DELETED
+- `src/document-indexer.ts` - DELETED
+- `src/embedding-service.ts` - DELETED
+- `src/embedding-service-direct.ts` - DELETED
+- `src/embedding-worker.ts` - DELETED
+
+### What's Next
+
+- Fix first-search latency (~14s for 4000 docs) - consider background preloading on plugin start
+- Settings UI for semantic search (exclude paths, index status)
+- Obsidian Leaf View for visual search interface
+
+---
+
+*End of log entry*

@@ -134,18 +134,17 @@ Remote Access via Cloudflare Tunnel:
 
 ### Phase 3 Status: ✅ COMPLETE
 
-Semantic Search with Local Embeddings:
+Semantic Search via Smart Connections Integration:
 
 - ✅ `semantic_search` MCP tool - find documents by meaning
-- ✅ `index_documents` MCP tool - build/update the embedding index
-- ✅ Iframe-based WASM embeddings (transformers.js)
-- ✅ TaylorAI/bge-micro-v2 model (384 dimensions)
-- ✅ Hierarchical chunking (document + H2 section embeddings)
-- ✅ Cosine similarity search with filtering
-- ✅ Incremental updates on file changes
-- ✅ Storage in `.witness/embeddings/` folder
+- ✅ Reads embeddings from Smart Connections plugin (`.smart-env/multi/*.ajson`)
+- ✅ Validates SC model compatibility (`TaylorAI/bge-micro-v2`)
+- ✅ Incremental caching with mtime tracking (~265ms cached searches)
+- ✅ Iframe WASM embeddings for query embedding only (transformers.js)
+- ✅ Cosine similarity search with path filtering
+- ✅ Tested on 4,097-document vault
 
-Total: 14 MCP tools registered and available
+Total: 13 MCP tools registered and available
 
 ## MCP Implementation Details
 

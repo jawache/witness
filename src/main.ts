@@ -10,8 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { EmbeddingServiceIframe } from './embedding-service-iframe';
-import { EmbeddingIndex } from './embedding-index';
-import { DocumentIndexer } from './document-indexer';
+import { SmartConnectionsReader } from './smart-connections-reader';
 
 /**
  * Logger that writes to both console and file.
@@ -205,8 +204,7 @@ export default class WitnessPlugin extends Plugin {
 	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
 	private embeddingService: EmbeddingServiceIframe | null = null;
-	private embeddingIndex: EmbeddingIndex | null = null;
-	private documentIndexer: DocumentIndexer | null = null;
+	private scReader: SmartConnectionsReader | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -233,31 +231,6 @@ export default class WitnessPlugin extends Plugin {
 		if (this.settings.enableTunnel && this.settings.mcpEnabled) {
 			this.startTunnel();
 		}
-
-		// Set up file change listeners for incremental embedding updates
-		this.registerEvent(
-			this.app.vault.on('modify', async (file) => {
-				if (this.documentIndexer && file instanceof TFile) {
-					await this.documentIndexer.onFileChange(file);
-				}
-			})
-		);
-
-		this.registerEvent(
-			this.app.vault.on('delete', async (file) => {
-				if (this.documentIndexer && file instanceof TFile) {
-					await this.documentIndexer.onFileDelete(file.path);
-				}
-			})
-		);
-
-		this.registerEvent(
-			this.app.vault.on('rename', async (file, oldPath) => {
-				if (this.documentIndexer && file instanceof TFile) {
-					await this.documentIndexer.onFileRename(file, oldPath);
-				}
-			})
-		);
 	}
 
 	async onunload() {
@@ -268,11 +241,10 @@ export default class WitnessPlugin extends Plugin {
 			this.embeddingService.destroy();
 			this.embeddingService = null;
 		}
-		if (this.embeddingIndex) {
-			this.embeddingIndex.clearCache();
-			this.embeddingIndex = null;
+		if (this.scReader) {
+			this.scReader.clearCache();
+			this.scReader = null;
 		}
-		this.documentIndexer = null;
 		await this.logger.close();
 	}
 
@@ -1007,74 +979,82 @@ export default class WitnessPlugin extends Plugin {
 			);
 		}
 
-		// Semantic Search tool
+		// Semantic Search tool (uses Smart Connections embeddings)
 		this.mcpServer.tool(
 			'semantic_search',
 			this.settings.coreToolDescriptions?.semantic_search ||
-				'Search for documents by meaning using semantic similarity. Finds conceptually related notes even if they don\'t share exact keywords.',
+				'Search for documents by meaning using semantic similarity. Requires Smart Connections plugin with TaylorAI/bge-micro-v2 embeddings.',
 			{
 				query: z.string().describe('Natural language search query'),
 				limit: z.number().optional().default(10).describe('Maximum number of results to return'),
 				minScore: z.number().optional().default(0.3).describe('Minimum similarity score (0-1)'),
-				tags: z.array(z.string()).optional().describe('Filter results to documents with these tags'),
 				paths: z.array(z.string()).optional().describe('Filter results to documents in these paths'),
 			},
 			{
 				readOnlyHint: true,
 			},
-			async ({ query, limit, minScore, tags, paths }) => {
+			async ({ query, limit, minScore, paths }) => {
 				try {
-					// Initialize embedding service on first use (iframe mode - isolated browser context)
+					// Initialize Smart Connections reader on first use
+					if (!this.scReader) {
+						this.scReader = new SmartConnectionsReader(this.app);
+					}
+
+					// Validate Smart Connections configuration
+					const validation = await this.scReader.validate();
+					if (!validation.valid) {
+						return {
+							content: [
+								{
+									type: 'text',
+									text: validation.error || 'Smart Connections validation failed',
+								},
+							],
+							isError: true,
+						};
+					}
+
+					this.logger.info(`Smart Connections validated: ${validation.documentCount} documents, model: ${validation.model}`);
+
+					// Load/refresh embeddings cache (incremental)
+					const loadedCount = await this.scReader.loadEmbeddings();
+					this.logger.info(`Loaded ${loadedCount} new/updated embeddings, total cached: ${this.scReader.getCount()}`);
+
+					if (this.scReader.getCount() === 0) {
+						return {
+							content: [
+								{
+									type: 'text',
+									text: 'No embeddings found in Smart Connections. Please ensure Smart Connections has indexed your vault.',
+								},
+							],
+							isError: true,
+						};
+					}
+
+					// Initialize embedding service for query embedding (iframe mode)
 					if (!this.embeddingService) {
-						this.embeddingService = new EmbeddingServiceIframe();
+						this.embeddingService = new EmbeddingServiceIframe({
+							gpuMode: 'never',  // Use WASM only for single query embeddings
+							throttleMs: 0,     // No throttling needed for single queries
+						});
 						this.embeddingService.onProgress((info) => {
 							this.logger.info(`Embedding progress: ${info.status}`, info.progress);
 						});
 					}
 
-					// Initialize embedding index on first use
-					if (!this.embeddingIndex) {
-						this.embeddingIndex = new EmbeddingIndex(this.app);
-						await this.embeddingIndex.initialize();
-					}
-
-					// Initialize document indexer on first use
-					if (!this.documentIndexer) {
-						this.documentIndexer = new DocumentIndexer(
-							this.app,
-							this.embeddingIndex,
-							this.embeddingService,
-							this.logger
-						);
-					}
-
 					// Initialize the model if not already done
 					const modelInfo = await this.embeddingService.initialize();
-					this.logger.info(`Embedding model: ${modelInfo.model} (${modelInfo.dimensions} dims)`);
-
-					// Check if we have any indexed documents
-					const stats = this.embeddingIndex.getStats();
-					if (!stats || stats.documentCount === 0) {
-						return {
-							content: [
-								{
-									type: 'text',
-									text: `No documents indexed yet. Use the index_documents tool to build the semantic index first.\n\nModel ready: ${modelInfo.model} (${modelInfo.dimensions} dimensions)`,
-								},
-							],
-							isError: false,
-						};
-					}
+					this.logger.info(`Query embedding model: ${modelInfo.model} (${modelInfo.dimensions} dims)`);
 
 					// Generate embedding for query
 					const queryEmbedding = await this.embeddingService.embed(query);
 					this.logger.info(`Generated query embedding for: "${query}"`);
 
-					// Search the index
-					const results = await this.embeddingIndex.search(queryEmbedding, {
+					// Search using Smart Connections embeddings
+					const results = this.scReader.search(queryEmbedding, {
 						limit,
 						minScore,
-						tags,
 						paths,
 					});
 
@@ -1092,11 +1072,7 @@ export default class WitnessPlugin extends Plugin {
 					}
 
 					const formattedResults = results.map((r, i) => {
-						const location = r.type === 'section' && r.section
-							? `${r.path}#${r.section.heading} (line ${r.section.line})`
-							: r.path;
-						const tagsStr = r.tags.length > 0 ? ` [${r.tags.join(', ')}]` : '';
-						return `${i + 1}. **${r.title}** (${(r.score * 100).toFixed(1)}%)${tagsStr}\n   ${location}`;
+						return `${i + 1}. **${r.path}** (${(r.score * 100).toFixed(1)}%)`;
 					}).join('\n\n');
 
 					return {
@@ -1117,78 +1093,6 @@ export default class WitnessPlugin extends Plugin {
 							{
 								type: 'text',
 								text: `Semantic search failed: ${errorMessage}`,
-							},
-						],
-						isError: true,
-					};
-				}
-			}
-		);
-
-		// Index Documents tool
-		this.mcpServer.tool(
-			'index_documents',
-			'Build or update the semantic search index. Processes all markdown files and generates embeddings for searching.',
-			{
-				force: z.boolean().optional().default(false).describe('Re-index all documents, even if unchanged'),
-			},
-			{
-				destructiveHint: true,
-			},
-			async ({ force }) => {
-				try {
-					// Initialize embedding service
-					if (!this.embeddingService) {
-						this.embeddingService = new EmbeddingServiceIframe();
-						this.embeddingService.onProgress((info) => {
-							this.logger.info(`Embedding progress: ${info.status}`, info.progress);
-						});
-					}
-
-					// Initialize embedding index
-					if (!this.embeddingIndex) {
-						this.embeddingIndex = new EmbeddingIndex(this.app);
-						await this.embeddingIndex.initialize();
-					}
-
-					// Initialize document indexer
-					if (!this.documentIndexer) {
-						this.documentIndexer = new DocumentIndexer(
-							this.app,
-							this.embeddingIndex,
-							this.embeddingService,
-							this.logger
-						);
-						this.documentIndexer.onProgress((progress) => {
-							this.logger.info(`Indexing: ${progress.phase} ${progress.current}/${progress.total}`, progress.currentFile);
-						});
-					}
-
-					// Ensure model is loaded
-					const modelInfo = await this.embeddingService.initialize();
-					this.logger.info(`Using model: ${modelInfo.model}`);
-
-					// Run indexing
-					const result = await this.documentIndexer.indexAll(force);
-
-					return {
-						content: [
-							{
-								type: 'text',
-								text: `Indexing complete!\n\n- Indexed: ${result.indexed} documents\n- Skipped (unchanged): ${result.skipped} documents\n- Errors: ${result.errors}\n\nModel: ${modelInfo.model} (${modelInfo.dimensions} dimensions)`,
-							},
-						],
-						isError: false,
-					};
-				} catch (error) {
-					const errorMessage = error instanceof Error ? error.message : String(error);
-					this.logger.error('Indexing error:', errorMessage);
-
-					return {
-						content: [
-							{
-								type: 'text',
-								text: `Indexing failed: ${errorMessage}`,
 							},
 						],
 						isError: true,

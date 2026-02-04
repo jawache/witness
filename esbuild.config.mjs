@@ -45,41 +45,9 @@ const mainContext = await esbuild.context({
 	platform: "node",
 });
 
-// Embedding worker build (separate bundle for Web Worker)
-// Uses browser platform and ES2020 for BigInt support (required by ONNX)
-const workerContext = await esbuild.context({
-	banner: {
-		js: banner,
-	},
-	entryPoints: ["src/embedding-worker.ts"],
-	bundle: true,
-	format: "iife",
-	target: "es2020",
-	logLevel: "info",
-	sourcemap: prod ? false : "inline",
-	treeShaking: true,
-	outfile: "embedding-worker.js",
-	platform: "browser",
-	// Force WASM version of ONNX runtime
-	conditions: ["browser", "import"],
-	alias: {
-		"onnxruntime-node": "onnxruntime-web",
-	},
-	// External native modules that can't be bundled
-	external: [
-		"*.node",
-	],
-});
-
 if (prod) {
-	await Promise.all([
-		mainContext.rebuild(),
-		workerContext.rebuild(),
-	]);
+	await mainContext.rebuild();
 	process.exit(0);
 } else {
-	await Promise.all([
-		mainContext.watch(),
-		workerContext.watch(),
-	]);
+	await mainContext.watch();
 }
