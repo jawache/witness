@@ -134,12 +134,37 @@ export class EmbeddingIndex {
   }
 
   /**
+   * Hash a string for filename generation
+   */
+  private hashString(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return Math.abs(hash).toString(16).padStart(8, '0');
+  }
+
+  /**
    * Get the vector file path for a document
    */
   private getVectorPath(docPath: string): string {
     // Convert path to safe filename: replace / with _ and add .json
-    const safeName = docPath.replace(/\//g, '_').replace(/\.md$/, '') + '.json';
-    return normalizePath(`${VECTORS_DIR}/${safeName}`);
+    let safeName = docPath.replace(/\//g, '_').replace(/\.md$/, '');
+
+    // Max filename length on most filesystems is 255 bytes
+    // Leave room for .json extension (5 chars) and some buffer
+    const MAX_FILENAME_LENGTH = 200;
+
+    if (safeName.length > MAX_FILENAME_LENGTH) {
+      // Hash the full path for uniqueness, keep a readable prefix
+      const hash = this.hashString(docPath);
+      const prefix = safeName.slice(0, 150);  // Keep first 150 chars for readability
+      safeName = `${prefix}_${hash}`;
+    }
+
+    return normalizePath(`${VECTORS_DIR}/${safeName}.json`);
   }
 
   /**
@@ -230,9 +255,9 @@ export class EmbeddingIndex {
   }
 
   /**
-   * Get all indexed document paths
+   * Get all indexed vector files
    */
-  async getIndexedPaths(): Promise<string[]> {
+  async getVectorFiles(): Promise<string[]> {
     const adapter = this.app.vault.adapter;
 
     if (!await adapter.exists(VECTORS_DIR)) {
@@ -240,28 +265,41 @@ export class EmbeddingIndex {
     }
 
     const files = await adapter.list(VECTORS_DIR);
-    return files.files.map(f => {
-      // Convert filename back to path
-      const name = f.replace(`${VECTORS_DIR}/`, '').replace('.json', '');
-      return name.replace(/_/g, '/') + '.md';
-    });
+    return files.files.filter(f => f.endsWith('.json'));
   }
 
   /**
    * Load all embeddings into cache for searching
+   * Reads directly from vector files to handle hashed filenames
    */
   async loadAllEmbeddings(): Promise<DocumentEmbedding[]> {
-    const paths = await this.getIndexedPaths();
+    const vectorFiles = await this.getVectorFiles();
     const embeddings: DocumentEmbedding[] = [];
+    const adapter = this.app.vault.adapter;
 
-    for (const path of paths) {
-      const embedding = await this.getDocumentEmbedding(path);
-      if (embedding) {
+    for (const vectorFile of vectorFiles) {
+      try {
+        const content = await adapter.read(vectorFile);
+        const embedding = JSON.parse(content) as DocumentEmbedding;
+
+        // Cache it using the path stored in the embedding
+        this.cache.set(embedding.path, embedding);
         embeddings.push(embedding);
+      } catch {
+        // Skip invalid files
       }
     }
 
     return embeddings;
+  }
+
+  /**
+   * Get all indexed document paths
+   * Note: For hashed filenames, we must read from stored embeddings
+   */
+  async getIndexedPaths(): Promise<string[]> {
+    const embeddings = await this.loadAllEmbeddings();
+    return embeddings.map(e => e.path);
   }
 
   /**
