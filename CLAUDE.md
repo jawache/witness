@@ -125,12 +125,33 @@ Total: 9 MCP tools registered and available
 
 Remote Access via Cloudflare Tunnel:
 
-- ✅ Cloudflare Quick Tunnel integration
+- ✅ Cloudflare Quick Tunnel integration (ephemeral URLs)
+- ✅ Cloudflare Named Tunnel support (permanent URLs with own domain)
+- ✅ Primary Machine designation for multi-device Obsidian Sync
 - ✅ Auto-install cloudflared binary to `~/.witness/bin/`
 - ✅ Tunnel URL displayed in settings with copy button
-- ✅ Regenerate tunnel button in settings UI
+- ✅ Regenerate/reconnect tunnel button in settings UI
 - ✅ Tunnel status indicator (connecting/connected/error)
 - ✅ Token authentication for remote access
+
+#### Named Tunnel Details
+
+**`Tunnel.withToken(token)` vs `Tunnel.quick(url)`:**
+- Quick tunnels emit a `url` event with the random trycloudflare.com URL
+- Named tunnels do NOT emit `url` — they emit `connected` with `{ id, ip, location }`
+- Named tunnel URL is user-configured in settings (from Cloudflare dashboard)
+- Named tunnel token is a JWT from Cloudflare Zero Trust → Networks → Tunnels → Configure
+
+**Primary Machine (`tunnelPrimaryHost`):**
+- Stores `os.hostname()` of the designated machine
+- Checked at the top of `startTunnel()` — skips silently if not primary
+- Prevents round-robin when Obsidian Sync shares plugin settings across devices
+- Settings UI shows current host, "Set as primary" button, and clear button
+
+**Mobile Limitations:**
+- `http.createServer()` and cloudflared binary are desktop-only
+- Obsidian mobile cannot run the MCP server or tunnel
+- Mobile devices access the vault as MCP clients through the tunnel URL
 
 ### Phase 3 Status: ✅ COMPLETE
 
@@ -292,33 +313,41 @@ this.mcpServer.tool(
 
 The SDK automatically generates JSON Schema from Zod definitions and handles request validation.
 
-### Cloudflare Quick Tunnel
+### Cloudflare Tunnel (Quick & Named)
 
-The plugin can expose the MCP server to the internet via Cloudflare's Quick Tunnel feature.
+The plugin can expose the MCP server to the internet via Cloudflare tunnels. Two modes are supported:
+
+**Quick Tunnel** - Random trycloudflare.com URL, changes on restart. Zero config.
+**Named Tunnel** - Permanent URL on your own domain. Requires Cloudflare account and tunnel token.
 
 **Implementation:**
 
 1. **Binary Management**: cloudflared binary is installed to `~/.witness/bin/` on first use
 2. **Tunnel Lifecycle**: Starts on plugin load (if enabled), stops on unload
-3. **URL Notification**: Logs URL to console and shows Obsidian notification
-4. **Settings UI**: Display URL with copy button, regenerate button, status indicator
+3. **Primary Host Check**: `os.hostname()` checked against `tunnelPrimaryHost` setting before starting
+4. **Settings UI**: Tunnel type dropdown, token field, URL display with copy, status indicator
 
-**Key Code Pattern:**
+**Key Code Patterns:**
 
 ```typescript
-// Ensure cloudflared is installed to a known location
-private getCloudflaredBinPath(): string {
-  const binDir = path.join(os.homedir(), '.witness', 'bin');
-  return path.join(binDir, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
-}
-
-// Install if needed, then tell the package where to find it
-const installed = await this.ensureCloudflaredInstalled();
-useCloudflared(binPath);  // Point package to our binary
-
-// Start quick tunnel
+// Quick tunnel - random URL
 const tunnel = Tunnel.quick(`http://localhost:${port}`);
 tunnel.once('url', (url) => { /* Save and display URL */ });
+
+// Named tunnel - permanent URL via token
+const tunnel = Tunnel.withToken(this.settings.tunnelToken);
+tunnel.once('connected', (conn) => { /* Mark as connected, URL from settings */ });
+// IMPORTANT: Named tunnels do NOT emit 'url' event, only 'connected'
+```
+
+**Primary Machine Check (for Obsidian Sync):**
+
+```typescript
+const currentHost = os.hostname();
+if (this.settings.tunnelPrimaryHost && this.settings.tunnelPrimaryHost !== currentHost) {
+    this.logger.info(`Tunnel skipped: not primary host`);
+    return;
+}
 ```
 
 **Why Custom Binary Path:**
@@ -331,14 +360,19 @@ Inside Obsidian's Electron environment, the cloudflared npm package can't resolv
 
 ```bash
 # Check health via tunnel
-curl https://your-random-words.trycloudflare.com/health
+curl https://your-tunnel-url/health
 
-# Test MCP endpoint
-curl -X POST https://your-random-words.trycloudflare.com/mcp \
+# Test MCP endpoint (with auth)
+curl -X POST "https://your-tunnel-url/mcp?token=YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"initialize",...}'
 ```
+
+**Known Gotchas:**
+- Named tunnel ingress rules in Cloudflare dashboard can restrict which paths are accessible (e.g., only `/mcp`). Keep ingress open or ensure all endpoints are covered.
+- Multiple machines with the same tunnel token = Cloudflare round-robins between them. Use Primary Machine to prevent this.
+- Orphaned cloudflared processes may accumulate if Obsidian crashes without cleanup.
 
 ### Semantic Search & Iframe WASM Pattern
 
@@ -365,21 +399,10 @@ document.body.appendChild(this.iframe);
 
 **Key Files:**
 
-- `src/embedding-service-iframe.ts` - Iframe-based embedding service
-- `src/embedding-index.ts` - Storage in `.witness/embeddings/`
-- `src/document-indexer.ts` - Hierarchical chunking and indexing
+- `src/embedding-service-iframe.ts` - Iframe-based embedding service (query embeddings only)
+- `src/smart-connections-reader.ts` - Reads pre-built embeddings from Smart Connections plugin
 
-**Storage Structure:**
-
-```text
-.witness/
-  embeddings/
-    index.json          # Index metadata (model, dimensions, count)
-    vectors/
-      path_to_file.json # Per-file embeddings
-```
-
-**Credit:** This pattern was learned from the Smart Connections plugin's approach.
+**Credit:** The iframe isolation pattern was learned from the Smart Connections plugin's approach.
 
 ### Token Authentication
 

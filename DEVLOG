@@ -1068,3 +1068,137 @@ semantic_search request
 ---
 
 *End of log entry*
+
+## 2026-02-05 - Named Tunnel & Primary Machine
+
+**Objective**: Replace ephemeral Quick Tunnel URLs with permanent Named Tunnel support, and add a Primary Machine feature for multi-device Obsidian Sync setups.
+
+### What We Built
+
+Two major features for the remote access system:
+
+1. **Cloudflare Named Tunnel Support** - Permanent URLs using your own domain
+2. **Primary Machine Designation** - Only one machine runs the tunnel when syncing across devices
+
+### The Journey
+
+**Named Tunnel Implementation**
+
+The user was tired of Quick Tunnel URLs changing every time Obsidian restarts. They had already created a Named Tunnel in the Cloudflare dashboard pointing `witness.asim.dev` to `localhost:3456`.
+
+The `cloudflared` npm package provides two APIs:
+- `Tunnel.quick(url)` - Quick tunnel with random trycloudflare.com URL
+- `Tunnel.withToken(token)` - Named tunnel using pre-configured dashboard settings
+
+Key discovery: Named tunnels do NOT emit a `url` event. That event is specifically for trycloudflare.com URLs where the URL isn't known in advance. Named tunnels emit a `connected` event instead, since the URL is already configured in the Cloudflare dashboard. This required listening for `connected` instead of `url` to update tunnel status.
+
+**Settings UI Updates:**
+
+- Added tunnel type dropdown: Quick vs Named
+- Added password-masked token field (300px wide for long JWT tokens)
+- Added editable tunnel URL field for the user's public hostname
+- MCP URL display automatically constructs the full URL with /mcp path and ?token= parameter
+
+**The Port Mismatch Discovery**
+
+Initial testing failed because the Cloudflare tunnel was configured for `localhost:3456` but the plugin was running on port 3000. Changed the port in settings to match.
+
+**The /health 404 Mystery**
+
+After connecting the tunnel, `/health` returned 404 while `/mcp` returned 401 (correct auth error). The cause: the Cloudflare tunnel ingress rules were path-restricted to `/mcp` only. After the user removed the path restriction in the dashboard, all endpoints worked through the tunnel.
+
+**Orphaned Process Cleanup**
+
+Discovered 17 orphaned `cloudflared tunnel --url http://localhost:3000` processes from previous Quick Tunnel sessions that weren't properly cleaned up on Obsidian restart. Killed them all.
+
+**Multi-Device Problem**
+
+The user asked: "What happens if multiple machines with Obsidian Sync all have the same tunnel token?" Answer: Cloudflare treats them as multiple connectors for the same tunnel and round-robins traffic between them. Since each machine has a different vault state, this produces unpredictable results.
+
+**Primary Machine Feature**
+
+Solution: Added `tunnelPrimaryHost` setting that stores `os.hostname()` of the designated machine. At the top of `startTunnel()`, the plugin checks if the current hostname matches. If not, it silently skips starting the tunnel.
+
+Settings UI for primary machine:
+- Shows current host vs configured host
+- "Set as primary" button (disabled if already primary)
+- "x" button to clear (allow all machines)
+- Warning color when current machine is NOT the primary
+
+**Mobile Considerations**
+
+Obsidian mobile (iOS/Android) cannot run the HTTP server or cloudflared binary. The tunnel and MCP server features are desktop-only. Mobile devices access the vault as clients through the tunnel URL.
+
+### Technical Details
+
+**New Settings:**
+```typescript
+tunnelType: 'quick' | 'named';   // Tunnel mode
+tunnelToken: string;              // Cloudflare tunnel JWT token
+tunnelPrimaryHost: string;        // Hostname of primary machine
+```
+
+**Named Tunnel Connection:**
+```typescript
+if (isNamed) {
+    this.tunnelProcess = Tunnel.withToken(this.settings.tunnelToken);
+    this.tunnelProcess.once('connected', async (connection) => {
+        this.tunnelStatus = 'connected';
+        // URL comes from user settings, not from event
+    });
+}
+```
+
+**Primary Host Check:**
+```typescript
+const currentHost = os.hostname();
+if (this.settings.tunnelPrimaryHost &&
+    this.settings.tunnelPrimaryHost !== currentHost) {
+    this.logger.info(`Tunnel skipped: not primary host`);
+    return;
+}
+```
+
+### Key Learnings
+
+1. **Named tunnels don't emit `url` events**: Only Quick Tunnels (trycloudflare.com) emit the `url` event. Named tunnels emit `connected` with location/IP info.
+2. **Cloudflare ingress rules matter**: Path restrictions in the tunnel config affect which endpoints are accessible. Keep it open or match all your endpoints.
+3. **Round-robin is the default**: Multiple cloudflared connectors on the same tunnel = load balancing. Not what you want for personal vaults.
+4. **`os.hostname()` for machine identity**: Simple and reliable way to identify which machine is which across Obsidian Sync.
+5. **Orphan processes accumulate**: Quick Tunnels from previous sessions may not be cleaned up on crash/force-quit. Consider periodic cleanup.
+
+### README Overhaul
+
+Rewrote the entire Remote Access section with:
+- Option A: Quick Tunnel (easy, temporary)
+- Option B: Named Tunnel with 3-step Cloudflare dashboard guide
+- Multiple Devices section with Primary Machine explanation
+- Mobile Devices section explaining desktop-only limitations
+- Security Notes section
+
+### Statistics
+
+- **3 new settings** added to WitnessSettings
+- **~60 lines** of tunnel code changes
+- **~80 lines** of settings UI additions
+- **README** Remote Access section completely rewritten
+- **17 orphaned processes** cleaned up
+- **1 successful end-to-end test** through `witness.asim.dev`
+
+### Files Changed
+
+- `src/main.ts` - Named tunnel support, primary host check, settings UI
+- `README.md` - Comprehensive remote access documentation
+- `CLAUDE.md` - Updated with session learnings
+- `manifest.json` - Version bump to 0.4.0
+- `package.json` - Version bump to 0.4.0
+
+### What's Next
+
+- WhatsApp/Telegram bot integration (Phase 2 remaining)
+- Phase 4: Heartbeat scheduler, chaos monitoring
+- Consider: automatic orphan process cleanup on startup
+
+---
+
+*End of log entry*

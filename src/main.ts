@@ -163,6 +163,9 @@ interface WitnessSettings {
 	// Remote access via Cloudflare Tunnel
 	enableTunnel: boolean;
 	tunnelUrl: string | null;
+	tunnelType: 'quick' | 'named';
+	tunnelToken: string;
+	tunnelPrimaryHost: string;
 	// Authentication (simple token)
 	enableAuth: boolean;
 }
@@ -191,6 +194,9 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	enableCommandFallback: false,
 	enableTunnel: false,
 	tunnelUrl: null,
+	tunnelType: 'quick',
+	tunnelToken: '',
+	tunnelPrimaryHost: '',
 	enableAuth: false,
 }
 
@@ -1293,7 +1299,8 @@ export default class WitnessPlugin extends Plugin {
 	}
 
 	/**
-	 * Start a Cloudflare Quick Tunnel to expose the MCP server
+	 * Start a Cloudflare Tunnel to expose the MCP server
+	 * Supports both Quick Tunnels (ephemeral URL) and Named Tunnels (permanent URL with token)
 	 */
 	async startTunnel() {
 		if (this.tunnelProcess) {
@@ -1306,10 +1313,31 @@ export default class WitnessPlugin extends Plugin {
 			return;
 		}
 
+		// Primary host check: only start tunnel on the designated machine
+		const currentHost = os.hostname();
+		if (this.settings.tunnelPrimaryHost && this.settings.tunnelPrimaryHost !== currentHost) {
+			this.logger.info(`Tunnel skipped: this machine (${currentHost}) is not the primary host (${this.settings.tunnelPrimaryHost})`);
+			this.tunnelStatus = 'disconnected';
+			return;
+		}
+
+		const isNamed = this.settings.tunnelType === 'named';
+
 		this.tunnelStatus = 'connecting';
-		this.logger.info('Starting Cloudflare Quick Tunnel...');
+		this.logger.info(`Starting Cloudflare ${isNamed ? 'Named' : 'Quick'} Tunnel...`);
 		if (this.tunnelStatusCallback) {
 			this.tunnelStatusCallback('connecting', null);
+		}
+
+		// Validate named tunnel has a token
+		if (isNamed && !this.settings.tunnelToken) {
+			this.logger.error('Cannot start named tunnel: no token configured');
+			this.tunnelStatus = 'error';
+			new Notice('Named tunnel requires a token. Please add your Cloudflare tunnel token in settings.');
+			if (this.tunnelStatusCallback) {
+				this.tunnelStatusCallback('error', null);
+			}
+			return;
 		}
 
 		// Ensure cloudflared is installed
@@ -1323,32 +1351,51 @@ export default class WitnessPlugin extends Plugin {
 		}
 
 		try {
-			// Start quick tunnel pointing to our local MCP server
-			const localUrl = `http://localhost:${this.settings.mcpPort}`;
-			this.tunnelProcess = Tunnel.quick(localUrl);
+			if (isNamed) {
+				// Named tunnel - uses pre-configured token from Cloudflare dashboard
+				this.logger.info('Starting named tunnel with token...');
+				this.tunnelProcess = Tunnel.withToken(this.settings.tunnelToken);
 
-			// Listen for the URL event
-			this.tunnelProcess.once('url', async (url: string) => {
-				this.logger.info(`Cloudflare Tunnel URL: ${url}`);
-				this.logger.info(`MCP endpoint available at: ${url}/mcp`);
-				this.settings.tunnelUrl = url;
-				this.tunnelStatus = 'connected';
-				await this.saveSettings();
+				// Named tunnels don't emit a 'url' event (that's only for trycloudflare.com)
+				// The URL is already known from the dashboard configuration
+				// We mark as connected when the first connection is established
+				this.tunnelProcess.once('connected', async (connection: { id: string; ip: string; location: string }) => {
+					this.logger.info(`Named tunnel connected to ${connection.location} (${connection.ip})`);
+					this.tunnelStatus = 'connected';
 
-				// Show notification
-				new Notice(`Tunnel connected: ${url}/mcp`);
+					if (this.tunnelStatusCallback) {
+						this.tunnelStatusCallback('connected', this.settings.tunnelUrl);
+					}
 
-				if (this.tunnelStatusCallback) {
-					this.tunnelStatusCallback('connected', url);
-				}
-			});
+					new Notice('Named tunnel connected!');
+				});
+			} else {
+				// Quick tunnel - gets a random trycloudflare.com URL
+				const localUrl = `http://localhost:${this.settings.mcpPort}`;
+				this.tunnelProcess = Tunnel.quick(localUrl);
 
-			// Listen for connected event
-			this.tunnelProcess.once('connected', (connection: { id: string; ip: string; location: string }) => {
-				this.logger.info(`Tunnel connected to ${connection.location} (${connection.ip})`);
-			});
+				// Listen for the URL event (only fires for quick tunnels)
+				this.tunnelProcess.once('url', async (url: string) => {
+					this.logger.info(`Cloudflare Tunnel URL: ${url}`);
+					this.logger.info(`MCP endpoint available at: ${url}/mcp`);
+					this.settings.tunnelUrl = url;
+					this.tunnelStatus = 'connected';
+					await this.saveSettings();
 
-			// Handle tunnel errors
+					new Notice(`Tunnel connected: ${url}/mcp`);
+
+					if (this.tunnelStatusCallback) {
+						this.tunnelStatusCallback('connected', url);
+					}
+				});
+
+				// Listen for connected event
+				this.tunnelProcess.once('connected', (connection: { id: string; ip: string; location: string }) => {
+					this.logger.info(`Tunnel connected to ${connection.location} (${connection.ip})`);
+				});
+			}
+
+			// Handle tunnel errors (both types)
 			this.tunnelProcess.on('error', (err: Error) => {
 				this.logger.error('Tunnel error:', err.message);
 				this.tunnelStatus = 'error';
@@ -1357,7 +1404,7 @@ export default class WitnessPlugin extends Plugin {
 				}
 			});
 
-			// Handle tunnel exit
+			// Handle tunnel exit (both types)
 			this.tunnelProcess.on('exit', (code: number | null) => {
 				this.logger.info(`Tunnel process exited with code: ${code}`);
 				this.tunnelProcess = null;
@@ -1782,8 +1829,8 @@ class WitnessSettingTab extends PluginSettingTab {
 
 		// Tunnel enable toggle
 		new Setting(containerEl)
-			.setName('Enable Quick Tunnel')
-			.setDesc('Create a Cloudflare tunnel to access your vault from anywhere (URL changes on restart)')
+			.setName('Enable Tunnel')
+			.setDesc('Create a Cloudflare tunnel to access your vault from anywhere')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.enableTunnel)
 				.onChange(async (value) => {
@@ -1805,8 +1852,101 @@ class WitnessSettingTab extends PluginSettingTab {
 					this.display(); // Refresh to show/hide URL section
 				}));
 
-		// Show tunnel URL and controls when enabled
+		// Show tunnel configuration when enabled
 		if (this.plugin.settings.enableTunnel) {
+			// Tunnel type selector
+			new Setting(containerEl)
+				.setName('Tunnel Type')
+				.setDesc('Quick: random URL that changes on restart. Named: permanent URL with your own domain.')
+				.addDropdown(dropdown => dropdown
+					.addOption('quick', 'Quick Tunnel (ephemeral)')
+					.addOption('named', 'Named Tunnel (permanent)')
+					.setValue(this.plugin.settings.tunnelType)
+					.onChange(async (value: string) => {
+						this.plugin.settings.tunnelType = value as 'quick' | 'named';
+						await this.plugin.saveSettings();
+						// Restart tunnel if running
+						if (this.plugin.getTunnelStatus().status !== 'disconnected') {
+							await this.plugin.regenerateTunnel();
+							setTimeout(() => this.display(), 3000);
+						} else {
+							this.display();
+						}
+					}));
+
+			const isNamed = this.plugin.settings.tunnelType === 'named';
+
+			// Named tunnel token field
+			if (isNamed) {
+				new Setting(containerEl)
+					.setName('Tunnel Token')
+					.setDesc('Token from Cloudflare dashboard (Zero Trust → Networks → Tunnels → Configure → Install connector)')
+					.addText(text => {
+						text
+							.setPlaceholder('eyJhIjo...')
+							.setValue(this.plugin.settings.tunnelToken)
+							.onChange(async (value) => {
+								this.plugin.settings.tunnelToken = value;
+								await this.plugin.saveSettings();
+							});
+						text.inputEl.style.width = '300px';
+						text.inputEl.type = 'password';
+					});
+
+				// Named tunnel URL (user-configured, for display/copy purposes)
+				new Setting(containerEl)
+					.setName('Tunnel URL')
+					.setDesc('Your tunnel\'s public hostname (e.g., https://witness.example.com)')
+					.addText(text => {
+						text
+							.setPlaceholder('https://witness.example.com')
+							.setValue(this.plugin.settings.tunnelUrl || '')
+							.onChange(async (value) => {
+								this.plugin.settings.tunnelUrl = value || null;
+								await this.plugin.saveSettings();
+							});
+						text.inputEl.style.width = '300px';
+					});
+
+				// Primary host - only this machine runs the tunnel
+				const currentHost = os.hostname();
+				const isPrimary = !this.plugin.settings.tunnelPrimaryHost || this.plugin.settings.tunnelPrimaryHost === currentHost;
+				const primaryDesc = this.plugin.settings.tunnelPrimaryHost
+					? `Primary: ${this.plugin.settings.tunnelPrimaryHost}` + (isPrimary ? ' (this machine)' : ` (this machine: ${currentHost})`)
+					: 'No primary set — all machines will run the tunnel';
+
+				const primarySetting = new Setting(containerEl)
+					.setName('Primary Machine')
+					.setDesc(primaryDesc);
+
+				if (!isPrimary) {
+					primarySetting.descEl.style.color = 'var(--text-warning)';
+				}
+
+				primarySetting.addButton(button => button
+					.setButtonText(isPrimary && this.plugin.settings.tunnelPrimaryHost ? 'This machine ✓' : 'Set as primary')
+					.setCta()
+					.setDisabled(isPrimary && !!this.plugin.settings.tunnelPrimaryHost)
+					.onClick(async () => {
+						this.plugin.settings.tunnelPrimaryHost = currentHost;
+						await this.plugin.saveSettings();
+						new Notice(`This machine (${currentHost}) is now the primary tunnel host`);
+						this.display();
+					}));
+
+				if (this.plugin.settings.tunnelPrimaryHost) {
+					primarySetting.addButton(button => button
+						.setIcon('x')
+						.setTooltip('Clear primary (allow all machines)')
+						.onClick(async () => {
+							this.plugin.settings.tunnelPrimaryHost = '';
+							await this.plugin.saveSettings();
+							new Notice('Primary host cleared — all machines will run the tunnel');
+							this.display();
+						}));
+				}
+			}
+
 			const { status, url } = this.plugin.getTunnelStatus();
 
 			// Status indicator
@@ -1864,7 +2004,11 @@ class WitnessSettingTab extends PluginSettingTab {
 
 			// URL display with copy button (includes token if auth enabled)
 			if (url) {
-				let mcpUrl = `${url}/mcp`;
+				let mcpUrl = isNamed ? url : `${url}/mcp`;
+				// For named tunnels, append /mcp if not already in the URL
+				if (isNamed && !mcpUrl.endsWith('/mcp')) {
+					mcpUrl = mcpUrl.replace(/\/$/, '') + '/mcp';
+				}
 				if (this.plugin.settings.enableAuth && this.plugin.settings.authToken) {
 					mcpUrl += `?token=${this.plugin.settings.authToken}`;
 				}
@@ -1880,25 +2024,27 @@ class WitnessSettingTab extends PluginSettingTab {
 					}));
 			}
 
-			// Regenerate tunnel button
+			// Reconnect tunnel button
 			new Setting(containerEl)
-				.setName('Regenerate Tunnel')
-				.setDesc('Get a new tunnel URL')
+				.setName(isNamed ? 'Reconnect Tunnel' : 'Regenerate Tunnel')
+				.setDesc(isNamed ? 'Restart the tunnel connection' : 'Get a new tunnel URL')
 				.addButton(button => button
-					.setButtonText('Regenerate')
+					.setButtonText(isNamed ? 'Reconnect' : 'Regenerate')
 					.onClick(async () => {
 						await this.plugin.regenerateTunnel();
 						// Wait a bit for the tunnel to come up
 						setTimeout(() => this.display(), 3000);
 					}));
 
-			// Warning note
-			const noteEl = containerEl.createEl('div', {
-				cls: 'setting-item-description',
-				text: '⚠️ This URL changes when Obsidian restarts. For a permanent URL, set up a Cloudflare Named Tunnel.'
-			});
-			noteEl.style.marginBottom = '20px';
-			noteEl.style.color = 'var(--text-warning)';
+			// Warning note (only for quick tunnels)
+			if (!isNamed) {
+				const noteEl = containerEl.createEl('div', {
+					cls: 'setting-item-description',
+					text: '⚠️ This URL changes when Obsidian restarts. Switch to a Named Tunnel for a permanent URL.'
+				});
+				noteEl.style.marginBottom = '20px';
+				noteEl.style.color = 'var(--text-warning)';
+			}
 
 			// Subscribe to status changes to refresh UI
 			this.plugin.onTunnelStatusChange((newStatus, newUrl) => {

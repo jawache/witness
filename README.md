@@ -23,7 +23,9 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Semantic Search**: Find documents by meaning using Smart Connections embeddings
 - **Command Execution**: Execute any Obsidian command via AI
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
-- **Remote Access**: Cloudflare Quick Tunnel for access from anywhere
+- **Remote Access**: Cloudflare Quick Tunnel or Named Tunnel (permanent URL) for access from anywhere
+- **Named Tunnel Support**: Use your own domain with Cloudflare Named Tunnels for a permanent, stable URL
+- **Primary Machine**: Designate which machine runs the tunnel when syncing across multiple devices
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
@@ -176,29 +178,96 @@ Open Obsidian Settings → Witness:
 
 ### Remote Access
 
-Enable the Quick Tunnel feature to access your vault from anywhere:
+Witness supports two types of Cloudflare tunnels to expose your vault remotely:
 
-1. **Enable Tunnel**
-   - Go to Obsidian Settings → Witness
-   - Toggle "Enable Quick Tunnel"
-   - Wait for the tunnel URL to appear
+#### Option A: Quick Tunnel (Easy, Temporary)
 
-2. **Enable Authentication** (recommended)
-   - Toggle "Require Authentication"
-   - A token is auto-generated, or click the reset icon to regenerate
-   - The MCP URL now includes the token: `https://xxx.trycloudflare.com/mcp?token=xxx`
+A quick tunnel gives you a random URL that changes every time Obsidian restarts. Good for testing.
 
-3. **Copy Your URL**
-   - Click "Copy URL" to copy the full URL with token
-   - The token can also be passed via `Authorization: Bearer xxx` header
+1. Go to Obsidian Settings → Witness
+2. Toggle "Enable Tunnel"
+3. Set Tunnel Type to "Quick Tunnel (ephemeral)"
+4. Wait for the tunnel URL to appear
+5. Enable "Require Authentication" and copy your MCP URL
 
-4. **Connect Claude**
-   - Use the tunnel URL in your MCP configuration
-   - Works with Claude Desktop, Claude.ai web, and Claude mobile
+The URL will look like: `https://random-words.trycloudflare.com/mcp?token=xxx`
 
-**Security Note**: The token is included in the URL query parameter. While HTTPS encrypts this in transit, be cautious about sharing URLs or logging them. For sensitive vaults, consider using a Cloudflare Named Tunnel with additional security layers.
+#### Option B: Named Tunnel (Permanent URL)
 
-**Note**: The tunnel URL changes each time Obsidian restarts. For a permanent URL, you can set up a Cloudflare Named Tunnel (requires a Cloudflare account and domain).
+A named tunnel gives you a permanent URL on your own domain. Requires a free Cloudflare account.
+
+**Step 1: Create the tunnel in Cloudflare**
+
+1. Sign up at [Cloudflare Zero Trust](https://one.dash.cloudflare.com/)
+2. Go to **Networks → Tunnels**
+3. Click **Create a tunnel**
+4. Choose **Cloudflared** as the connector type
+5. Name your tunnel (e.g., "witness")
+6. On the "Install connector" page, **copy the tunnel token** (the long `eyJh...` string)
+7. Skip the connector installation (Witness handles this automatically)
+8. Add a **Public Hostname**:
+   - Subdomain: e.g., `witness`
+   - Domain: select your domain (e.g., `example.com`)
+   - Service Type: `HTTP`
+   - URL: `localhost:3456` (or whatever port you set in Witness settings)
+9. Save the tunnel
+
+**Step 2: Configure Witness**
+
+1. Go to Obsidian Settings → Witness
+2. Set the MCP Server Port to match your tunnel config (e.g., `3456`)
+3. Toggle "Enable Tunnel"
+4. Set Tunnel Type to **"Named Tunnel (permanent)"**
+5. Paste your **Tunnel Token** from Cloudflare
+6. Set **Tunnel URL** to your public hostname (e.g., `https://witness.example.com`)
+7. Enable "Require Authentication" (recommended)
+8. Click "Copy URL" to get your full MCP URL
+
+**Step 3: Connect Claude**
+
+Use the tunnel URL in your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "witness": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote@latest",
+        "https://witness.example.com/mcp?token=YOUR_TOKEN",
+        "--transport",
+        "http-only"
+      ]
+    }
+  }
+}
+```
+
+This works with Claude Desktop, Claude.ai web, and Claude mobile.
+
+### Multiple Devices (Obsidian Sync)
+
+If you sync your vault across multiple computers using Obsidian Sync, the Witness plugin settings sync too — including the tunnel token. Without precaution, every machine would try to start the tunnel, and Cloudflare would round-robin traffic between them unpredictably.
+
+To prevent this, Witness has a **Primary Machine** feature:
+
+1. Open Obsidian Settings → Witness on the machine you want to run the tunnel
+2. Under Named Tunnel settings, click **"Set as primary"**
+3. This saves the machine's hostname — only this machine will start the tunnel
+4. On other machines, the tunnel is silently skipped on startup
+
+To switch the primary to a different machine, open Witness settings on that machine and click "Set as primary". To clear the restriction entirely, click the **✕** button next to the primary hostname.
+
+### Mobile Devices
+
+The tunnel and MCP server features are **desktop-only**. Obsidian mobile (iOS/Android) cannot run the HTTP server or cloudflared binary. To access your vault from a mobile device, connect to the tunnel URL from a client app (e.g., Claude mobile) — the vault is served by whichever desktop machine is running the tunnel.
+
+### Security Notes
+
+- The auth token is included in the URL query parameter. HTTPS encrypts this in transit, but be cautious about sharing URLs or logging them.
+- For additional security, the token can also be passed via `Authorization: Bearer xxx` header instead of the query parameter.
+- The `cloudflared` binary is automatically downloaded and stored in `~/.witness/bin/`.
 
 ### Example Commands
 
@@ -315,11 +384,12 @@ This is different from other Obsidian MCP servers that run externally and connec
 - [x] File-based logging
 - [x] Integration test suite (23 tests)
 
-### Phase 2: Remote Access (In Progress)
+### Phase 2: Remote Access ✅
 - [x] Cloudflare Quick Tunnel integration
+- [x] Cloudflare Named Tunnel support (permanent URLs)
+- [x] Primary machine designation for multi-device sync
 - [x] Token authentication for remote access
 - [ ] WhatsApp/Telegram bot
-- [ ] Mobile app support
 - [ ] Multi-user sessions
 
 ### Phase 3: Semantic Search ✅
