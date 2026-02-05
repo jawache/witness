@@ -1,6 +1,6 @@
 {
   "name": "witness-obsidian-plugin",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "AI companion for managing your Obsidian vault - Chaos to Order",
   "main": "main.js",
   "scripts": {
