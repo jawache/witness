@@ -258,6 +258,64 @@ export default class WitnessPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
+	/**
+	 * Check if the Dataview plugin is installed and its API is available.
+	 */
+	private isDataviewAvailable(): boolean {
+		return !!(this.app as any).plugins?.plugins?.dataview?.api;
+	}
+
+	/**
+	 * Get the Dataview API, or null if unavailable.
+	 */
+	private getDataviewApi(): any | null {
+		return (this.app as any).plugins?.plugins?.dataview?.api ?? null;
+	}
+
+	/**
+	 * Process a markdown string, replacing ```dataview codeblocks with query results.
+	 * Returns the original content unchanged if Dataview is not available.
+	 */
+	async resolveDataviewBlocks(content: string): Promise<string> {
+		const dvApi = this.getDataviewApi();
+		if (!dvApi) return content;
+
+		// Match ```dataview ... ``` blocks
+		const dataviewBlockRegex = /```dataview\n([\s\S]*?)```/g;
+
+		// Collect all matches first (to avoid regex state issues with async)
+		const matches: Array<{ full: string; query: string }> = [];
+		let match;
+		while ((match = dataviewBlockRegex.exec(content)) !== null) {
+			matches.push({ full: match[0], query: match[1].trim() });
+		}
+
+		if (matches.length === 0) return content;
+
+		this.logger.mcp(`Resolving ${matches.length} Dataview block(s)`);
+
+		let result = content;
+		for (const m of matches) {
+			try {
+				const queryResult = await dvApi.queryMarkdown(m.query);
+				if (queryResult.successful) {
+					result = result.replace(m.full, queryResult.value.trim());
+					this.logger.mcp(`Dataview query resolved: "${m.query.substring(0, 60)}..."`);
+				} else {
+					const errorMsg = `> [!warning] Dataview query failed: ${queryResult.error}`;
+					result = result.replace(m.full, errorMsg);
+					this.logger.error(`Dataview query failed: ${queryResult.error}`);
+				}
+			} catch (err: any) {
+				const errorMsg = `> [!warning] Dataview error: ${err.message}`;
+				result = result.replace(m.full, errorMsg);
+				this.logger.error(`Dataview error: ${err.message}`);
+			}
+		}
+
+		return result;
+	}
+
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
@@ -359,18 +417,24 @@ export default class WitnessPlugin extends Plugin {
 			this.getToolDescription('read_file', 'Read the contents of a file from the vault'),
 			{
 				path: z.string().describe('Path to the file relative to vault root'),
+				render: z.boolean().optional().default(false).describe('Resolve Dataview queries in the file before returning (requires Dataview plugin)'),
 			},
 			{
 				readOnlyHint: true,
 			},
-			async ({ path }) => {
-				this.logger.mcp(`read_file called with path: "${path}"`);
+			async ({ path, render }) => {
+				this.logger.mcp(`read_file called with path: "${path}", render: ${render}`);
 				const file = this.app.vault.getAbstractFileByPath(path);
 				this.logger.mcp(`File lookup:`, file ? `Found: ${file.path}` : 'NOT FOUND');
 				if (!file) {
 					throw new Error('File not found');
 				}
-				const content = await this.app.vault.read(file as any);
+				let content = await this.app.vault.read(file as any);
+
+				if (render) {
+					content = await this.resolveDataviewBlocks(content);
+				}
+
 				this.logger.mcp(`read_file success, length: ${content.length} chars`);
 				return {
 					content: [
@@ -849,6 +913,7 @@ export default class WitnessPlugin extends Plugin {
 		);
 
 		// Register get_orientation tool (READ-ONLY)
+		// Always resolves Dataview blocks so the AI sees live data
 		this.mcpServer.tool(
 			'get_orientation',
 			'Load the orientation document to understand vault structure and organizational context',
@@ -874,7 +939,11 @@ export default class WitnessPlugin extends Plugin {
 					throw new Error(`Orientation document not found at: ${orientationPath}. Please create this file or update the path in settings.`);
 				}
 
-				const content = await this.app.vault.read(file as any);
+				let content = await this.app.vault.read(file as any);
+
+				// Always resolve Dataview blocks in the orientation document
+				content = await this.resolveDataviewBlocks(content);
+
 				this.logger.mcp(`Successfully read file, length: ${content.length} chars`);
 
 				return {
@@ -886,6 +955,78 @@ export default class WitnessPlugin extends Plugin {
 					],
 					isError: false,
 				};
+			}
+		);
+
+		// Register dataview_query tool
+		// Always registered; checks Dataview availability at call time since
+		// Dataview may load after Witness during Obsidian startup.
+		this.mcpServer.tool(
+			'dataview_query',
+			'Execute a Dataview Query Language (DQL) query against the vault. Returns structured data from frontmatter, tags, links, and file metadata. Requires the Dataview plugin.',
+			{
+				query: z.string().describe('DQL query string (e.g., TABLE tags FROM "topics" SORT file.name)'),
+				format: z.enum(['markdown', 'json']).optional().default('markdown').describe('Output format: markdown (rendered table) or json (structured data)'),
+			},
+			{
+				readOnlyHint: true,
+			},
+			async ({ query, format }) => {
+				this.logger.mcp(`dataview_query called: "${query.substring(0, 80)}", format: ${format}`);
+				const dvApi = this.getDataviewApi();
+				if (!dvApi) {
+					return {
+						content: [{ type: 'text', text: 'Dataview plugin is not installed or not enabled. Install the Dataview community plugin to use this tool.' }],
+						isError: true,
+					};
+				}
+
+				try {
+					if (format === 'json') {
+						const result = await dvApi.query(query);
+						if (!result.successful) {
+							return {
+								content: [{ type: 'text', text: `Dataview query failed: ${result.error}` }],
+								isError: true,
+							};
+						}
+						// Convert Dataview Link objects to plain strings
+						const headers = result.value.headers;
+						const values = result.value.values.map((row: any[]) =>
+							row.map((cell: any) => {
+								if (cell === null || cell === undefined) return null;
+								if (typeof cell === 'object' && cell.path) return cell.path; // Link object
+								if (Array.isArray(cell)) return cell.map((v: any) => typeof v === 'object' && v.path ? v.path : String(v));
+								return cell;
+							})
+						);
+						const jsonOutput = JSON.stringify({ headers, values }, null, 2);
+						this.logger.mcp(`dataview_query (json) success: ${headers.length} columns, ${values.length} rows`);
+						return {
+							content: [{ type: 'text', text: jsonOutput }],
+							isError: false,
+						};
+					} else {
+						const result = await dvApi.queryMarkdown(query);
+						if (!result.successful) {
+							return {
+								content: [{ type: 'text', text: `Dataview query failed: ${result.error}` }],
+								isError: true,
+							};
+						}
+						this.logger.mcp(`dataview_query (markdown) success, length: ${result.value.length}`);
+						return {
+							content: [{ type: 'text', text: result.value.trim() }],
+							isError: false,
+						};
+					}
+				} catch (err: any) {
+					this.logger.error(`dataview_query error: ${err.message}`);
+					return {
+						content: [{ type: 'text', text: `Dataview query error: ${err.message}` }],
+						isError: true,
+					};
+				}
 			}
 		);
 

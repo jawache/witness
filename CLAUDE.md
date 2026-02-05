@@ -167,6 +167,20 @@ Semantic Search via Smart Connections Integration:
 
 Total: 13 MCP tools registered and available
 
+### Dataview Integration
+
+- ✅ `dataview_query` MCP tool - execute DQL queries (markdown or JSON output)
+- ✅ `read_file` render parameter - resolve Dataview codeblocks before returning
+- ✅ `get_orientation` auto-renders Dataview blocks (AI sees live data)
+- ✅ 8 integration tests for Dataview features
+- ✅ Test vault includes Dataview plugin and topic test files
+
+**Plugin Load Order:** Always register tools unconditionally and check Dataview availability at call time. Dataview may not be loaded when Witness starts.
+
+**Dataview API Access:** `(this.app as any).plugins.plugins.dataview?.api` — returns the DV API or undefined.
+
+Total: 15 MCP tools registered and available
+
 ## MCP Implementation Details
 
 ### StreamableHTTP Protocol & Session Management

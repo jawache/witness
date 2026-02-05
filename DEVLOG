@@ -1202,3 +1202,71 @@ Rewrote the entire Remote Access section with:
 ---
 
 *End of log entry*
+
+## 2026-02-05 - Dataview Integration & Orientation Consolidation
+
+**Objective**: Integrate the Dataview plugin's query engine into Witness MCP tools, consolidate the main vault's orientation files into a single comprehensive document, and refine the knowledge-saving workflow.
+
+### What We Built
+
+1. **`dataview_query` MCP tool** — Execute DQL queries directly from an AI client
+   - Supports markdown and JSON output formats
+   - Structured data: `dvApi.query()` with Link-to-string conversion
+   - Rendered tables: `dvApi.queryMarkdown()` for human-readable output
+   - Always registered at startup; checks Dataview availability at call time
+
+2. **`read_file` render parameter** — Optional `render: true` flag that resolves Dataview codeblocks before returning content
+
+3. **`get_orientation` auto-rendering** — Orientation document always has its Dataview queries resolved, so the AI sees live data (prompt tables, template lists) instead of raw codeblocks
+
+4. **Consolidated ORIENTATION.md** — Merged three separate context files in the main vault into one comprehensive document covering vault philosophy, knowledge collections, templates, prompts, heartbeat, writing style, and the full knowledge-saving workflow
+
+5. **Knowledge-saving workflow** — Detailed "Saving Knowledge to the Vault" section with:
+   - Existence checking (text + semantic search before creating)
+   - Citation-by-default policy (footnotes for external sources without being asked)
+   - Internal wiki-links via semantic search (knowledge-to-knowledge only)
+   - Frontmatter references for provenance
+   - Summary table of all 5 link types
+
+6. **Session skills** — Updated `/wrap-up` to include git push, created `/release` for GitHub releases with version bumps
+
+### The Journey
+
+The session started with Dataview research — confirming that the `dvApi.queryMarkdown()` and `dvApi.query()` APIs were accessible from within Obsidian's plugin context. The key architectural insight was that Witness has a unique advantage: it runs *inside* Obsidian, so it can call Dataview's API directly rather than scraping rendered HTML.
+
+The first implementation hit a plugin load-order bug: Dataview hadn't initialised yet when Witness registered its tools at startup. The conditional `if (this.isDataviewAvailable())` check silently skipped registration entirely. The fix was straightforward — always register the tool, check availability at call time, and return a helpful error if Dataview isn't loaded.
+
+The orientation consolidation was more involved. Three separate files (root ORIENTATION.md, knowledge ORIENTATION.md, and relevant CLAUDE.md sections) were merged into a single document. Multiple rounds of refinement followed — removing sections that belong in system prompts, expanding the citation and linking rules, and establishing the "citations by default" policy.
+
+### Technical Achievements
+
+- **15 MCP tools** now available (was 13)
+- **31 integration tests** passing (8 new Dataview tests)
+- Regex-based Dataview codeblock detection: `/```dataview\n([\s\S]*?)```/g`
+- Link object serialisation for JSON format output
+- Test vault now includes Dataview plugin and 3 topic files for testing
+
+### Key Learnings
+
+- **Plugin load order matters**: Always register tools unconditionally and check runtime availability in the handler. Obsidian doesn't guarantee plugin load order.
+- **Dataview API is clean**: `queryMarkdown()` returns `{ successful: boolean, value: string, error?: string }` — no parsing needed.
+- **Orientation files benefit from live data**: Having Dataview queries in the orientation document means the AI always sees current prompt and template lists without manual updates.
+
+### Statistics
+
+- Files changed: 5 modified, 6 new
+- Lines added: ~350
+- New MCP tools: 1 (`dataview_query`)
+- New tool parameters: 1 (`read_file.render`)
+- New integration tests: 8
+- Total integration tests: 31
+
+### What's Next
+
+- Semantic search feature implementation (Phase A-E from feature spec)
+- WhatsApp/Telegram bot integration
+- Phase 4: Heartbeat scheduler, chaos monitoring
+
+---
+
+*End of log entry*

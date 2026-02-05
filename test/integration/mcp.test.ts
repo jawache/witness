@@ -307,6 +307,111 @@ describe('MCP Server Integration Tests', () => {
     });
   });
 
+  describe('dataview_query', () => {
+    it('should be listed as an available tool', async () => {
+      const tools = await client.listTools();
+      const toolNames = tools.map((t: any) => t.name);
+      expect(toolNames).toContain('dataview_query');
+    });
+
+    it('should execute a TABLE query and return markdown', async () => {
+      const result = await client.callTool('dataview_query', {
+        query: 'TABLE description FROM "topics" SORT file.name',
+      });
+      const content = getTextContent(result);
+
+      expect(result.isError).not.toBe(true);
+      // Should contain markdown table with our test topics
+      expect(content).toContain('carbon-accounting');
+      expect(content).toContain('green-software');
+      expect(content).toContain('quantum-computing');
+    });
+
+    it('should execute a LIST query', async () => {
+      const result = await client.callTool('dataview_query', {
+        query: 'LIST FROM "topics" WHERE contains(tags, "sustainability")',
+      });
+      const content = getTextContent(result);
+
+      expect(result.isError).not.toBe(true);
+      expect(content).toContain('green-software');
+      expect(content).toContain('carbon-accounting');
+      expect(content).not.toContain('quantum-computing');
+    });
+
+    it('should return JSON format when requested', async () => {
+      const result = await client.callTool('dataview_query', {
+        query: 'TABLE description FROM "topics" SORT file.name',
+        format: 'json',
+      });
+      const content = getTextContent(result);
+
+      expect(result.isError).not.toBe(true);
+      const parsed = JSON.parse(content);
+      expect(parsed.headers).toBeDefined();
+      expect(parsed.values).toBeDefined();
+      expect(parsed.values.length).toBe(3);
+    });
+
+    it('should return error for invalid query', async () => {
+      const result = await client.callTool('dataview_query', {
+        query: 'INVALID QUERY SYNTAX HERE',
+      });
+
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe('read_file with render', () => {
+    it('should return raw content when render is false', async () => {
+      const result = await client.callTool('read_file', {
+        path: 'dataview-test.md',
+        render: false,
+      });
+      const content = getTextContent(result);
+
+      // Should contain raw dataview codeblock
+      expect(content).toContain('```dataview');
+      expect(content).toContain('TABLE description, tags FROM "topics"');
+    });
+
+    it('should resolve Dataview blocks when render is true', async () => {
+      const result = await client.callTool('read_file', {
+        path: 'dataview-test.md',
+        render: true,
+      });
+      const content = getTextContent(result);
+
+      // Should NOT contain raw dataview codeblock
+      expect(content).not.toContain('```dataview');
+
+      // Should contain resolved data
+      expect(content).toContain('carbon-accounting');
+      expect(content).toContain('green-software');
+      expect(content).toContain('quantum-computing');
+
+      // Static content should remain
+      expect(content).toContain('This text should remain unchanged after rendering');
+    });
+  });
+
+  describe('get_orientation with Dataview', () => {
+    it('should auto-resolve Dataview blocks in orientation', async () => {
+      const result = await client.callTool('get_orientation', {});
+      const content = getTextContent(result);
+
+      // The orientation file (README.md) has a Dataview TABLE query
+      // It should be resolved automatically
+      expect(content).toContain('# Test Vault');
+      expect(content).not.toContain('```dataview');
+
+      // Should contain the resolved topic data
+      expect(content).toContain('carbon-accounting');
+      expect(content).toContain('green-software');
+      expect(content).toContain('quantum-computing');
+    });
+  });
+
   describe('logging', () => {
     // Helper to get log file path
     const getLogPath = () => {

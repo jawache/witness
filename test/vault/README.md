@@ -7,3 +7,9 @@ This is a minimal vault for integration testing.
 - Verify MCP tools work correctly
 - Provide known, stable content for assertions
 - Should not be modified during normal development
+
+## Topics in This Vault
+
+```dataview
+TABLE description FROM "topics" SORT file.name
+```

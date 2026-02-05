@@ -29,9 +29,9 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
-**13 MCP Tools Available**:
+**15 MCP Tools Available**:
 
-- `read_file` - Read file contents
+- `read_file` - Read file contents (with optional Dataview rendering)
 - `write_file` - Create/modify files
 - `list_files` - Browse directories
 - `edit_file` - Find and replace text
@@ -42,8 +42,10 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - `create_folder` - Create folders (with mkdir -p support)
 - `delete` - Delete files/folders (with trash support)
 - `execute_command` - Run Obsidian commands
-- `get_vault_context` - Load your vault's context document
+- `get_vault_context` - Load your vault's context document (auto-renders Dataview)
 - `semantic_search` - Find documents by meaning (requires Smart Connections plugin)
+- `dataview_query` - Execute Dataview queries, get structured vault data (requires Dataview plugin)
+- `copy-obsidian-url` - Copy the internal Obsidian URL for the current file
 
 ### Coming Soon
 
@@ -296,7 +298,7 @@ npm run test:install-plugin
 # Start Obsidian with test vault
 npm run test:start-obsidian
 
-# Run integration tests (23 tests)
+# Run integration tests (31 tests)
 npm test
 
 # Check server status
@@ -382,7 +384,7 @@ This is different from other Obsidian MCP servers that run externally and connec
 - [x] Command execution
 - [x] Orientation document system
 - [x] File-based logging
-- [x] Integration test suite (23 tests)
+- [x] Integration test suite (31 tests)
 
 ### Phase 2: Remote Access ✅
 - [x] Cloudflare Quick Tunnel integration
@@ -399,6 +401,13 @@ This is different from other Obsidian MCP servers that run externally and connec
 - [x] Cosine similarity search with incremental caching
 - [x] Filter by paths
 - [x] Tested on 4,097-document vault
+
+### Dataview Integration ✅
+
+- [x] `dataview_query` MCP tool (markdown + JSON output)
+- [x] `read_file` render parameter for resolving Dataview codeblocks
+- [x] `get_vault_context` auto-renders Dataview queries
+- [x] 8 integration tests
 
 ### Phase 4: Intelligence
 
