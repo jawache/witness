@@ -1270,3 +1270,47 @@ The orientation consolidation was more involved. Three separate files (root ORIE
 ---
 
 *End of log entry*
+
+## 2026-02-05 - Claude Code Configuration & Desktop-Only Flag
+
+**Objective**: Set up reusable Claude Code configuration for use across projects, and mark the plugin as desktop-only.
+
+### What We Built
+
+- **User-level Claude Code skills** (`~/.claude/skills/`):
+  - `/wrap-up` — session wrap-up protocol (DEVLOG, docs, commit, push)
+  - `/release` — version bump, build, GitHub release creation
+  - `/init-project` — scaffold standard project files (CLAUDE.md, DEVLOG, README.md, TODO.md, docs/)
+- **User-level CLAUDE.md** (`~/.claude/CLAUDE.md`) — shared conventions: project structure, DEVLOG format, TODO.md usage, feature file specs, commit style, British English preference
+- **User-level settings** (`~/.claude/settings.json`) — permissive permissions (Bash(*), Read, Edit, Write, WebSearch, WebFetch) so every project gets them by default
+- **Desktop-only flag** — set `isDesktopOnly: true` in manifest.json since the plugin runs an HTTP server and cloudflared binary
+
+### The Journey
+
+Started with the question of how to share Claude Code configuration across projects. Discovered the configuration hierarchy: user-level (`~/.claude/`) vs project-level (`.claude/`). Converted the existing JSON skill files to the preferred markdown SKILL.md format with YAML frontmatter, generalised them so they're not Witness-specific, and placed them at user level.
+
+Also captured the user's project conventions: TODO.md linking to feature specs in `docs/features/`, `docs/spec.md` for original specifications, and the pattern of ending feature discussions with a spec file.
+
+### Key Learnings
+
+- Claude Code skills live in `~/.claude/skills/<name>/SKILL.md` for user-level (all projects) or `.claude/skills/<name>/SKILL.md` for project-level
+- Both `.claude/commands/` (legacy) and `.claude/skills/` work, but skills is the current standard
+- Skills use markdown with YAML frontmatter, not JSON — `allowed-tools` in frontmatter grants auto-approved permissions
+- User-level `~/.claude/CLAUDE.md` applies to all projects — good for shared conventions
+- User-level `~/.claude/settings.json` applies globally — no need for per-project settings files if permissions are the same
+
+### Statistics
+
+- 5 files created at user level (~/.claude/)
+- 1 file modified in repo (manifest.json)
+- Skills converted from JSON to markdown format
+
+### Next Steps
+
+- Test `/init-project` in a new project directory
+- Test `/wrap-up` and `/release` in a fresh session
+- Consider adding more shared skills as patterns emerge
+
+---
+
+*End of log entry*
