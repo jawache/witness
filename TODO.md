@@ -4,10 +4,10 @@
 
 ## Next Up
 
-- [ ] [Hybrid search](docs/features/hybrid-search.md) — Add BM25 + semantic hybrid search via Orama's built-in mode. Highest impact, lowest effort.
 - [ ] [Markdown chunking](docs/features/markdown-chunking.md) — Split documents by headings before embedding. Improves retrieval for long documents.
 - [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
 - [ ] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with status bar indicator and log viewer.
+- [ ] [Search panel](docs/features/search-panel.md) — Side panel UI for searching the vault with hybrid, vector, and fulltext modes.
 
 ## Features
 
@@ -31,3 +31,5 @@ Implement Cloudflare Tunnel or similar for remote access to the MCP server from 
 - [x] Move/rename file tool (move_file)
 - [x] Ollama integration — Local embeddings via Ollama + Orama vector store
 - [x] Tabbed settings UI with Ollama configuration and model pull
+- [x] Hybrid search — BM25 + semantic via Orama's built-in hybrid mode with RRF
+- [x] Unit + integration test suite (53 tests)
