@@ -1155,17 +1155,19 @@ export default class WitnessPlugin extends Plugin {
 		this.mcpServer.tool(
 			'semantic_search',
 			this.settings.coreToolDescriptions?.semantic_search ||
-				'Search for documents by meaning using semantic similarity. Requires Ollama running with nomic-embed-text model.',
+				'Search for documents by meaning using semantic similarity, keyword matching, or both. Requires Ollama running with an embedding model.',
 			{
 				query: z.string().describe('Natural language search query'),
+				mode: z.enum(['hybrid', 'vector', 'fulltext']).optional().default('hybrid')
+					.describe('Search mode: hybrid (keyword+semantic, best for most queries), vector (semantic only), fulltext (keyword only)'),
 				limit: z.number().optional().default(10).describe('Maximum number of results to return'),
-				minScore: z.number().optional().default(0.3).describe('Minimum similarity score (0-1)'),
+				minScore: z.number().optional().default(0.3).describe('Minimum similarity score (0-1, applies to hybrid and vector modes)'),
 				paths: z.array(z.string()).optional().describe('Filter results to documents in these paths'),
 			},
 			{
 				readOnlyHint: true,
 			},
-			async ({ query, limit, minScore, paths }) => {
+			async ({ query, mode, limit, minScore, paths }) => {
 				try {
 					// Initialize Ollama provider on first use
 					if (!this.ollamaProvider) {
@@ -1220,9 +1222,16 @@ export default class WitnessPlugin extends Plugin {
 						};
 					}
 
-					// Search
-					this.logger.info(`Semantic search for: "${query}"`);
-					const results = await this.vectorStore.search(query, { limit, minScore, paths });
+					// Search using the requested mode
+					this.logger.info(`Search (${mode}) for: "${query}"`);
+					let results;
+					if (mode === 'vector') {
+						results = await this.vectorStore.searchVector(query, { limit, minScore, paths });
+					} else if (mode === 'fulltext') {
+						results = await this.vectorStore.searchFulltext(query, { limit, paths });
+					} else {
+						results = await this.vectorStore.searchHybrid(query, { limit, minScore, paths });
+					}
 
 					// Format results
 					if (results.length === 0) {
