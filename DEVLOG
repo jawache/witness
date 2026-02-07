@@ -1314,3 +1314,86 @@ Also captured the user's project conventions: TODO.md linking to feature specs i
 ---
 
 *End of log entry*
+
+## 2026-02-05 - Ollama + Orama: Own the Embedding Index
+
+**Objective**: Replace Smart Connections + iframe WASM embedding approach with Ollama for embedding generation and Orama for vector storage. Own the entire embedding index.
+
+### What We Built
+
+1. **OllamaProvider** (`src/ollama-provider.ts`, ~110 lines) — HTTP client for Ollama's `/api/embed` endpoint
+   - Batch embedding support (multiple texts in one call)
+   - Model availability checking (`/api/tags`)
+   - Dimension lookup for known models
+   - Default: `nomic-embed-text` (768 dimensions, 274MB)
+
+2. **VectorStore** (`src/vector-store.ts`, ~250 lines) — Orama-backed vector database
+   - Schema: path, title, mtime, embedding vector
+   - Single-file persistence at `.witness/index.orama`
+   - Incremental indexing: only re-embeds files with changed mtime
+   - Batch indexing with progress callbacks
+   - Cosine similarity search with path filtering
+
+3. **Updated `semantic_search` tool** — Lazy-initialises Ollama + Orama on first use
+   - Checks Ollama availability, returns helpful error if not running
+   - Auto-indexes stale files before searching
+   - Persists index to disk after indexing
+
+4. **Removed Smart Connections integration** — Deleted `src/smart-connections-reader.ts` (343 lines) and `src/embedding-service-iframe.ts` (540 lines). Net deletion of ~883 lines of fragile code.
+
+### The Journey
+
+The session started with revisiting the embedding strategy. The iframe WASM approach worked but was brittle — ~400 lines of code handling WebGPU detection, fp16/fp32 fallback, WASM fallback, throttling, and iframe lifecycle. Smart Connections dependency tied us to another plugin's proprietary `.ajson` format, which isn't sustainable for a public plugin.
+
+**Ollama as the answer**: Since the user already runs Ollama on the same machine, we can replace both SC reading AND iframe WASM with simple HTTP calls to `localhost:11434/api/embed`. No WASM, no iframe, no proprietary formats.
+
+**Storage: Orama over individual JSON files**: The earlier custom embedding index used one JSON file per document, causing multi-second load times on large vaults. Orama provides a pure JS embedded search engine (<2kb bundled) that serialises the entire database to a single JSON file. Load once, search in microseconds.
+
+**The implementation went smoothly**: Created `OllamaProvider` and `VectorStore` as clean, focused classes. Updated `src/main.ts` to use them instead of SC/iframe. Built successfully after fixing Orama's internal type casting (needed `as unknown as VaultDocument`).
+
+**End-to-end test**: Launched Obsidian with the test vault, initialised an MCP session, and called `semantic_search` with query "test vault integration". Got 5 results back:
+
+1. README.md (66.9%)
+2. subfolder/nested.md (43.0%)
+3. test-read.md (40.6%)
+4. topics/carbon-accounting.md (38.4%)
+5. dataview-test.md (38.1%)
+
+### Key Learnings
+
+1. **Simple HTTP > iframe WASM**: Replacing ~540 lines of iframe/WASM/WebGPU code with a 20-line HTTP fetch to Ollama. The complexity difference is staggering.
+2. **Orama is excellent**: Pure JS, zero dependencies, vector + full-text support, single-file serialisation. Perfect for Obsidian plugins.
+3. **Own your index**: Depending on another plugin's internal data format is fragile. Generating and storing embeddings ourselves gives full control.
+4. **Ollama batch API**: The `/api/embed` endpoint accepts an array of inputs, reducing round-trips for bulk indexing.
+
+### Statistics
+
+- **2 new source files** created (~360 lines)
+- **2 source files** deleted (~883 lines)
+- **Net: ~520 lines removed** while keeping the same functionality
+- **1 npm package** added (`@orama/orama`)
+- **Bundle size**: 2.2MB (down from previous builds with transformers.js overhead)
+- **5 test results** returned successfully from end-to-end test
+
+### Files Changed
+
+- `src/ollama-provider.ts` — NEW: Ollama HTTP client
+- `src/vector-store.ts` — NEW: Orama vector store
+- `src/main.ts` — Updated imports, instance vars, semantic_search handler
+- `src/smart-connections-reader.ts` — DELETED
+- `src/embedding-service-iframe.ts` — DELETED
+- `docs/features/ollama-integration.md` — NEW: Feature specification
+- `TODO.md` — Added Ollama integration task
+- `package.json` — Added @orama/orama dependency
+- `manifest.json` — isDesktopOnly: true (both demo + test vaults)
+
+### What's Next
+
+- Integration tests for the new Ollama/Orama semantic search
+- Settings UI for Ollama configuration (base URL, model selection)
+- Background indexing on vault open
+- Progress indicator during initial index build
+
+---
+
+*End of log entry*

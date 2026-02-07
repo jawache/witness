@@ -2,7 +2,7 @@
 
 ## High Priority
 
-(None currently)
+- [ ] [Ollama integration](docs/features/ollama-integration.md) — Replace Smart Connections + iframe WASM with Ollama for embeddings. Own the index entirely.
 
 ## Features
 

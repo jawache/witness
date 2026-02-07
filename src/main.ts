@@ -9,8 +9,8 @@ import { Tunnel, bin as cloudflaredBin, install as installCloudflared, use as us
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { EmbeddingServiceIframe } from './embedding-service-iframe';
-import { SmartConnectionsReader } from './smart-connections-reader';
+import { OllamaProvider } from './ollama-provider';
+import { VectorStore } from './vector-store';
 
 /**
  * Logger that writes to both console and file.
@@ -209,8 +209,8 @@ export default class WitnessPlugin extends Plugin {
 	private tunnelProcess: Tunnel | null = null;
 	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
-	private embeddingService: EmbeddingServiceIframe | null = null;
-	private scReader: SmartConnectionsReader | null = null;
+	private vectorStore: VectorStore | null = null;
+	private ollamaProvider: OllamaProvider | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -243,14 +243,12 @@ export default class WitnessPlugin extends Plugin {
 		this.logger.info('Witness plugin unloading');
 		this.stopTunnel();
 		this.stopMCPServer();
-		if (this.embeddingService) {
-			this.embeddingService.destroy();
-			this.embeddingService = null;
+		if (this.vectorStore) {
+			await this.vectorStore.save();
+			this.vectorStore.destroy();
+			this.vectorStore = null;
 		}
-		if (this.scReader) {
-			this.scReader.clearCache();
-			this.scReader = null;
-		}
+		this.ollamaProvider = null;
 		await this.logger.close();
 	}
 
@@ -1126,11 +1124,11 @@ export default class WitnessPlugin extends Plugin {
 			);
 		}
 
-		// Semantic Search tool (uses Smart Connections embeddings)
+		// Semantic Search tool (uses Ollama embeddings + Orama vector store)
 		this.mcpServer.tool(
 			'semantic_search',
 			this.settings.coreToolDescriptions?.semantic_search ||
-				'Search for documents by meaning using semantic similarity. Requires Smart Connections plugin with TaylorAI/bge-micro-v2 embeddings.',
+				'Search for documents by meaning using semantic similarity. Requires Ollama running with nomic-embed-text model.',
 			{
 				query: z.string().describe('Natural language search query'),
 				limit: z.number().optional().default(10).describe('Maximum number of results to return'),
@@ -1142,68 +1140,59 @@ export default class WitnessPlugin extends Plugin {
 			},
 			async ({ query, limit, minScore, paths }) => {
 				try {
-					// Initialize Smart Connections reader on first use
-					if (!this.scReader) {
-						this.scReader = new SmartConnectionsReader(this.app);
+					// Initialize Ollama provider on first use
+					if (!this.ollamaProvider) {
+						this.ollamaProvider = new OllamaProvider();
 					}
 
-					// Validate Smart Connections configuration
-					const validation = await this.scReader.validate();
-					if (!validation.valid) {
+					// Check Ollama availability
+					if (!(await this.ollamaProvider.isAvailable())) {
 						return {
 							content: [
 								{
 									type: 'text',
-									text: validation.error || 'Smart Connections validation failed',
+									text: 'Ollama is not running. Start Ollama and ensure nomic-embed-text is pulled:\n\n  ollama pull nomic-embed-text',
 								},
 							],
 							isError: true,
 						};
 					}
 
-					this.logger.info(`Smart Connections validated: ${validation.documentCount} documents, model: ${validation.model}`);
+					// Initialize vector store on first use
+					if (!this.vectorStore) {
+						this.vectorStore = new VectorStore(this.app, this.ollamaProvider);
+						await this.vectorStore.initialize();
+						this.logger.info(`Vector store initialized with ${this.vectorStore.getCount()} documents`);
 
-					// Load/refresh embeddings cache (incremental)
-					const loadedCount = await this.scReader.loadEmbeddings();
-					this.logger.info(`Loaded ${loadedCount} new/updated embeddings, total cached: ${this.scReader.getCount()}`);
+						// If index is empty or stale, do an incremental index
+						const mdFiles = this.app.vault.getMarkdownFiles();
+						const staleFiles = await this.vectorStore.getStaleFiles(mdFiles);
 
-					if (this.scReader.getCount() === 0) {
+						if (staleFiles.length > 0) {
+							this.logger.info(`Indexing ${staleFiles.length} new/changed files...`);
+							const indexed = await this.vectorStore.indexFiles(staleFiles, (done, total) => {
+								this.logger.info(`Indexing progress: ${done}/${total}`);
+							});
+							await this.vectorStore.save();
+							this.logger.info(`Indexed ${indexed} files, total: ${this.vectorStore.getCount()}`);
+						}
+					}
+
+					if (this.vectorStore.getCount() === 0) {
 						return {
 							content: [
 								{
 									type: 'text',
-									text: 'No embeddings found in Smart Connections. Please ensure Smart Connections has indexed your vault.',
+									text: 'No documents indexed yet. Ensure your vault has markdown files and Ollama is running.',
 								},
 							],
 							isError: true,
 						};
 					}
 
-					// Initialize embedding service for query embedding (iframe mode)
-					if (!this.embeddingService) {
-						this.embeddingService = new EmbeddingServiceIframe({
-							gpuMode: 'never',  // Use WASM only for single query embeddings
-							throttleMs: 0,     // No throttling needed for single queries
-						});
-						this.embeddingService.onProgress((info) => {
-							this.logger.info(`Embedding progress: ${info.status}`, info.progress);
-						});
-					}
-
-					// Initialize the model if not already done
-					const modelInfo = await this.embeddingService.initialize();
-					this.logger.info(`Query embedding model: ${modelInfo.model} (${modelInfo.dimensions} dims)`);
-
-					// Generate embedding for query
-					const queryEmbedding = await this.embeddingService.embed(query);
-					this.logger.info(`Generated query embedding for: "${query}"`);
-
-					// Search using Smart Connections embeddings
-					const results = this.scReader.search(queryEmbedding, {
-						limit,
-						minScore,
-						paths,
-					});
+					// Search
+					this.logger.info(`Semantic search for: "${query}"`);
+					const results = await this.vectorStore.search(query, { limit, minScore, paths });
 
 					// Format results
 					if (results.length === 0) {
