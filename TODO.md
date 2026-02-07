@@ -4,6 +4,12 @@
 
 - [ ] [Ollama integration](docs/features/ollama-integration.md) — Replace Smart Connections + iframe WASM with Ollama for embeddings. Own the index entirely.
 
+## Next Up
+
+- [ ] [Hybrid search](docs/features/hybrid-search.md) — Add BM25 + semantic hybrid search via Orama's built-in mode. Highest impact, lowest effort.
+- [ ] [Markdown chunking](docs/features/markdown-chunking.md) — Split documents by headings before embedding. Improves retrieval for long documents.
+- [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
+
 ## Features
 
 ### Remote Access via Internet Tunnel
