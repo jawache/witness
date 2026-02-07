@@ -26,6 +26,7 @@ embedding-worker.js
 
 # Test outputs (created by integration tests, not fixtures)
 test/vault/*-temp.md
+test/vault/test-move-dest.md
 test/vault/move-conflict-*.md
 test/vault/subfolder/moved-file.md
 
@@ -33,6 +34,13 @@ test/vault/subfolder/moved-file.md
 test/vault/.obsidian/plugins/smart-connections/
 test/vault/.smart-env/
 
-# Test vault runtime config (changes during testing)
+# Test vault plugin build artifacts (overwritten by test:install-plugin)
+test/vault/.obsidian/plugins/witness/main.js
+test/vault/.obsidian/plugins/witness/manifest.json
+test/vault/.obsidian/plugins/witness/styles.css
+
+# Test vault runtime data
 test/vault/.obsidian/plugins/witness/data.json
+test/vault/.obsidian/plugins/witness/logs/
 test/vault/.obsidian/community-plugins.json
+test/vault/.witness/
