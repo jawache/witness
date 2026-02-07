@@ -11,6 +11,6 @@ export default defineConfig({
       concurrent: false,
     },
     // Include integration tests
-    include: ['integration/**/*.test.ts'],
+    include: ['integration/**/*.test.ts', 'unit/**/*.test.ts'],
   },
 });

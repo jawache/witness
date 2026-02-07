@@ -1,19 +1,24 @@
 /**
  * Vector store backed by Orama.
- * Stores document embeddings and supports vector similarity search.
+ * Stores document embeddings and supports hybrid (BM25 + vector),
+ * vector-only, and fulltext-only search modes.
  * Persists to .witness/index.orama as a single JSON file.
  */
 
-import { create, insert, remove, searchVector, save, load, count, getByID } from '@orama/orama';
+import { create, insert, remove, search, searchVector, save, load, count, getByID } from '@orama/orama';
 import type { AnyOrama, RawData } from '@orama/orama';
 import type { App, TFile } from 'obsidian';
 import { OllamaProvider } from './ollama-provider';
 
 const STORE_PATH = '.witness/index.orama';
 
+// Bump this when the schema changes to force re-indexing on upgrade.
+const SCHEMA_VERSION = 2; // v1 = vector-only, v2 = hybrid (added content field)
+
 interface VaultDocument {
 	path: string;
 	title: string;
+	content: string;
 	mtime: number;
 	embedding: number[];
 }
@@ -36,28 +41,42 @@ export class VectorStore {
 		this.dimensions = ollama.getDimensions();
 	}
 
+	private getSchema() {
+		return {
+			path: 'string' as const,
+			title: 'string' as const,
+			content: 'string' as const,
+			mtime: 'number' as const,
+			embedding: `vector[${this.dimensions}]` as const,
+		};
+	}
+
 	/**
 	 * Initialise the database. Loads from disk if a saved index exists,
 	 * otherwise creates a fresh empty database.
 	 */
 	async initialize(): Promise<void> {
-		const schema = {
-			path: 'string' as const,
-			title: 'string' as const,
-			mtime: 'number' as const,
-			embedding: `vector[${this.dimensions}]` as const,
-		};
-
+		const schema = this.getSchema();
 		this.db = create({ schema, id: 'witness-vectors' });
 
 		// Try to load existing index
 		if (await this.app.vault.adapter.exists(STORE_PATH)) {
 			try {
 				const raw = await this.app.vault.adapter.read(STORE_PATH);
-				const data = JSON.parse(raw) as RawData;
+				const envelope = JSON.parse(raw);
+
+				// Check schema version — discard old indexes to force re-index
+				const version = envelope.schemaVersion ?? 1;
+				if (version < SCHEMA_VERSION) {
+					console.warn(`VectorStore: Schema v${version} → v${SCHEMA_VERSION}, discarding old index`);
+					this.db = create({ schema, id: 'witness-vectors' });
+					return;
+				}
+
+				const data = (envelope.data ?? envelope) as RawData;
 				load(this.db, data);
 			} catch (e) {
-				// Corrupted index — start fresh
+				// Corrupted or incompatible index — start fresh
 				console.warn('VectorStore: Failed to load saved index, starting fresh:', e);
 				this.db = create({ schema, id: 'witness-vectors' });
 			}
@@ -76,7 +95,8 @@ export class VectorStore {
 		}
 
 		const data = save(this.db);
-		await this.app.vault.adapter.write(STORE_PATH, JSON.stringify(data));
+		const envelope = { schemaVersion: SCHEMA_VERSION, data };
+		await this.app.vault.adapter.write(STORE_PATH, JSON.stringify(envelope));
 	}
 
 	/**
@@ -104,6 +124,7 @@ export class VectorStore {
 			id: file.path,
 			path: file.path,
 			title: file.basename,
+			content,
 			mtime: file.stat.mtime,
 			embedding,
 		});
@@ -136,6 +157,7 @@ export class VectorStore {
 					id: batch[j].path,
 					path: batch[j].path,
 					title: batch[j].basename,
+					content: texts[j],
 					mtime: batch[j].stat.mtime,
 					embedding: embeddings[j],
 				});
@@ -166,9 +188,10 @@ export class VectorStore {
 	}
 
 	/**
-	 * Search for documents similar to a query string.
+	 * Hybrid search: BM25 keyword matching + vector cosine similarity,
+	 * merged via Reciprocal Rank Fusion (RRF).
 	 */
-	async search(
+	async searchHybrid(
 		query: string,
 		options?: { limit?: number; minScore?: number; paths?: string[] }
 	): Promise<SearchResult[]> {
@@ -177,7 +200,33 @@ export class VectorStore {
 		const limit = options?.limit ?? 10;
 		const minScore = options?.minScore ?? 0.3;
 
-		// Generate query embedding
+		const queryEmbedding = await this.ollama.embedOne(query);
+
+		const results = await search(this.db, {
+			mode: 'hybrid',
+			term: query,
+			vector: { value: queryEmbedding, property: 'embedding' },
+			properties: ['title', 'content'],
+			similarity: minScore,
+			limit,
+			hybridWeights: { text: 0.3, vector: 0.7 },
+		} as any);
+
+		return this.mapAndFilterHits(results.hits, options?.paths);
+	}
+
+	/**
+	 * Vector-only search: cosine similarity on embeddings.
+	 */
+	async searchVector(
+		query: string,
+		options?: { limit?: number; minScore?: number; paths?: string[] }
+	): Promise<SearchResult[]> {
+		if (!this.db) throw new Error('VectorStore not initialized');
+
+		const limit = options?.limit ?? 10;
+		const minScore = options?.minScore ?? 0.3;
+
 		const queryEmbedding = await this.ollama.embedOne(query);
 
 		const results = await searchVector(this.db, {
@@ -187,20 +236,53 @@ export class VectorStore {
 			limit,
 		});
 
-		let hits = results.hits.map((hit) => ({
+		return this.mapAndFilterHits(results.hits, options?.paths);
+	}
+
+	/**
+	 * Fulltext-only search: BM25 keyword matching, no embeddings needed.
+	 */
+	async searchFulltext(
+		query: string,
+		options?: { limit?: number; paths?: string[] }
+	): Promise<SearchResult[]> {
+		if (!this.db) throw new Error('VectorStore not initialized');
+
+		const results = await search(this.db, {
+			term: query,
+			properties: ['title', 'content'],
+			limit: options?.limit ?? 10,
+		});
+
+		// Normalize BM25 scores to 0-1 range (relative to top result)
+		const mapped = this.mapAndFilterHits(results.hits, options?.paths);
+		const maxScore = mapped.length > 0 ? mapped[0].score : 1;
+		if (maxScore > 1) {
+			return mapped.map((r) => ({ ...r, score: r.score / maxScore }));
+		}
+		return mapped;
+	}
+
+	/**
+	 * Map Orama hits to SearchResult[] and optionally filter by paths.
+	 */
+	private mapAndFilterHits(
+		hits: Array<{ document: unknown; score: number }>,
+		paths?: string[]
+	): SearchResult[] {
+		let results = hits.map((hit) => ({
 			path: (hit.document as unknown as VaultDocument).path,
 			title: (hit.document as unknown as VaultDocument).title,
 			score: hit.score,
 		}));
 
-		// Filter by paths if specified
-		if (options?.paths?.length) {
-			hits = hits.filter((h) =>
-				options.paths!.some((p) => h.path.startsWith(p))
+		if (paths?.length) {
+			results = results.filter((h) =>
+				paths.some((p) => h.path.startsWith(p))
 			);
 		}
 
-		return hits;
+		return results;
 	}
 
 	/**
@@ -233,12 +315,7 @@ export class VectorStore {
 	 * Clear the entire index and delete the stored file.
 	 */
 	async clear(): Promise<void> {
-		const schema = {
-			path: 'string' as const,
-			title: 'string' as const,
-			mtime: 'number' as const,
-			embedding: `vector[${this.dimensions}]` as const,
-		};
+		const schema = this.getSchema();
 		this.db = create({ schema, id: 'witness-vectors' });
 
 		if (await this.app.vault.adapter.exists(STORE_PATH)) {

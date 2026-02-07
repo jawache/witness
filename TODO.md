@@ -7,6 +7,7 @@
 - [ ] [Hybrid search](docs/features/hybrid-search.md) — Add BM25 + semantic hybrid search via Orama's built-in mode. Highest impact, lowest effort.
 - [ ] [Markdown chunking](docs/features/markdown-chunking.md) — Split documents by headings before embedding. Improves retrieval for long documents.
 - [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
+- [ ] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with status bar indicator and log viewer.
 
 ## Features
 

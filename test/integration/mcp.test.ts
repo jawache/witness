@@ -412,6 +412,109 @@ describe('MCP Server Integration Tests', () => {
     });
   });
 
+  describe('semantic_search', () => {
+    // Check if Ollama is available — skip tests gracefully if not
+    let ollamaAvailable = false;
+
+    beforeAll(async () => {
+      try {
+        const resp = await fetch('http://localhost:11434/api/tags');
+        ollamaAvailable = resp.ok;
+      } catch {
+        ollamaAvailable = false;
+      }
+    });
+
+    it('should return results for hybrid search (default mode)', async () => {
+      if (!ollamaAvailable) return;
+
+      const result = await client.callTool('semantic_search', {
+        query: 'carbon emissions',
+      });
+
+      expect(result.isError).not.toBe(true);
+      const content = getTextContent(result);
+      expect(content).toContain('carbon-accounting');
+    }, 60000); // First call triggers indexing — may be slow
+
+    it('should return results for vector search', async () => {
+      if (!ollamaAvailable) return;
+
+      const result = await client.callTool('semantic_search', {
+        query: 'carbon emissions',
+        mode: 'vector',
+      });
+
+      expect(result.isError).not.toBe(true);
+      const content = getTextContent(result);
+      expect(content).toContain('carbon-accounting');
+    });
+
+    it('should return results for fulltext search', async () => {
+      if (!ollamaAvailable) return;
+
+      const result = await client.callTool('semantic_search', {
+        query: 'carbon',
+        mode: 'fulltext',
+      });
+
+      expect(result.isError).not.toBe(true);
+      const content = getTextContent(result);
+      expect(content).toContain('carbon-accounting');
+    });
+
+    it('should return different result counts per mode', async () => {
+      if (!ollamaAvailable) return;
+
+      // Fulltext for "carbon" should only find docs containing the word
+      const fulltext = await client.callTool('semantic_search', {
+        query: 'carbon',
+        mode: 'fulltext',
+      });
+      const fulltextContent = getTextContent(fulltext);
+
+      // Vector should find more docs via semantic similarity
+      const vector = await client.callTool('semantic_search', {
+        query: 'carbon',
+        mode: 'vector',
+      });
+      const vectorContent = getTextContent(vector);
+
+      const fulltextCount = (fulltextContent.match(/\d+\.\s\*\*/g) || []).length;
+      const vectorCount = (vectorContent.match(/\d+\.\s\*\*/g) || []).length;
+      expect(vectorCount).toBeGreaterThan(fulltextCount);
+    });
+
+    it('should filter results by paths', async () => {
+      if (!ollamaAvailable) return;
+
+      const result = await client.callTool('semantic_search', {
+        query: 'carbon',
+        mode: 'fulltext',
+        paths: ['topics/'],
+      });
+
+      expect(result.isError).not.toBe(true);
+      const content = getTextContent(result);
+      expect(content).toContain('topics/');
+    });
+
+    it('should respect limit parameter', async () => {
+      if (!ollamaAvailable) return;
+
+      const result = await client.callTool('semantic_search', {
+        query: 'test',
+        mode: 'vector',
+        limit: 2,
+      });
+
+      expect(result.isError).not.toBe(true);
+      const content = getTextContent(result);
+      const matchCount = (content.match(/\d+\.\s\*\*/g) || []).length;
+      expect(matchCount).toBeLessThanOrEqual(2);
+    });
+  });
+
   describe('logging', () => {
     // Helper to get log file path
     const getLogPath = () => {
