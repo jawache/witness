@@ -2302,28 +2302,32 @@ class WitnessSettingTab extends PluginSettingTab {
 		}
 
 		// Available embedding models with pull buttons
+		// Models with multiple sizes list each variant separately
 		const AVAILABLE_MODELS: [string, string][] = [
-			['nomic-embed-text', 'General purpose, 768d (recommended)'],
-			['all-minilm', '384d, 46MB — lightweight'],
-			['mxbai-embed-large', '1024d, 670MB — high quality'],
-			['bge-m3', '1024d, 1.2GB — multilingual'],
-			['snowflake-arctic-embed', '384-1024d — multiple sizes'],
-			['snowflake-arctic-embed2', '1024d — multilingual'],
-			['nomic-embed-text-v2-moe', 'MoE, multilingual'],
-			['qwen3-embedding', '0.6-8B — multiple sizes'],
-			['embeddinggemma', '300M — Google'],
-			['paraphrase-multilingual', '278M — multilingual'],
-			['granite-embedding', '30-278M — IBM'],
-			['bge-large', '335M — BAAI'],
+			['nomic-embed-text', '274MB download, 768d — general purpose (recommended)'],
+			['all-minilm', '46MB download, 384d — fast and lightweight'],
+			['mxbai-embed-large', '670MB download, 1024d — high quality'],
+			['bge-m3', '1.2GB download, 1024d — multilingual'],
+			['bge-large', '670MB download, 1024d — BAAI'],
+			['snowflake-arctic-embed:33m', '67MB download, 384d — small'],
+			['snowflake-arctic-embed:110m', '223MB download, 768d — medium'],
+			['snowflake-arctic-embed:335m', '670MB download, 1024d — large'],
+			['snowflake-arctic-embed2', '568MB download, 1024d — multilingual'],
+			['nomic-embed-text-v2-moe', '489MB download, 768d — MoE, multilingual'],
+			['granite-embedding:30m', '62MB download, 384d — IBM, tiny'],
+			['granite-embedding:278m', '557MB download, 768d — IBM'],
+			['paraphrase-multilingual', '557MB download, 768d — multilingual'],
+			['qwen3-embedding:0.6b', '490MB download, 1024d — small'],
+			['qwen3-embedding:8b', '6.6GB download, 4096d — large'],
 		];
 
 		const pulledNames = new Set(
-			(this.embeddingModelsCache ?? []).map(m => m.name.split(':')[0])
+			(this.embeddingModelsCache ?? []).map(m => m.name)
 		);
 
 		const modelsGroup = new SettingGroup(pane).setHeading('Available Models');
 		for (const [name, desc] of AVAILABLE_MODELS) {
-			const isPulled = pulledNames.has(name);
+			const isPulled = pulledNames.has(name) || pulledNames.has(name + ':latest');
 			modelsGroup.addSetting(s => {
 				s.setName(name).setDesc(desc);
 				if (isPulled) {
@@ -2331,22 +2335,21 @@ class WitnessSettingTab extends PluginSettingTab {
 						.setButtonText('Installed')
 						.setDisabled(true));
 				} else {
+					let pulling = false;
 					s.addButton(btn => btn
 						.setButtonText('Pull')
 						.onClick(async () => {
-							btn.setButtonText('Pulling...');
-							btn.setDisabled(true);
+							if (pulling) return;
+							pulling = true;
+							s.setDesc('Downloading...');
+							btn.setButtonText('...');
 							try {
 								const provider = new OllamaProvider({
 									baseUrl: this.plugin.settings.ollamaBaseUrl,
 								});
-								await provider.pullModel(name, (status, percent) => {
+								await provider.pullModel(name, (_status, percent) => {
 									if (percent !== null) {
-										btn.setButtonText(`${percent}%`);
-									} else {
-										btn.setButtonText(status.length > 20
-											? status.slice(0, 20) + '...'
-											: status || 'Pulling...');
+										s.setDesc(`Downloading... ${percent}%`);
 									}
 								});
 								new Notice(`${name} pulled successfully`);
@@ -2354,8 +2357,9 @@ class WitnessSettingTab extends PluginSettingTab {
 								this.display();
 							} catch (e) {
 								new Notice(`Failed to pull ${name}: ${(e as Error).message}`);
+								s.setDesc(desc);
 								btn.setButtonText('Pull');
-								btn.setDisabled(false);
+								pulling = false;
 							}
 						}));
 				}

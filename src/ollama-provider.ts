@@ -168,7 +168,7 @@ export class OllamaProvider {
 				try {
 					const data = JSON.parse(line);
 					let percent: number | null = null;
-					if (data.total && data.completed) {
+					if (data.total > 0 && data.completed != null) {
 						percent = Math.round((data.completed / data.total) * 100);
 					}
 					onProgress?.(data.status || '', percent);
