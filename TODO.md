@@ -2,8 +2,6 @@
 
 ## High Priority
 
-- [ ] [Ollama integration](docs/features/ollama-integration.md) — Replace Smart Connections + iframe WASM with Ollama for embeddings. Own the index entirely.
-
 ## Next Up
 
 - [ ] [Hybrid search](docs/features/hybrid-search.md) — Add BM25 + semantic hybrid search via Orama's built-in mode. Highest impact, lowest effort.
@@ -30,3 +28,5 @@ Implement Cloudflare Tunnel or similar for remote access to the MCP server from 
 - [x] Integration test suite (23 tests, all MCP tools covered)
 - [x] MCP server logging to file (.obsidian/plugins/witness/logs/)
 - [x] Move/rename file tool (move_file)
+- [x] Ollama integration — Local embeddings via Ollama + Orama vector store
+- [x] Tabbed settings UI with Ollama configuration and model pull
