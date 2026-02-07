@@ -99,8 +99,9 @@ export class VectorStore {
 		// Remove existing entry for this path if present
 		await this.removeByPath(file.path);
 
-		// Insert new entry
+		// Insert new entry — use file path as document ID for reliable lookups
 		await insert(this.db, {
+			id: file.path,
 			path: file.path,
 			title: file.basename,
 			mtime: file.stat.mtime,
@@ -132,6 +133,7 @@ export class VectorStore {
 			for (let j = 0; j < batch.length; j++) {
 				await this.removeByPath(batch[j].path);
 				await insert(this.db, {
+					id: batch[j].path,
 					path: batch[j].path,
 					title: batch[j].basename,
 					mtime: batch[j].stat.mtime,
@@ -148,21 +150,18 @@ export class VectorStore {
 
 	/**
 	 * Remove a document by its vault path.
+	 * Uses path as document ID for direct lookup (no search needed).
 	 */
 	async removeByPath(filePath: string): Promise<void> {
 		if (!this.db) return;
 
-		// Search for the document by path to get its internal ID
-		const results = await searchVector(this.db, {
-			mode: 'vector',
-			vector: { value: new Array(this.dimensions).fill(0), property: 'embedding' },
-			similarity: 0,
-			where: { path: { eq: filePath } },
-			limit: 1,
-		});
-
-		if (results.hits.length > 0) {
-			await remove(this.db, results.hits[0].id);
+		try {
+			const existing = getByID(this.db, filePath);
+			if (existing) {
+				await remove(this.db, filePath);
+			}
+		} catch {
+			// Document doesn't exist — nothing to remove
 		}
 	}
 
@@ -206,6 +205,7 @@ export class VectorStore {
 
 	/**
 	 * Get files that need re-indexing (mtime changed or not indexed).
+	 * Uses path as document ID for direct lookup.
 	 */
 	async getStaleFiles(files: TFile[]): Promise<TFile[]> {
 		if (!this.db) return files;
@@ -213,22 +213,16 @@ export class VectorStore {
 		const stale: TFile[] = [];
 
 		for (const file of files) {
-			// Search for existing entry
-			const results = await searchVector(this.db, {
-				mode: 'vector',
-				vector: { value: new Array(this.dimensions).fill(0), property: 'embedding' },
-				similarity: 0,
-				where: { path: { eq: file.path } },
-				limit: 1,
-			});
-
-			if (results.hits.length === 0) {
-				stale.push(file);
-			} else {
-				const doc = results.hits[0].document as unknown as VaultDocument;
-				if (doc.mtime !== file.stat.mtime) {
+			try {
+				const doc = getByID(this.db, file.path) as unknown as VaultDocument | null;
+				if (!doc) {
+					stale.push(file);
+				} else if (doc.mtime !== file.stat.mtime) {
 					stale.push(file);
 				}
+			} catch {
+				// Document not found — needs indexing
+				stale.push(file);
 			}
 		}
 

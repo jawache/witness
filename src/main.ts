@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, Modal, SuggestModal, normalizePath, Notice, TFile } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, SettingGroup, SecretComponent, Modal, SuggestModal, normalizePath, Notice, TFile } from 'obsidian';
 import * as http from 'http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -9,7 +9,7 @@ import { Tunnel, bin as cloudflaredBin, install as installCloudflared, use as us
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { OllamaProvider } from './ollama-provider';
+import { OllamaProvider, type EmbeddingModelInfo } from './ollama-provider';
 import { VectorStore } from './vector-store';
 
 /**
@@ -168,6 +168,9 @@ interface WitnessSettings {
 	tunnelPrimaryHost: string;
 	// Authentication (simple token)
 	enableAuth: boolean;
+	// Ollama / Semantic Search
+	ollamaBaseUrl: string;
+	ollamaModel: string;
 }
 
 // Helper function to generate random credentials
@@ -198,6 +201,8 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	tunnelToken: '',
 	tunnelPrimaryHost: '',
 	enableAuth: false,
+	ollamaBaseUrl: 'http://localhost:11434',
+	ollamaModel: 'nomic-embed-text',
 }
 
 export default class WitnessPlugin extends Plugin {
@@ -209,8 +214,8 @@ export default class WitnessPlugin extends Plugin {
 	private tunnelProcess: Tunnel | null = null;
 	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
-	private vectorStore: VectorStore | null = null;
-	private ollamaProvider: OllamaProvider | null = null;
+	vectorStore: VectorStore | null = null;
+	ollamaProvider: OllamaProvider | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -250,6 +255,28 @@ export default class WitnessPlugin extends Plugin {
 		}
 		this.ollamaProvider = null;
 		await this.logger.close();
+	}
+
+	/**
+	 * Reset the Ollama provider and vector store so they reinitialise
+	 * with the current settings on next semantic_search call.
+	 */
+	resetSemanticSearch(): void {
+		if (this.vectorStore) {
+			this.vectorStore.destroy();
+			this.vectorStore = null;
+		}
+		this.ollamaProvider = null;
+	}
+
+	getIndexCount(): number {
+		return this.vectorStore?.getCount() ?? 0;
+	}
+
+	async clearIndex(): Promise<void> {
+		if (this.vectorStore) {
+			await this.vectorStore.clear();
+		}
 	}
 
 	async loadSettings() {
@@ -1142,7 +1169,10 @@ export default class WitnessPlugin extends Plugin {
 				try {
 					// Initialize Ollama provider on first use
 					if (!this.ollamaProvider) {
-						this.ollamaProvider = new OllamaProvider();
+						this.ollamaProvider = new OllamaProvider({
+							baseUrl: this.settings.ollamaBaseUrl,
+							model: this.settings.ollamaModel,
+						});
 					}
 
 					// Check Ollama availability
@@ -1776,8 +1806,12 @@ class CommandEditModal extends Modal {
 	}
 }
 
+type WitnessTab = 'server' | 'commands' | 'remote' | 'search';
+
 class WitnessSettingTab extends PluginSettingTab {
 	plugin: WitnessPlugin;
+	private activeTab: WitnessTab = 'server';
+	private embeddingModelsCache: EmbeddingModelInfo[] | null = null;
 
 	constructor(app: App, plugin: WitnessPlugin) {
 		super(app, plugin);
@@ -1786,99 +1820,129 @@ class WitnessSettingTab extends PluginSettingTab {
 
 	display(): void {
 		const {containerEl} = this;
-
 		containerEl.empty();
 
 		containerEl.createEl('h2', {text: 'Witness Settings'});
 
-		// ===== BASIC SETTINGS =====
-		containerEl.createEl('h3', {text: 'Basic Settings'});
+		// Tab header
+		const header = containerEl.createDiv({cls: 'witness-tab-header'});
+		const tabs: {id: WitnessTab; label: string}[] = [
+			{id: 'server', label: 'Server'},
+			{id: 'commands', label: 'Custom Commands'},
+			{id: 'remote', label: 'Remote Access'},
+			{id: 'search', label: 'Semantic Search'},
+		];
+		for (const tab of tabs) {
+			const btn = header.createEl('button', {
+				text: tab.label,
+				cls: `witness-tab-button${tab.id === this.activeTab ? ' witness-tab-active' : ''}`,
+			});
+			btn.addEventListener('click', () => {
+				this.activeTab = tab.id;
+				this.display();
+			});
+		}
 
-		new Setting(containerEl)
-			.setName('Enable MCP Server')
-			.setDesc('Start the MCP server to allow AI assistants to interact with your vault')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.mcpEnabled)
-				.onChange(async (value) => {
-					this.plugin.settings.mcpEnabled = value;
-					await this.plugin.saveSettings();
+		// Tab panes
+		const panes: Record<WitnessTab, HTMLElement> = {
+			server: containerEl.createDiv({cls: 'witness-tab-content'}),
+			commands: containerEl.createDiv({cls: 'witness-tab-content'}),
+			remote: containerEl.createDiv({cls: 'witness-tab-content'}),
+			search: containerEl.createDiv({cls: 'witness-tab-content'}),
+		};
 
-					if (value) {
-						await this.plugin.startMCPServer();
-					} else {
-						this.plugin.stopMCPServer();
-					}
-				}));
+		this.renderServerTab(panes.server);
+		this.renderCommandsTab(panes.commands);
+		this.renderRemoteTab(panes.remote);
+		this.renderSearchTab(panes.search);
 
-		new Setting(containerEl)
-			.setName('MCP Server Port')
-			.setDesc('Port number for the MCP server (default: 3000)')
-			.addText(text => text
-				.setPlaceholder('3000')
-				.setValue(this.plugin.settings.mcpPort.toString())
-				.onChange(async (value) => {
-					const port = parseInt(value);
-					if (!isNaN(port) && port > 0 && port < 65536) {
-						this.plugin.settings.mcpPort = port;
+		// Show active pane
+		panes[this.activeTab].addClass('witness-tab-visible');
+	}
+
+	// ===== SERVER TAB =====
+	private renderServerTab(pane: HTMLElement): void {
+		new SettingGroup(pane)
+			.setHeading('Basic Settings')
+			.addSetting(s => s
+				.setName('Enable MCP Server')
+				.setDesc('Start the MCP server to allow AI assistants to interact with your vault')
+				.addToggle(toggle => toggle
+					.setValue(this.plugin.settings.mcpEnabled)
+					.onChange(async (value) => {
+						this.plugin.settings.mcpEnabled = value;
 						await this.plugin.saveSettings();
-					}
-				}));
+						if (value) {
+							await this.plugin.startMCPServer();
+						} else {
+							this.plugin.stopMCPServer();
+						}
+					})))
+			.addSetting(s => s
+				.setName('MCP Server Port')
+				.setDesc('Port number for the MCP server (default: 3000)')
+				.addText(text => text
+					.setPlaceholder('3000')
+					.setValue(this.plugin.settings.mcpPort.toString())
+					.onChange(async (value) => {
+						const port = parseInt(value);
+						if (!isNaN(port) && port > 0 && port < 65536) {
+							this.plugin.settings.mcpPort = port;
+							await this.plugin.saveSettings();
+						}
+					})));
 
-		// ===== SERVER CONFIGURATION =====
-		containerEl.createEl('h3', {text: 'Server Configuration'});
+		new SettingGroup(pane)
+			.setHeading('Server Configuration')
+			.addSetting(s => {
+				s.setName('Server Instructions')
+				 .setDesc('Instructions shown to AI assistants about how to use this MCP server');
 
-		const serverInstructionsSetting = new Setting(containerEl)
-			.setName('Server Instructions')
-			.setDesc('Instructions shown to AI assistants about how to use this MCP server');
-
-		let instructionsTextArea: HTMLTextAreaElement;
-
-		serverInstructionsSetting.addTextArea(text => {
-			instructionsTextArea = text.inputEl;
-			text
-				.setPlaceholder('Enter server instructions')
-				.setValue(this.plugin.settings.serverInstructions)
-				.onChange(async (value) => {
-					this.plugin.settings.serverInstructions = value;
-					await this.plugin.saveSettings();
+				let instructionsTextArea: HTMLTextAreaElement;
+				s.addTextArea(text => {
+					instructionsTextArea = text.inputEl;
+					text.setPlaceholder('Enter server instructions')
+						.setValue(this.plugin.settings.serverInstructions)
+						.onChange(async (value) => {
+							this.plugin.settings.serverInstructions = value;
+							await this.plugin.saveSettings();
+						});
+					text.inputEl.rows = 4;
+					text.inputEl.cols = 50;
 				});
-			text.inputEl.rows = 4;
-			text.inputEl.cols = 50;
-		});
-
-		// Add reset button
-		serverInstructionsSetting.addButton(button => button
-			.setIcon('reset')
-			.setTooltip('Reset to default')
-			.onClick(async () => {
-				this.plugin.settings.serverInstructions = DEFAULT_SETTINGS.serverInstructions;
-				instructionsTextArea.value = DEFAULT_SETTINGS.serverInstructions;
-				await this.plugin.saveSettings();
-			}));
-
-		new Setting(containerEl)
-			.setName('Orientation Document')
-			.setDesc('Path to a file that helps AI understand your vault structure and organization')
-			.addButton(button => {
-				button.setButtonText(this.plugin.settings.orientationPath || 'Select file');
-				button.onClick(() => {
-					new FileSuggestModal(this.app, async (selectedFile) => {
-						this.plugin.settings.orientationPath = selectedFile;
-						button.setButtonText(selectedFile);
+				s.addButton(button => button
+					.setIcon('reset')
+					.setTooltip('Reset to default')
+					.onClick(async () => {
+						this.plugin.settings.serverInstructions = DEFAULT_SETTINGS.serverInstructions;
+						instructionsTextArea.value = DEFAULT_SETTINGS.serverInstructions;
 						await this.plugin.saveSettings();
-					}).open();
+					}));
+			})
+			.addSetting(s => {
+				s.setName('Orientation Document')
+				 .setDesc('Path to a file that helps AI understand your vault structure');
+				s.addButton(button => {
+					button.setButtonText(this.plugin.settings.orientationPath || 'Select file');
+					button.onClick(() => {
+						new FileSuggestModal(this.app, async (selectedFile) => {
+							this.plugin.settings.orientationPath = selectedFile;
+							button.setButtonText(selectedFile);
+							await this.plugin.saveSettings();
+						}).open();
+					});
 				});
 			});
+	}
 
-		// ===== CUSTOM COMMANDS =====
-		containerEl.createEl('h3', {text: 'Custom Commands'});
-		containerEl.createEl('p', {
+	// ===== CUSTOM COMMANDS TAB =====
+	private renderCommandsTab(pane: HTMLElement): void {
+		pane.createEl('p', {
 			text: 'Expose specific Obsidian commands as MCP tools with custom names and descriptions.',
 			cls: 'setting-item-description'
 		});
 
-		// Add custom command button
-		new Setting(containerEl)
+		new Setting(pane)
 			.setName('Add Custom Command')
 			.setDesc('Add a new custom command to expose as an MCP tool')
 			.addButton(button => button
@@ -1893,34 +1957,29 @@ class WitnessSettingTab extends PluginSettingTab {
 						enabled: true
 					});
 					await this.plugin.saveSettings();
-					this.display(); // Refresh UI
+					this.display();
 				}));
 
-		// Display existing custom commands in compact list
 		this.plugin.settings.customCommands.forEach((cmd, index) => {
-			const setting = new Setting(containerEl);
+			const setting = new Setting(pane);
 
-			// Tool name with warning indicator for destructive commands only
 			const toolNameText = cmd.readOnly ? cmd.name : `⚠️ ${cmd.name}`;
 			setting.setName(toolNameText);
 
-			// Show command ID as description
 			const commands = (this.app as any).commands.commands;
 			const commandName = cmd.commandId && commands[cmd.commandId]
 				? commands[cmd.commandId].name
 				: 'No command selected';
 			setting.setDesc(commandName);
 
-			// Edit button
 			setting.addButton(button => button
 				.setButtonText('Edit')
 				.onClick(() => {
 					new CommandEditModal(this.app, this.plugin, cmd, () => {
-						this.display(); // Refresh after edit
+						this.display();
 					}).open();
 				}));
 
-			// Enabled toggle with label
 			const toggleContainer = setting.controlEl.createDiv();
 			toggleContainer.style.display = 'flex';
 			toggleContainer.style.alignItems = 'center';
@@ -1939,26 +1998,39 @@ class WitnessSettingTab extends PluginSettingTab {
 						toggle.setTooltip(value ? 'Click to disable' : 'Click to enable');
 						await this.plugin.saveSettings();
 					});
-				// Move toggle into container
 				toggleContainer.appendChild(toggle.toggleEl);
 			});
 
-			// Delete button
 			setting.addButton(button => button
 				.setIcon('trash')
 				.setTooltip('Delete')
 				.onClick(async () => {
 					this.plugin.settings.customCommands.splice(index, 1);
 					await this.plugin.saveSettings();
-					this.display(); // Refresh UI
+					this.display();
 				}));
 		});
 
-		// ===== REMOTE ACCESS =====
-		containerEl.createEl('h3', {text: 'Remote Access'});
+		new SettingGroup(pane)
+			.setHeading('Advanced')
+			.addSetting(s => s
+				.setName('Enable Command Fallback')
+				.setDesc('WARNING: Enables list_all_commands and execute_any_command tools for unrestricted command access.')
+				.addToggle(toggle => toggle
+					.setValue(this.plugin.settings.enableCommandFallback)
+					.onChange(async (value) => {
+						this.plugin.settings.enableCommandFallback = value;
+						await this.plugin.saveSettings();
+						if (this.plugin.settings.mcpEnabled) {
+							this.plugin.stopMCPServer();
+							await this.plugin.startMCPServer();
+						}
+					})));
+	}
 
-		// Tunnel enable toggle
-		new Setting(containerEl)
+	// ===== REMOTE ACCESS TAB =====
+	private renderRemoteTab(pane: HTMLElement): void {
+		new Setting(pane)
 			.setName('Enable Tunnel')
 			.setDesc('Create a Cloudflare tunnel to access your vault from anywhere')
 			.addToggle(toggle => toggle
@@ -1966,7 +2038,6 @@ class WitnessSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					this.plugin.settings.enableTunnel = value;
 					await this.plugin.saveSettings();
-
 					if (value) {
 						if (this.plugin.settings.mcpEnabled) {
 							await this.plugin.startTunnel();
@@ -1979,228 +2050,383 @@ class WitnessSettingTab extends PluginSettingTab {
 					} else {
 						this.plugin.stopTunnel();
 					}
-					this.display(); // Refresh to show/hide URL section
+					this.display();
 				}));
 
-		// Show tunnel configuration when enabled
-		if (this.plugin.settings.enableTunnel) {
-			// Tunnel type selector
-			new Setting(containerEl)
-				.setName('Tunnel Type')
-				.setDesc('Quick: random URL that changes on restart. Named: permanent URL with your own domain.')
-				.addDropdown(dropdown => dropdown
-					.addOption('quick', 'Quick Tunnel (ephemeral)')
-					.addOption('named', 'Named Tunnel (permanent)')
-					.setValue(this.plugin.settings.tunnelType)
-					.onChange(async (value: string) => {
-						this.plugin.settings.tunnelType = value as 'quick' | 'named';
-						await this.plugin.saveSettings();
-						// Restart tunnel if running
-						if (this.plugin.getTunnelStatus().status !== 'disconnected') {
-							await this.plugin.regenerateTunnel();
-							setTimeout(() => this.display(), 3000);
-						} else {
-							this.display();
-						}
-					}));
+		if (!this.plugin.settings.enableTunnel) return;
 
-			const isNamed = this.plugin.settings.tunnelType === 'named';
-
-			// Named tunnel token field
-			if (isNamed) {
-				new Setting(containerEl)
-					.setName('Tunnel Token')
-					.setDesc('Token from Cloudflare dashboard (Zero Trust → Networks → Tunnels → Configure → Install connector)')
-					.addText(text => {
-						text
-							.setPlaceholder('eyJhIjo...')
-							.setValue(this.plugin.settings.tunnelToken)
-							.onChange(async (value) => {
-								this.plugin.settings.tunnelToken = value;
-								await this.plugin.saveSettings();
-							});
-						text.inputEl.style.width = '300px';
-						text.inputEl.type = 'password';
-					});
-
-				// Named tunnel URL (user-configured, for display/copy purposes)
-				new Setting(containerEl)
-					.setName('Tunnel URL')
-					.setDesc('Your tunnel\'s public hostname (e.g., https://witness.example.com)')
-					.addText(text => {
-						text
-							.setPlaceholder('https://witness.example.com')
-							.setValue(this.plugin.settings.tunnelUrl || '')
-							.onChange(async (value) => {
-								this.plugin.settings.tunnelUrl = value || null;
-								await this.plugin.saveSettings();
-							});
-						text.inputEl.style.width = '300px';
-					});
-
-				// Primary host - only this machine runs the tunnel
-				const currentHost = os.hostname();
-				const isPrimary = !this.plugin.settings.tunnelPrimaryHost || this.plugin.settings.tunnelPrimaryHost === currentHost;
-				const primaryDesc = this.plugin.settings.tunnelPrimaryHost
-					? `Primary: ${this.plugin.settings.tunnelPrimaryHost}` + (isPrimary ? ' (this machine)' : ` (this machine: ${currentHost})`)
-					: 'No primary set — all machines will run the tunnel';
-
-				const primarySetting = new Setting(containerEl)
-					.setName('Primary Machine')
-					.setDesc(primaryDesc);
-
-				if (!isPrimary) {
-					primarySetting.descEl.style.color = 'var(--text-warning)';
-				}
-
-				primarySetting.addButton(button => button
-					.setButtonText(isPrimary && this.plugin.settings.tunnelPrimaryHost ? 'This machine ✓' : 'Set as primary')
-					.setCta()
-					.setDisabled(isPrimary && !!this.plugin.settings.tunnelPrimaryHost)
-					.onClick(async () => {
-						this.plugin.settings.tunnelPrimaryHost = currentHost;
-						await this.plugin.saveSettings();
-						new Notice(`This machine (${currentHost}) is now the primary tunnel host`);
+		new Setting(pane)
+			.setName('Tunnel Type')
+			.setDesc('Quick: random URL that changes on restart. Named: permanent URL with your own domain.')
+			.addDropdown(dropdown => dropdown
+				.addOption('quick', 'Quick Tunnel (ephemeral)')
+				.addOption('named', 'Named Tunnel (permanent)')
+				.setValue(this.plugin.settings.tunnelType)
+				.onChange(async (value: string) => {
+					this.plugin.settings.tunnelType = value as 'quick' | 'named';
+					await this.plugin.saveSettings();
+					if (this.plugin.getTunnelStatus().status !== 'disconnected') {
+						await this.plugin.regenerateTunnel();
+						setTimeout(() => this.display(), 3000);
+					} else {
 						this.display();
+					}
+				}));
+
+		const isNamed = this.plugin.settings.tunnelType === 'named';
+
+		if (isNamed) {
+			new Setting(pane)
+				.setName('Tunnel Token')
+				.setDesc('Token from Cloudflare dashboard (Zero Trust → Networks → Tunnels → Configure)')
+				.addComponent(el => new SecretComponent(this.app, el)
+					.setValue(this.plugin.settings.tunnelToken)
+					.onChange(async (value) => {
+						this.plugin.settings.tunnelToken = value;
+						await this.plugin.saveSettings();
 					}));
 
-				if (this.plugin.settings.tunnelPrimaryHost) {
-					primarySetting.addButton(button => button
-						.setIcon('x')
-						.setTooltip('Clear primary (allow all machines)')
-						.onClick(async () => {
-							this.plugin.settings.tunnelPrimaryHost = '';
+			new Setting(pane)
+				.setName('Tunnel URL')
+				.setDesc('Your tunnel\'s public hostname (e.g., https://witness.example.com)')
+				.addText(text => {
+					text.setPlaceholder('https://witness.example.com')
+						.setValue(this.plugin.settings.tunnelUrl || '')
+						.onChange(async (value) => {
+							this.plugin.settings.tunnelUrl = value || null;
 							await this.plugin.saveSettings();
-							new Notice('Primary host cleared — all machines will run the tunnel');
-							this.display();
-						}));
-				}
+						});
+					text.inputEl.style.width = '300px';
+				});
+
+			const currentHost = os.hostname();
+			const isPrimary = !this.plugin.settings.tunnelPrimaryHost || this.plugin.settings.tunnelPrimaryHost === currentHost;
+			const primaryDesc = this.plugin.settings.tunnelPrimaryHost
+				? `Primary: ${this.plugin.settings.tunnelPrimaryHost}` + (isPrimary ? ' (this machine)' : ` (this machine: ${currentHost})`)
+				: 'No primary set — all machines will run the tunnel';
+
+			const primarySetting = new Setting(pane)
+				.setName('Primary Machine')
+				.setDesc(primaryDesc);
+
+			if (!isPrimary) {
+				primarySetting.descEl.style.color = 'var(--text-warning)';
 			}
 
-			const { status, url } = this.plugin.getTunnelStatus();
+			primarySetting.addButton(button => button
+				.setButtonText(isPrimary && this.plugin.settings.tunnelPrimaryHost ? 'This machine ✓' : 'Set as primary')
+				.setCta()
+				.setDisabled(isPrimary && !!this.plugin.settings.tunnelPrimaryHost)
+				.onClick(async () => {
+					this.plugin.settings.tunnelPrimaryHost = currentHost;
+					await this.plugin.saveSettings();
+					new Notice(`This machine (${currentHost}) is now the primary tunnel host`);
+					this.display();
+				}));
 
-			// Status indicator
-			const statusText = status === 'connected' ? '● Connected' :
-				status === 'connecting' ? '○ Connecting...' :
-				status === 'error' ? '● Error' : '○ Disconnected';
-			const statusColor = status === 'connected' ? 'var(--text-success)' :
-				status === 'connecting' ? 'var(--text-warning)' :
-				status === 'error' ? 'var(--text-error)' : 'var(--text-muted)';
+			if (this.plugin.settings.tunnelPrimaryHost) {
+				primarySetting.addButton(button => button
+					.setIcon('x')
+					.setTooltip('Clear primary (allow all machines)')
+					.onClick(async () => {
+						this.plugin.settings.tunnelPrimaryHost = '';
+						await this.plugin.saveSettings();
+						new Notice('Primary host cleared — all machines will run the tunnel');
+						this.display();
+					}));
+			}
+		}
 
-			const statusSetting = new Setting(containerEl)
-				.setName('Tunnel Status')
-				.setDesc(statusText);
-			statusSetting.descEl.style.color = statusColor;
+		const { status, url } = this.plugin.getTunnelStatus();
 
-			// Auth enable toggle (under tunnel section)
-			new Setting(containerEl)
+		const statusText = status === 'connected' ? '● Connected' :
+			status === 'connecting' ? '○ Connecting...' :
+			status === 'error' ? '● Error' : '○ Disconnected';
+		const statusColor = status === 'connected' ? 'var(--text-success)' :
+			status === 'connecting' ? 'var(--text-warning)' :
+			status === 'error' ? 'var(--text-error)' : 'var(--text-muted)';
+
+		const statusSetting = new Setting(pane)
+			.setName('Tunnel Status')
+			.setDesc(statusText);
+		statusSetting.descEl.style.color = statusColor;
+
+		// Authentication
+		new SettingGroup(pane)
+			.setHeading('Authentication')
+			.addSetting(s => s
 				.setName('Require Authentication')
 				.setDesc('Protect your remote MCP endpoint with a token')
 				.addToggle(toggle => toggle
 					.setValue(this.plugin.settings.enableAuth)
 					.onChange(async (value) => {
 						this.plugin.settings.enableAuth = value;
-						// Auto-generate token if enabling auth and no token exists
 						if (value && !this.plugin.settings.authToken) {
 							this.plugin.settings.authToken = generateRandomId(32);
 						}
 						await this.plugin.saveSettings();
-						this.display(); // Refresh to show/hide token field
-					}));
-
-			// Show token field when auth is enabled
-			if (this.plugin.settings.enableAuth) {
-				const tokenSetting = new Setting(containerEl)
-					.setName('Authentication Token')
-					.setDesc('Token required for all MCP requests');
-
-				tokenSetting.addText(text => text
-					.setPlaceholder('Token')
-					.setValue(this.plugin.settings.authToken)
-					.onChange(async (value) => {
-						this.plugin.settings.authToken = value;
-						await this.plugin.saveSettings();
-					}));
-
-				tokenSetting.addButton(button => button
-					.setIcon('reset')
-					.setTooltip('Regenerate token')
-					.onClick(async () => {
-						await this.plugin.regenerateAuthToken();
-						new Notice('New token generated!');
 						this.display();
-					}));
-			}
+					})));
 
-			// URL display with copy button (includes token if auth enabled)
-			if (url) {
-				let mcpUrl = isNamed ? url : `${url}/mcp`;
-				// For named tunnels, append /mcp if not already in the URL
-				if (isNamed && !mcpUrl.endsWith('/mcp')) {
-					mcpUrl = mcpUrl.replace(/\/$/, '') + '/mcp';
-				}
-				if (this.plugin.settings.enableAuth && this.plugin.settings.authToken) {
-					mcpUrl += `?token=${this.plugin.settings.authToken}`;
-				}
-				const urlSetting = new Setting(containerEl)
-					.setName('Your MCP URL')
-					.setDesc(mcpUrl);
+		if (this.plugin.settings.enableAuth) {
+			const tokenSetting = new Setting(pane)
+				.setName('Authentication Token')
+				.setDesc('Token required for all MCP requests');
 
-				urlSetting.addButton(button => button
-					.setButtonText('Copy URL')
-					.onClick(() => {
-						navigator.clipboard.writeText(mcpUrl);
-						new Notice('URL copied to clipboard!');
-					}));
-			}
+			tokenSetting.addComponent(el => new SecretComponent(this.app, el)
+				.setValue(this.plugin.settings.authToken)
+				.onChange(async (value) => {
+					this.plugin.settings.authToken = value;
+					await this.plugin.saveSettings();
+				}));
 
-			// Reconnect tunnel button
-			new Setting(containerEl)
-				.setName(isNamed ? 'Reconnect Tunnel' : 'Regenerate Tunnel')
-				.setDesc(isNamed ? 'Restart the tunnel connection' : 'Get a new tunnel URL')
-				.addButton(button => button
-					.setButtonText(isNamed ? 'Reconnect' : 'Regenerate')
-					.onClick(async () => {
-						await this.plugin.regenerateTunnel();
-						// Wait a bit for the tunnel to come up
-						setTimeout(() => this.display(), 3000);
-					}));
-
-			// Warning note (only for quick tunnels)
-			if (!isNamed) {
-				const noteEl = containerEl.createEl('div', {
-					cls: 'setting-item-description',
-					text: '⚠️ This URL changes when Obsidian restarts. Switch to a Named Tunnel for a permanent URL.'
-				});
-				noteEl.style.marginBottom = '20px';
-				noteEl.style.color = 'var(--text-warning)';
-			}
-
-			// Subscribe to status changes to refresh UI
-			this.plugin.onTunnelStatusChange((newStatus, newUrl) => {
-				// Refresh the display when status changes
-				if (newStatus === 'connected' || newStatus === 'error') {
+			tokenSetting.addButton(button => button
+				.setIcon('reset')
+				.setTooltip('Regenerate token')
+				.onClick(async () => {
+					await this.plugin.regenerateAuthToken();
+					new Notice('New token generated!');
 					this.display();
+				}));
+		}
+
+		if (url) {
+			let mcpUrl = isNamed ? url : `${url}/mcp`;
+			if (isNamed && !mcpUrl.endsWith('/mcp')) {
+				mcpUrl = mcpUrl.replace(/\/$/, '') + '/mcp';
+			}
+			if (this.plugin.settings.enableAuth && this.plugin.settings.authToken) {
+				mcpUrl += `?token=${this.plugin.settings.authToken}`;
+			}
+			const urlSetting = new Setting(pane)
+				.setName('Your MCP URL')
+				.setDesc(mcpUrl);
+
+			urlSetting.addButton(button => button
+				.setButtonText('Copy URL')
+				.onClick(() => {
+					navigator.clipboard.writeText(mcpUrl);
+					new Notice('URL copied to clipboard!');
+				}));
+		}
+
+		new Setting(pane)
+			.setName(isNamed ? 'Reconnect Tunnel' : 'Regenerate Tunnel')
+			.setDesc(isNamed ? 'Restart the tunnel connection' : 'Get a new tunnel URL')
+			.addButton(button => button
+				.setButtonText(isNamed ? 'Reconnect' : 'Regenerate')
+				.onClick(async () => {
+					await this.plugin.regenerateTunnel();
+					setTimeout(() => this.display(), 3000);
+				}));
+
+		if (!isNamed) {
+			const noteEl = pane.createEl('div', {
+				cls: 'setting-item-description',
+				text: '⚠️ This URL changes when Obsidian restarts. Switch to a Named Tunnel for a permanent URL.'
+			});
+			noteEl.style.marginBottom = '20px';
+			noteEl.style.color = 'var(--text-warning)';
+		}
+
+		this.plugin.onTunnelStatusChange((newStatus) => {
+			if (newStatus === 'connected' || newStatus === 'error') {
+				this.display();
+			}
+		});
+	}
+
+	// ===== SEMANTIC SEARCH TAB =====
+	private renderSearchTab(pane: HTMLElement): void {
+		new SettingGroup(pane)
+			.setHeading('Ollama Connection')
+			.addSetting(s => s
+				.setName('Base URL')
+				.setDesc('The URL where Ollama is running')
+				.addText(text => text
+					.setPlaceholder('http://localhost:11434')
+					.setValue(this.plugin.settings.ollamaBaseUrl)
+					.onChange(async (value) => {
+						this.plugin.settings.ollamaBaseUrl = value;
+						await this.plugin.saveSettings();
+						this.plugin.resetSemanticSearch();
+						this.embeddingModelsCache = null;
+					})));
+
+		// Model selector
+		const modelDesc = createFragment(f => {
+			f.appendText('Dropdown shows models pulled locally. To add more, run: ');
+			f.createEl('code', {text: 'ollama pull <model-name>'});
+		});
+		const modelSetting = new Setting(pane)
+			.setName('Embedding Model')
+			.setDesc(modelDesc);
+
+		if (this.embeddingModelsCache && this.embeddingModelsCache.length > 0) {
+			modelSetting.addDropdown(dropdown => {
+				for (const model of this.embeddingModelsCache!) {
+					const dims = model.dimensions ? `, ${model.dimensions}d` : '';
+					const label = `${model.name} (${model.parameterSize}, ${model.family}${dims})`;
+					dropdown.addOption(model.name, label);
+				}
+				const currentModel = this.plugin.settings.ollamaModel;
+				if (!this.embeddingModelsCache!.some(m => m.name === currentModel)) {
+					dropdown.addOption(currentModel, currentModel);
+				}
+				dropdown.setValue(currentModel);
+				dropdown.onChange(async (value) => {
+					this.plugin.settings.ollamaModel = value;
+					await this.plugin.saveSettings();
+					this.plugin.resetSemanticSearch();
+				});
+			});
+		} else {
+			modelSetting.addText(text => text
+				.setPlaceholder('nomic-embed-text')
+				.setValue(this.plugin.settings.ollamaModel)
+				.onChange(async (value) => {
+					this.plugin.settings.ollamaModel = value;
+					await this.plugin.saveSettings();
+					this.plugin.resetSemanticSearch();
+				}));
+
+			const provider = new OllamaProvider({
+				baseUrl: this.plugin.settings.ollamaBaseUrl,
+			});
+			provider.listEmbeddingModels().then(models => {
+				if (models.length > 0) {
+					this.embeddingModelsCache = models;
+					this.display();
+				}
+			}).catch(() => {});
+		}
+
+		// Available embedding models with pull buttons
+		const AVAILABLE_MODELS: [string, string][] = [
+			['nomic-embed-text', 'General purpose, 768d (recommended)'],
+			['all-minilm', '384d, 46MB — lightweight'],
+			['mxbai-embed-large', '1024d, 670MB — high quality'],
+			['bge-m3', '1024d, 1.2GB — multilingual'],
+			['snowflake-arctic-embed', '384-1024d — multiple sizes'],
+			['snowflake-arctic-embed2', '1024d — multilingual'],
+			['nomic-embed-text-v2-moe', 'MoE, multilingual'],
+			['qwen3-embedding', '0.6-8B — multiple sizes'],
+			['embeddinggemma', '300M — Google'],
+			['paraphrase-multilingual', '278M — multilingual'],
+			['granite-embedding', '30-278M — IBM'],
+			['bge-large', '335M — BAAI'],
+		];
+
+		const pulledNames = new Set(
+			(this.embeddingModelsCache ?? []).map(m => m.name.split(':')[0])
+		);
+
+		const modelsGroup = new SettingGroup(pane).setHeading('Available Models');
+		for (const [name, desc] of AVAILABLE_MODELS) {
+			const isPulled = pulledNames.has(name);
+			modelsGroup.addSetting(s => {
+				s.setName(name).setDesc(desc);
+				if (isPulled) {
+					s.addButton(btn => btn
+						.setButtonText('Installed')
+						.setDisabled(true));
+				} else {
+					s.addButton(btn => btn
+						.setButtonText('Pull')
+						.onClick(async () => {
+							btn.setButtonText('Pulling...');
+							btn.setDisabled(true);
+							try {
+								const provider = new OllamaProvider({
+									baseUrl: this.plugin.settings.ollamaBaseUrl,
+								});
+								await provider.pullModel(name, (status, percent) => {
+									if (percent !== null) {
+										btn.setButtonText(`${percent}%`);
+									} else {
+										btn.setButtonText(status.length > 20
+											? status.slice(0, 20) + '...'
+											: status || 'Pulling...');
+									}
+								});
+								new Notice(`${name} pulled successfully`);
+								this.embeddingModelsCache = null;
+								this.display();
+							} catch (e) {
+								new Notice(`Failed to pull ${name}: ${(e as Error).message}`);
+								btn.setButtonText('Pull');
+								btn.setDisabled(false);
+							}
+						}));
 				}
 			});
 		}
 
-		// ===== COMMAND FALLBACK =====
-		containerEl.createEl('h3', {text: 'Advanced Options'});
+		// Index status
+		new SettingGroup(pane)
+			.setHeading('Index')
+			.addSetting(s => {
+				const count = this.plugin.getIndexCount();
+				const statusText = count > 0
+					? `${count} documents indexed`
+					: 'No index — will be built on first semantic search';
 
-		new Setting(containerEl)
-			.setName('Enable Command Fallback')
-			.setDesc('⚠️ WARNING: Enables list_all_commands and execute_any_command tools for unrestricted command access. Use with caution!')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.enableCommandFallback)
-				.onChange(async (value) => {
-					this.plugin.settings.enableCommandFallback = value;
-					await this.plugin.saveSettings();
-					// Restart server to apply changes
-					if (this.plugin.settings.mcpEnabled) {
-						this.plugin.stopMCPServer();
-						await this.plugin.startMCPServer();
-					}
-				}));
+				s.setName('Index Status')
+				 .setDesc(statusText);
+			})
+			.addSetting(s => {
+				s.setName('Build Index')
+				 .setDesc('Index all vault documents now');
+				s.addButton(button => button
+					.setButtonText('Build Index')
+					.setCta()
+					.onClick(async () => {
+						try {
+							if (!this.plugin.ollamaProvider) {
+								this.plugin.ollamaProvider = new OllamaProvider({
+									baseUrl: this.plugin.settings.ollamaBaseUrl,
+									model: this.plugin.settings.ollamaModel,
+								});
+							}
+							if (!(await this.plugin.ollamaProvider.isAvailable())) {
+								new Notice('Ollama is not running. Start it first.');
+								return;
+							}
+							if (!this.plugin.vectorStore) {
+								this.plugin.vectorStore = new VectorStore(this.app, this.plugin.ollamaProvider);
+								await this.plugin.vectorStore.initialize();
+							}
+							const mdFiles = this.app.vault.getMarkdownFiles();
+							const staleFiles = await this.plugin.vectorStore.getStaleFiles(mdFiles);
+							if (staleFiles.length === 0) {
+								new Notice('All documents are already indexed');
+								this.display();
+								return;
+							}
+							new Notice(`Indexing ${staleFiles.length} documents...`);
+							await this.plugin.vectorStore.indexFiles(staleFiles, (done, total) => {
+								if (done % 50 === 0 || done === total) {
+									new Notice(`Indexing: ${done}/${total}`);
+								}
+							});
+							await this.plugin.vectorStore.save();
+							new Notice(`Indexing complete: ${this.plugin.getIndexCount()} documents`);
+							this.display();
+						} catch (e) {
+							new Notice(`Indexing failed: ${(e as Error).message}`);
+						}
+					}));
+			})
+			.addSetting(s => {
+				s.setName('Clear Index')
+				 .setDesc('Clear the existing index and rebuild from scratch on next search');
+				s.addButton(button => button
+					.setButtonText('Clear Index')
+					.onClick(async () => {
+						await this.plugin.clearIndex();
+						new Notice('Semantic search index cleared');
+						this.display();
+					}));
+			});
 	}
 }

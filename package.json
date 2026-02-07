@@ -10,7 +10,7 @@
     "test": "vitest run --config test/vitest.config.ts",
     "test:watch": "vitest --config test/vitest.config.ts",
     "test:start-obsidian": "open \"obsidian://open?path=$(pwd)/test/vault\"",
-    "test:install-plugin": "npm run build && cp main.js manifest.json embedding-worker.js test/vault/.obsidian/plugins/witness/"
+    "test:install-plugin": "npm run build && cp main.js manifest.json styles.css test/vault/.obsidian/plugins/witness/"
   },
   "keywords": [
     "obsidian",
