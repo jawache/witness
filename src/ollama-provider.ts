@@ -6,6 +6,7 @@
 export interface OllamaProviderConfig {
 	baseUrl?: string;
 	model?: string;
+	log?: (level: string, message: string, data?: any) => void;
 }
 
 export interface EmbeddingModelInfo {
@@ -50,13 +51,35 @@ const MODEL_DIMENSIONS: Record<string, number> = {
 	'snowflake-arctic-embed': 384,
 };
 
+// Context length in tokens per model. Used for client-side pre-truncation
+// as a safety net — Ollama's truncate:true is unreliable on some versions.
+// NOTE: Use the actual model architecture context_length from /api/show → model_info,
+// NOT the num_ctx Modelfile parameter (which may be larger but doesn't extend embedding context).
+const MODEL_CONTEXT_TOKENS: Record<string, number> = {
+	'nomic-embed-text': 2048,   // nomic-bert.context_length = 2048 (num_ctx 8192 is misleading)
+	'all-minilm': 256,
+	'mxbai-embed-large': 512,
+	'bge-m3': 8192,
+	'bge-large': 512,
+	'snowflake-arctic-embed': 512,
+};
+
+// Conservative chars-per-token estimate. English averages ~4, but JSON, URLs,
+// special syntax, and non-ASCII can be as low as ~1.5. Use 2 for safety.
+const CHARS_PER_TOKEN = 2;
+const DEFAULT_CONTEXT_TOKENS = 2048;
+
 export class OllamaProvider {
 	private baseUrl: string;
 	private model: string;
+	private log: (level: string, message: string, data?: any) => void;
+	private resolvedDimensions: number | null = null;
+	private resolvedContextTokens: number | null = null;
 
 	constructor(config?: OllamaProviderConfig) {
 		this.baseUrl = config?.baseUrl || 'http://localhost:11434';
 		this.model = config?.model || 'nomic-embed-text';
+		this.log = config?.log || (() => {});
 	}
 
 	/**
@@ -181,14 +204,21 @@ export class OllamaProvider {
 	 * Embed one or more texts. Returns one embedding vector per input.
 	 */
 	async embed(texts: string[]): Promise<number[][]> {
+		// Pre-truncate as safety net — Ollama's truncate:true is unreliable on some versions
+		const maxChars = this.getMaxChars();
+		const truncated = texts.map(t => t.length > maxChars ? t.slice(0, maxChars) : t);
+
+		this.log('info', `Ollama embed: model=${this.model}, texts=${texts.length}, sizes=[${truncated.map(t => t.length).join(',')}], maxChars=${maxChars}`);
+
 		const res = await fetch(`${this.baseUrl}/api/embed`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ model: this.model, input: texts }),
+			body: JSON.stringify({ model: this.model, input: truncated, truncate: true }),
 		});
 
 		if (!res.ok) {
 			const body = await res.text();
+			this.log('error', `Ollama embed failed: status=${res.status}, body=${body}, model=${this.model}, textCount=${truncated.length}, textSizes=[${truncated.map(t => t.length).join(',')}]`);
 			throw new Error(`Ollama embed failed (${res.status}): ${body}`);
 		}
 
@@ -209,31 +239,47 @@ export class OllamaProvider {
 	}
 
 	getDimensions(): number {
+		if (this.resolvedDimensions) return this.resolvedDimensions;
 		return MODEL_DIMENSIONS[this.model.split(':')[0]] || 768;
 	}
 
-	/**
-	 * Get dimensions by querying /api/show if not in the hardcoded map.
-	 * Falls back to the static map, then to 768.
-	 */
-	async getDimensionsAsync(): Promise<number> {
-		const baseName = this.model.split(':')[0];
-		if (MODEL_DIMENSIONS[baseName]) return MODEL_DIMENSIONS[baseName];
+	getMaxChars(): number {
+		const tokens = this.resolvedContextTokens
+			?? MODEL_CONTEXT_TOKENS[this.model.split(':')[0]]
+			?? DEFAULT_CONTEXT_TOKENS;
+		return tokens * CHARS_PER_TOKEN;
+	}
 
+	/**
+	 * Query /api/show to resolve the model's actual dimensions and context length.
+	 * Caches results so getDimensions() and getMaxChars() return accurate values.
+	 * Falls back to hardcoded maps if Ollama is unreachable.
+	 */
+	async resolveModelInfo(): Promise<void> {
 		try {
 			const res = await fetch(`${this.baseUrl}/api/show`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ model: this.model }),
 			});
-			if (res.ok) {
-				const data = (await res.json()) as OllamaShowResponse;
-				const embLen = Object.entries(data.model_info || {})
-					.find(([k]) => k.includes('embedding_length'));
-				if (embLen) return embLen[1] as number;
-			}
-		} catch { /* fall through */ }
+			if (!res.ok) return;
 
-		return 768;
+			const data = (await res.json()) as OllamaShowResponse;
+			const info = data.model_info || {};
+
+			for (const [key, value] of Object.entries(info)) {
+				if (key.includes('embedding_length') && typeof value === 'number') {
+					this.resolvedDimensions = value;
+				}
+				if (key.includes('context_length') && typeof value === 'number') {
+					this.resolvedContextTokens = value;
+				}
+			}
+
+			this.log('info', `Resolved model info for ${this.model}: dimensions=${this.resolvedDimensions ?? 'fallback'}, contextTokens=${this.resolvedContextTokens ?? 'fallback'}, maxChars=${this.getMaxChars()}`);
+		} catch {
+			this.log('info', `Could not resolve model info for ${this.model}, using fallback values`);
+		}
 	}
+
 }

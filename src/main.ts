@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, SettingGroup, SecretComponent, Modal, SuggestModal, normalizePath, Notice, TFile } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, SettingGroup, SecretComponent, Modal, SuggestModal, normalizePath, Notice, TFile, TFolder, ItemView, WorkspaceLeaf } from 'obsidian';
 import * as http from 'http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -11,6 +11,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { OllamaProvider, type EmbeddingModelInfo } from './ollama-provider';
 import { VectorStore } from './vector-store';
+import { WitnessSearchView, VIEW_TYPE_SEARCH } from './search-view';
 
 /**
  * Logger that writes to both console and file.
@@ -38,7 +39,12 @@ class MCPLogger {
 		const timestamp = new Date().toISOString();
 		let line = `[${timestamp}] [${level}] ${message}`;
 		if (data !== undefined) {
-			line += ` ${typeof data === 'string' ? data : JSON.stringify(data)}`;
+			if (data instanceof Error) {
+				line += ` ${data.message}`;
+				if (data.stack) line += `\n${data.stack}`;
+			} else {
+				line += ` ${typeof data === 'string' ? data : JSON.stringify(data)}`;
+			}
 		}
 		return line;
 	}
@@ -171,6 +177,7 @@ interface WitnessSettings {
 	// Ollama / Semantic Search
 	ollamaBaseUrl: string;
 	ollamaModel: string;
+	excludedFolders: string[];
 }
 
 // Helper function to generate random credentials
@@ -203,6 +210,7 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	enableAuth: false,
 	ollamaBaseUrl: 'http://localhost:11434',
 	ollamaModel: 'nomic-embed-text',
+	excludedFolders: [],
 }
 
 export default class WitnessPlugin extends Plugin {
@@ -210,7 +218,7 @@ export default class WitnessPlugin extends Plugin {
 	private httpServer: http.Server | null = null;
 	private mcpServer: McpServer | null = null;
 	private transports: Map<string, StreamableHTTPServerTransport> = new Map();
-	private logger: MCPLogger;
+	logger: MCPLogger;
 	private tunnelProcess: Tunnel | null = null;
 	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
@@ -228,9 +236,21 @@ export default class WitnessPlugin extends Plugin {
 		// Add settings tab
 		this.addSettingTab(new WitnessSettingTab(this.app, this));
 
-		// Add ribbon icon for quick access
-		this.addRibbonIcon('eye', 'Witness', () => {
-			this.logger.debug('Witness icon clicked');
+		// Register search panel view
+		this.registerView(VIEW_TYPE_SEARCH, (leaf) => new WitnessSearchView(leaf, this));
+
+		// Add ribbon icon to toggle search panel
+		this.addRibbonIcon('search', 'Witness Search', () => {
+			this.toggleSearchPanel();
+		});
+
+		// Add command to toggle search panel
+		this.addCommand({
+			id: 'toggle-search-panel',
+			name: 'Toggle search panel',
+			callback: () => {
+				this.toggleSearchPanel();
+			},
 		});
 
 		// Start MCP server if enabled
@@ -258,6 +278,22 @@ export default class WitnessPlugin extends Plugin {
 	}
 
 	/**
+	 * Toggle the search panel open/closed in the right sidebar.
+	 */
+	async toggleSearchPanel(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_SEARCH);
+		if (existing.length > 0) {
+			existing[0].detach();
+		} else {
+			const leaf = this.app.workspace.getRightLeaf(false);
+			if (leaf) {
+				await leaf.setViewState({ type: VIEW_TYPE_SEARCH, active: true });
+				this.app.workspace.revealLeaf(leaf);
+			}
+		}
+	}
+
+	/**
 	 * Reset the Ollama provider and vector store so they reinitialise
 	 * with the current settings on next semantic_search call.
 	 */
@@ -273,9 +309,24 @@ export default class WitnessPlugin extends Plugin {
 		return this.vectorStore?.getCount() ?? 0;
 	}
 
+	getIndexableFiles(): TFile[] {
+		const allFiles = this.app.vault.getMarkdownFiles();
+		const excluded = this.settings.excludedFolders;
+		if (!excluded || excluded.length === 0) return allFiles;
+		return allFiles.filter(f =>
+			!excluded.some(folder => f.path.startsWith(folder + '/') || f.path === folder)
+		);
+	}
+
 	async clearIndex(): Promise<void> {
 		if (this.vectorStore) {
 			await this.vectorStore.clear();
+			this.vectorStore = null;
+		} else {
+			// VectorStore not loaded — delete the file directly
+			if (await this.app.vault.adapter.exists('.witness/index.orama')) {
+				await this.app.vault.adapter.remove('.witness/index.orama');
+			}
 		}
 	}
 
@@ -1174,7 +1225,12 @@ export default class WitnessPlugin extends Plugin {
 						this.ollamaProvider = new OllamaProvider({
 							baseUrl: this.settings.ollamaBaseUrl,
 							model: this.settings.ollamaModel,
+							log: (level, msg, data) => {
+								if (level === 'error') this.logger.error(msg, data);
+								else this.logger.info(msg);
+							},
 						});
+						await this.ollamaProvider.resolveModelInfo();
 					}
 
 					// Check Ollama availability
@@ -1197,16 +1253,19 @@ export default class WitnessPlugin extends Plugin {
 						this.logger.info(`Vector store initialized with ${this.vectorStore.getCount()} documents`);
 
 						// If index is empty or stale, do an incremental index
-						const mdFiles = this.app.vault.getMarkdownFiles();
+						const mdFiles = this.getIndexableFiles();
 						const staleFiles = await this.vectorStore.getStaleFiles(mdFiles);
 
 						if (staleFiles.length > 0) {
 							this.logger.info(`Indexing ${staleFiles.length} new/changed files...`);
-							const indexed = await this.vectorStore.indexFiles(staleFiles, (done, total) => {
+							const result = await this.vectorStore.indexFiles(staleFiles, (done, total) => {
 								this.logger.info(`Indexing progress: ${done}/${total}`);
+							}, (level, msg, data) => {
+								if (level === 'error') this.logger.error(msg, data);
+								else this.logger.info(msg);
 							});
 							await this.vectorStore.save();
-							this.logger.info(`Indexed ${indexed} files, total: ${this.vectorStore.getCount()}`);
+							this.logger.info(`Indexed ${result.indexed} files (${result.failed.length} failed), total: ${this.vectorStore.getCount()}`);
 						}
 					}
 
@@ -1666,6 +1725,37 @@ class FileSuggestModal extends SuggestModal<string> {
 
 	onChooseSuggestion(file: string, evt: MouseEvent | KeyboardEvent) {
 		this.onChoose(file);
+	}
+}
+
+// Folder picker modal for exclusion settings
+class FolderSuggestModal extends SuggestModal<string> {
+	folders: string[];
+	onChoose: (folder: string) => void;
+
+	constructor(app: App, onChoose: (folder: string) => void) {
+		super(app);
+		this.folders = app.vault.getAllLoadedFiles()
+			.filter((f): f is TFolder => f instanceof TFolder)
+			.map(f => f.path)
+			.filter(p => p.length > 0)
+			.sort();
+		this.onChoose = onChoose;
+	}
+
+	getSuggestions(query: string): string[] {
+		const lowerQuery = query.toLowerCase();
+		return this.folders.filter(folder =>
+			folder.toLowerCase().includes(lowerQuery)
+		);
+	}
+
+	renderSuggestion(folder: string, el: HTMLElement) {
+		el.createEl('div', { text: folder });
+	}
+
+	onChooseSuggestion(folder: string, evt: MouseEvent | KeyboardEvent) {
+		this.onChoose(folder);
 	}
 }
 
@@ -2245,6 +2335,34 @@ class WitnessSettingTab extends PluginSettingTab {
 		});
 	}
 
+	/**
+	 * Eagerly load the vector store from disk to get the index count,
+	 * without requiring Ollama to be running.
+	 */
+	private async loadIndexCount(): Promise<number> {
+		if (this.plugin.vectorStore) {
+			return this.plugin.getIndexCount();
+		}
+		try {
+			if (!this.plugin.ollamaProvider) {
+				this.plugin.ollamaProvider = new OllamaProvider({
+					baseUrl: this.plugin.settings.ollamaBaseUrl,
+					model: this.plugin.settings.ollamaModel,
+					log: (level, msg, data) => {
+						if (level === 'error') this.plugin.logger.error(msg, data);
+						else this.plugin.logger.info(msg);
+					},
+				});
+				await this.plugin.ollamaProvider.resolveModelInfo();
+			}
+			this.plugin.vectorStore = new VectorStore(this.app, this.plugin.ollamaProvider);
+			await this.plugin.vectorStore.initialize();
+			return this.plugin.getIndexCount();
+		} catch {
+			return 0;
+		}
+	}
+
 	// ===== SEMANTIC SEARCH TAB =====
 	private renderSearchTab(pane: HTMLElement): void {
 		new SettingGroup(pane)
@@ -2376,16 +2494,28 @@ class WitnessSettingTab extends PluginSettingTab {
 		}
 
 		// Index status
+		let indexStatusSetting: Setting;
 		new SettingGroup(pane)
 			.setHeading('Index')
 			.addSetting(s => {
-				const count = this.plugin.getIndexCount();
-				const statusText = count > 0
-					? `${count} documents indexed`
-					: 'No index — will be built on first semantic search';
+				indexStatusSetting = s;
+				s.setName('Index Status');
 
-				s.setName('Index Status')
-				 .setDesc(statusText);
+				// Show cached count immediately, then try loading from disk
+				const count = this.plugin.getIndexCount();
+				if (count > 0) {
+					s.setDesc(`${count} documents indexed`);
+				} else {
+					s.setDesc('Checking index...');
+					// Eagerly load index from disk to show accurate count
+					this.loadIndexCount().then(diskCount => {
+						if (diskCount > 0) {
+							indexStatusSetting.setDesc(`${diskCount} documents indexed`);
+						} else {
+							indexStatusSetting.setDesc('No index — will be built on first semantic search');
+						}
+					});
+				}
 			})
 			.addSetting(s => {
 				s.setName('Build Index')
@@ -2399,7 +2529,12 @@ class WitnessSettingTab extends PluginSettingTab {
 								this.plugin.ollamaProvider = new OllamaProvider({
 									baseUrl: this.plugin.settings.ollamaBaseUrl,
 									model: this.plugin.settings.ollamaModel,
+									log: (level, msg, data) => {
+										if (level === 'error') this.plugin.logger.error(msg, data);
+										else this.plugin.logger.info(msg);
+									},
 								});
+								await this.plugin.ollamaProvider.resolveModelInfo();
 							}
 							if (!(await this.plugin.ollamaProvider.isAvailable())) {
 								new Notice('Ollama is not running. Start it first.');
@@ -2409,24 +2544,38 @@ class WitnessSettingTab extends PluginSettingTab {
 								this.plugin.vectorStore = new VectorStore(this.app, this.plugin.ollamaProvider);
 								await this.plugin.vectorStore.initialize();
 							}
-							const mdFiles = this.app.vault.getMarkdownFiles();
+							const mdFiles = this.plugin.getIndexableFiles();
 							const staleFiles = await this.plugin.vectorStore.getStaleFiles(mdFiles);
 							if (staleFiles.length === 0) {
-								new Notice('All documents are already indexed');
-								this.display();
+								indexStatusSetting.setDesc(`${this.plugin.getIndexCount()} documents indexed — all up to date`);
 								return;
 							}
-							new Notice(`Indexing ${staleFiles.length} documents...`);
-							await this.plugin.vectorStore.indexFiles(staleFiles, (done, total) => {
-								if (done % 50 === 0 || done === total) {
-									new Notice(`Indexing: ${done}/${total}`);
-								}
+							button.setDisabled(true);
+							button.setButtonText('Indexing...');
+							indexStatusSetting.setDesc(`Indexing 0/${staleFiles.length}...`);
+							const result = await this.plugin.vectorStore.indexFiles(staleFiles, (done, total) => {
+								indexStatusSetting.setDesc(`Indexing ${done}/${total}...`);
+							}, (level, msg, data) => {
+								if (level === 'error') this.plugin.logger.error(msg, data);
+								else this.plugin.logger.info(msg);
 							});
 							await this.plugin.vectorStore.save();
-							new Notice(`Indexing complete: ${this.plugin.getIndexCount()} documents`);
-							this.display();
+							button.setDisabled(false);
+							button.setButtonText('Build Index');
+							if (result.failed.length > 0) {
+								const failedPreview = result.failed.slice(0, 5).join('\n');
+								const moreText = result.failed.length > 5 ? `\n...and ${result.failed.length - 5} more (see logs)` : '';
+								indexStatusSetting.setDesc(
+									`${result.indexed} documents indexed, ${result.failed.length} failed:\n${failedPreview}${moreText}`
+								);
+							} else {
+								indexStatusSetting.setDesc(`${this.plugin.getIndexCount()} documents indexed`);
+							}
 						} catch (e) {
-							new Notice(`Indexing failed: ${(e as Error).message}`);
+							this.plugin.logger.error('Indexing failed', e);
+							indexStatusSetting.setDesc(`Indexing failed: ${(e as Error).message}`);
+							button.setDisabled(false);
+							button.setButtonText('Build Index');
 						}
 					}));
 			})
@@ -2437,9 +2586,42 @@ class WitnessSettingTab extends PluginSettingTab {
 					.setButtonText('Clear Index')
 					.onClick(async () => {
 						await this.plugin.clearIndex();
-						new Notice('Semantic search index cleared');
+						indexStatusSetting.setDesc('Index cleared — will be rebuilt on next semantic search');
+					}));
+			});
+
+		// Folder exclusions
+		const exclusionsGroup = new SettingGroup(pane)
+			.setHeading('Folder Exclusions');
+
+		for (const folder of this.plugin.settings.excludedFolders) {
+			exclusionsGroup.addSetting(s => {
+				s.setName(folder);
+				s.addButton(button => button
+					.setButtonText('Remove')
+					.onClick(async () => {
+						this.plugin.settings.excludedFolders =
+							this.plugin.settings.excludedFolders.filter(f => f !== folder);
+						await this.plugin.saveSettings();
 						this.display();
 					}));
 			});
+		}
+
+		exclusionsGroup.addSetting(s => {
+			s.setName('Add Folder')
+			 .setDesc('Choose a folder to exclude from semantic search indexing');
+			s.addButton(button => button
+				.setButtonText('Add Folder')
+				.onClick(() => {
+					new FolderSuggestModal(this.app, async (folder) => {
+						if (!this.plugin.settings.excludedFolders.includes(folder)) {
+							this.plugin.settings.excludedFolders.push(folder);
+							await this.plugin.saveSettings();
+							this.display();
+						}
+					}).open();
+				}));
+		});
 	}
 }

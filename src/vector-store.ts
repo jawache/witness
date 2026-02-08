@@ -27,6 +27,7 @@ export interface SearchResult {
 	path: string;
 	title: string;
 	score: number;
+	snippet?: string;
 }
 
 export class VectorStore {
@@ -136,38 +137,37 @@ export class VectorStore {
 	async indexFiles(
 		files: TFile[],
 		onProgress?: (done: number, total: number) => void,
-		batchSize = 20
-	): Promise<number> {
+		onLog?: (level: string, message: string, data?: any) => void,
+	): Promise<{ indexed: number; failed: string[] }> {
 		if (!this.db) throw new Error('VectorStore not initialized');
 
 		let indexed = 0;
+		const failed: string[] = [];
 		const total = files.length;
 
-		for (let i = 0; i < files.length; i += batchSize) {
-			const batch = files.slice(i, i + batchSize);
-			const texts = await Promise.all(
-				batch.map((f) => this.app.vault.cachedRead(f))
-			);
-
-			const embeddings = await this.ollama.embed(texts);
-
-			for (let j = 0; j < batch.length; j++) {
-				await this.removeByPath(batch[j].path);
+		for (const file of files) {
+			try {
+				const content = await this.app.vault.cachedRead(file);
+				const [embedding] = await this.ollama.embed([content]);
+				await this.removeByPath(file.path);
 				await insert(this.db, {
-					id: batch[j].path,
-					path: batch[j].path,
-					title: batch[j].basename,
-					content: texts[j],
-					mtime: batch[j].stat.mtime,
-					embedding: embeddings[j],
+					id: file.path,
+					path: file.path,
+					title: file.basename,
+					content,
+					mtime: file.stat.mtime,
+					embedding,
 				});
+				indexed++;
+			} catch (e) {
+				failed.push(file.path);
+				onLog?.('error', `Failed to index ${file.path}: ${(e as Error).message}`);
 			}
 
-			indexed += batch.length;
-			onProgress?.(indexed, total);
+			onProgress?.(indexed + failed.length, total);
 		}
 
-		return indexed;
+		return { indexed, failed };
 	}
 
 	/**
@@ -270,11 +270,16 @@ export class VectorStore {
 		hits: Array<{ document: unknown; score: number }>,
 		paths?: string[]
 	): SearchResult[] {
-		let results = hits.map((hit) => ({
-			path: (hit.document as unknown as VaultDocument).path,
-			title: (hit.document as unknown as VaultDocument).title,
-			score: hit.score,
-		}));
+		let results = hits.map((hit) => {
+			const doc = hit.document as unknown as VaultDocument;
+			const snippet = doc.content ? doc.content.slice(0, 200) : undefined;
+			return {
+				path: doc.path,
+				title: doc.title,
+				score: hit.score,
+				snippet,
+			};
+		});
 
 		if (paths?.length) {
 			results = results.filter((h) =>
