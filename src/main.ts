@@ -817,7 +817,7 @@ export default class WitnessPlugin extends Plugin {
 				'Use property to match frontmatter values (e.g., {"key": "status", "value": "draft"}).\n' +
 				'Use sortBy to order results by a property (e.g., {"property": "created"} for newest first, {"property": "name", "direction": "asc"} for alphabetical).\n' +
 				'Built-in sort properties: "mtime" (modified time), "size", "name". Any frontmatter property also works.\n' +
-				'Returns file paths with metadata (size, modified time, tags). Does not search file contents — use the search tool for that.'),
+				'Returns file paths with title, metadata (size, modified time, tags), and full frontmatter. Does not search file contents — use the search tool for that.'),
 			{
 				pattern: z.string().optional().describe('Pattern to match in filename (case-insensitive)'),
 				path: z.string().optional().describe('Limit to files under this folder'),
@@ -830,7 +830,7 @@ export default class WitnessPlugin extends Plugin {
 					property: z.string().describe('Property to sort by: frontmatter name (e.g., "created") or built-in: "mtime", "size", "name"'),
 					direction: z.enum(['asc', 'desc']).optional().describe('Sort direction. Defaults to "desc" for dates/mtime, "asc" for strings'),
 				}).optional().describe('Sort results by a property'),
-				limit: z.number().optional().default(50).describe('Maximum number of results'),
+				limit: z.number().optional().default(20).describe('Maximum number of results'),
 			},
 			{
 				readOnlyHint: true,
@@ -920,12 +920,21 @@ export default class WitnessPlugin extends Plugin {
 				// Build results with metadata
 				const results = limitedFiles.map(f => {
 					const tags = this.getFileTags(f);
-					return {
+					const cache = this.app.metadataCache.getFileCache(f);
+					const fm = cache?.frontmatter;
+					const result: Record<string, any> = {
 						path: f.path,
+						title: f.basename,
 						size: f.stat.size,
 						mtime: f.stat.mtime,
-						tags: tags.length > 0 ? tags : undefined,
 					};
+					if (tags.length > 0) result.tags = tags;
+					if (fm) {
+						// Copy frontmatter, excluding Obsidian's internal 'position' key
+						const { position, ...frontmatter } = fm;
+						if (Object.keys(frontmatter).length > 0) result.frontmatter = frontmatter;
+					}
+					return result;
 				});
 
 				return {
