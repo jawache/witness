@@ -764,18 +764,24 @@ export default class WitnessPlugin extends Plugin {
 					const paths = path ? [path] : undefined;
 					const tags = tag ? [tag] : undefined;
 
+					// Over-fetch when phrases are present — boosting may reorder significantly
+					const effectiveLimit = phrases.length > 0 ? Math.max(limit * 3, 30) : limit;
+
 					let results = await this.vectorStore.search(cleanQuery || query, {
 						mode: mode ?? 'hybrid',
-						limit,
+						limit: effectiveLimit,
 						minScore,
 						paths,
 						tags,
 					});
 
-					// Post-filter by quoted phrases
+					// Boost results containing exact phrase matches to the top
 					if (phrases.length > 0 && results.length > 0) {
-						results = this.filterByPhrases(results, phrases);
+						results = this.boostByPhrases(results, phrases);
 					}
+
+					// Trim back to requested limit
+					results = results.slice(0, limit);
 
 					// Return structured JSON
 					if (results.length === 0) {
@@ -1388,20 +1394,28 @@ export default class WitnessPlugin extends Plugin {
 	}
 
 	/**
-	 * Post-filter search results by exact phrase matching.
-	 * Reads file content and checks if all phrases appear in the matching section.
+	 * Boost search results that contain exact phrase matches.
+	 * Phrase-matching results appear first, preserving score order within each group.
+	 * Uses full chunk content (not just snippet) for matching.
 	 */
-	private filterByPhrases(results: SearchResult[], phrases: string[]): SearchResult[] {
-		// For now, filter based on snippet content (already available)
-		// A more thorough approach would read the full chunk content
-		return results.filter(r => {
-			const text = (r.snippet || '').toLowerCase();
+	private boostByPhrases(results: SearchResult[], phrases: string[]): SearchResult[] {
+		const phraseMatches: SearchResult[] = [];
+		const rest: SearchResult[] = [];
+
+		for (const r of results) {
+			const text = (r.content || r.snippet || '').toLowerCase();
 			const title = (r.title || '').toLowerCase();
-			return phrases.every(p => {
-				const lower = p.toLowerCase();
-				return text.includes(lower) || title.includes(lower);
-			});
-		});
+			const searchText = text + ' ' + title;
+			const allMatch = phrases.every(p => searchText.includes(p.toLowerCase()));
+
+			if (allMatch) {
+				phraseMatches.push(r);
+			} else {
+				rest.push(r);
+			}
+		}
+
+		return [...phraseMatches, ...rest];
 	}
 
 	private async handleMCPRequest(req: IncomingMessage, res: ServerResponse) {

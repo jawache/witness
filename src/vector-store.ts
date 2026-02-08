@@ -464,6 +464,7 @@ export class OramaSearchEngine implements SearchEngine {
 					score: hit.score,
 					headingPath: doc.headingPath || undefined,
 					snippet,
+					content: doc.content || undefined,
 				});
 			}
 		}

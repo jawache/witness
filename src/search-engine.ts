@@ -20,6 +20,8 @@ export interface SearchResult {
 	score: number;
 	headingPath?: string;
 	snippet?: string;
+	/** Full chunk content for phrase matching. Not sent to MCP clients. */
+	content?: string;
 }
 
 export interface IndexFileOptions {
