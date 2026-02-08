@@ -1397,3 +1397,127 @@ The session started with revisiting the embedding strategy. The iframe WASM appr
 ---
 
 *End of log entry*
+
+## 2026-02-07 - Fixing Embedding Quality: Context Limits, Task Prefixes, and Short Document Noise
+
+**Objective**: Debug and fix the 565 embedding failures with nomic-embed-text, then systematically fix search quality issues uncovered during real-world testing on a 4,097-document vault.
+
+### What We Built
+
+- Dynamic model info resolution via Ollama's `/api/show` endpoint
+- Model-specific task prefixes for nomic-embed-text and mxbai-embed-large
+- Minimum content length filter (configurable, default 50 chars) to suppress short document noise
+- Race condition fixes in the settings UI async lifecycle
+- Fixed Clear Index to work even when VectorStore hasn't been loaded
+- Comprehensive documentation of embedding model behaviour and gotchas
+
+### The Journey
+
+This session was a deep debugging journey into why semantic search was returning poor results. It started with a simple symptom — 565 out of ~4,000 files failing to embed — and ended with a thorough understanding of how embedding models actually work under the hood.
+
+**Chapter 1: The 565 Failures**
+
+After switching from mxbai-embed-large to nomic-embed-text, 565 files consistently failed with Ollama returning 400 "index length exceeded context length". We had already added `truncate: true` and client-side pre-truncation in the previous session, so why were files still failing?
+
+The breakthrough came from querying Ollama's `/api/show` endpoint directly:
+
+```bash
+curl -s http://localhost:11434/api/show -d '{"model":"nomic-embed-text"}' | jq '.model_info'
+```
+
+This revealed `nomic-bert.context_length: 2048` — but our hardcoded `MODEL_CONTEXT_TOKENS` had `8192` for nomic-embed-text, taken from the Modelfile's `num_ctx` parameter. These are fundamentally different things: `num_ctx` is a runtime parameter for generative models, but BERT-based embedding models have a fixed architecture context window baked into their weights. For nomic-embed-text, that's 2048 tokens, not 8192.
+
+With `maxChars = 8192 * 2 = 16384`, we were sending documents up to 16K characters — far exceeding the actual 4096-character limit (2048 tokens * 2 chars/token). Fixing the constant to 2048 immediately resolved all 565 failures.
+
+**Chapter 2: Dynamic Resolution**
+
+Hardcoded constants are fragile. The user rightly pointed out that if Ollama's `/api/show` provides the real values, we should use them. We added `resolveModelInfo()` to OllamaProvider, which queries `/api/show` once at startup and caches both `embedding_length` (dimensions) and `context_length` (context window). The hardcoded maps now serve as fallbacks when Ollama is unreachable.
+
+**Chapter 3: Clear Index Doesn't Actually Clear**
+
+Testing revealed that "Clear Index" didn't work after a plugin restart. The bug: `clearIndex()` checked `if (this.vectorStore)` — but after a restart, `vectorStore` is null (it's lazily initialised on first search). So the method did nothing, leaving the old `.witness/index.orama` file on disk. Next search would load the old index.
+
+The fix was twofold: if `vectorStore` is null, delete the file directly from disk. And after clearing, set `vectorStore` to null to ensure a fresh one is created next time.
+
+**Chapter 4: Vector Search Returns Junk**
+
+After re-indexing with the corrected context length, vector search still returned completely irrelevant results. Searching for "water" returned an empty document called "mica app" (content: just the word "gold"). Fulltext search worked fine, so the issue was specifically with vector similarity.
+
+The root cause: **nomic-embed-text requires task prefixes**. Documents must be prefixed with `search_document: ` and queries with `search_query: `. Without these, both documents and queries embed into a generic space where similarity scores are meaningless. This is documented in nomic's model card but easy to miss.
+
+We added `MODEL_TASK_PREFIXES`, `embedDocuments()`, and `embedQuery()` to OllamaProvider. The VectorStore was updated to use these instead of raw `embed()`.
+
+**Chapter 5: Which Other Models Need Prefixes?**
+
+This discovery raised an important question: do our other supported models also need prefixes? We researched each one systematically:
+
+- **nomic-embed-text**: Both prefixes mandatory (search_document / search_query)
+- **mxbai-embed-large**: Query prefix only ("Represent this sentence for searching relevant passages: ")
+- **all-minilm**: No prefix needed
+- **bge-m3**: No prefix needed
+- **bge-large**: Optional query prefix (marginal improvement)
+- **snowflake-arctic-embed**: Query prefix needed
+
+We added mxbai-embed-large to the prefix map (the user's preferred model), with an empty document prefix and the full query prefix.
+
+**Chapter 6: The Null Save Race Condition**
+
+During indexing, the user hit "cannot read properties of null reading save". This was a race condition: `loadIndexCount()` (called when the settings tab opens) runs async and creates a VectorStore. If the user clicks "Build Index" before it completes, both paths create VectorStores, and one might go null before the other finishes.
+
+Fix: the Build Index handler now captures a local `const vs = this.plugin.vectorStore` reference before the async loop. Even if `clearIndex()` or `loadIndexCount()` nullifies the plugin-level reference during indexing, the local reference remains valid.
+
+**Chapter 7: Short Document Noise**
+
+Even with prefixes fixed, short documents kept appearing in results. The "mica app" file (content: "gold") matched every query. This is a fundamental property of how embedding models work: short texts lack distinctive features, so their embeddings cluster near the centre of the vector space. Since cosine similarity measures the angle between vectors, these centroid-adjacent embeddings score moderately high against everything.
+
+The solution: a configurable `minContentLength` setting (default 50 characters) that filters files by `file.stat.size` before indexing. This is a simple, effective improvement — the single most impactful setting for search quality besides choosing the right model.
+
+### Technical Achievements
+
+- **Dynamic model introspection**: No more guessing dimensions or context lengths from documentation. Query the model and cache the results.
+- **Correct task prefix handling**: Embeddings now land in the right vector space for each model, producing meaningful similarity scores.
+- **Race-condition-safe async UI**: Captured local references prevent null pointer errors during long-running operations.
+- **Comprehensive model documentation**: Every supported embedding model researched and documented with its prefix requirements, context limits, and characteristics.
+
+### Key Learnings
+
+1. **`num_ctx` != context_length for BERT models**: The Modelfile parameter is for generative models. Embedding models have fixed architecture context windows. Always check the model's actual `context_length` from `/api/show` model_info.
+
+2. **Task prefixes are not optional**: Some embedding models (nomic-embed-text, mxbai-embed-large) require specific prefixes to produce useful embeddings. Without them, documents and queries embed into a generic space where similarity is meaningless. Always check the model card.
+
+3. **Short documents produce noise, not signal**: A file containing "gold" will match any query because it lacks distinctive features. Filtering by minimum content length is the cheapest and most effective quality improvement.
+
+4. **Characters per token varies wildly**: English prose averages ~4 chars/token, but JSON, HTML, URLs, and special syntax can be as low as ~1.5. Use a conservative estimate (we use 2) for pre-truncation.
+
+5. **Race conditions in async UI**: When a settings page loads data asynchronously and users can click buttons during loading, capture local references to mutable state. Don't rely on `this.plugin.vectorStore` remaining non-null across `await` boundaries.
+
+6. **Web research first**: When hitting a bug with an external tool (Ollama, Orama, etc.), always check the API docs and other people's issues before guessing. The `truncate: true` parameter, the `/api/show` endpoint, and the task prefix requirements were all documented — we just needed to find them.
+
+### Statistics
+
+- 3 files changed, 81 insertions, 14 deletions (this session's commit)
+- 26 files changed, ~4,700 insertions, ~1,200 deletions (full Ollama integration branch)
+- 53 tests (52 passing, 1 pre-existing failure)
+- 6 supported embedding models documented with prefix/context requirements
+- 0 embedding failures after fixes (was 565)
+
+### Files Changed
+
+- `src/ollama-provider.ts` — Task prefixes, embedDocuments/embedQuery, resolveModelInfo
+- `src/vector-store.ts` — Use embedDocuments/embedQuery instead of raw embed
+- `src/main.ts` — minContentLength setting, race condition fixes, loadIndexCount, settings UI
+
+### What's Next
+
+- Markdown chunking — split long documents by headings before embedding for better retrieval on long files
+- Background indexing — automatic incremental indexing with status bar indicator
+- Re-ranking — optional Ollama-based re-ranking for higher precision
+- Chaos triage — MCP tools for processing chaos items one at a time
+
+### Reflections
+
+This session was a masterclass in how many layers of subtlety hide behind "just call an embedding API". Context lengths aren't what they seem. Prefixes that look optional are mandatory. Short documents that seem harmless are the worst polluters. Each fix was simple once understood, but finding the root cause required peeling back assumptions layer by layer. The user's instinct to verify each model's documentation before committing to a prefix map was exactly right — different models have genuinely different APIs, and getting them wrong produces silently wrong results rather than obvious errors.
+
+---
+
+*End of log entry*

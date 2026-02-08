@@ -155,17 +155,22 @@ Remote Access via Cloudflare Tunnel:
 
 ### Phase 3 Status: ✅ COMPLETE
 
-Semantic Search via Smart Connections Integration:
+Semantic Search via Ollama + Orama:
 
-- ✅ `semantic_search` MCP tool - find documents by meaning
-- ✅ Reads embeddings from Smart Connections plugin (`.smart-env/multi/*.ajson`)
-- ✅ Validates SC model compatibility (`TaylorAI/bge-micro-v2`)
-- ✅ Incremental caching with mtime tracking (~265ms cached searches)
-- ✅ Iframe WASM embeddings for query embedding only (transformers.js)
-- ✅ Cosine similarity search with path filtering
+- ✅ `semantic_search` MCP tool — hybrid (BM25 + vector), vector-only, and fulltext modes
+- ✅ Local embeddings via Ollama (no cloud dependency)
+- ✅ Orama vector store with JSON persistence (`.witness/index.orama`)
+- ✅ Dynamic model info resolution via `/api/show` (dimensions, context length)
+- ✅ Client-side pre-truncation with conservative CHARS_PER_TOKEN=2
+- ✅ Model-specific task prefixes (nomic-embed-text, mxbai-embed-large)
+- ✅ Minimum content length filter to skip short/noisy documents
+- ✅ Folder exclusions with FolderSuggestModal picker
+- ✅ Incremental indexing with stale file detection (mtime-based)
+- ✅ Search panel sidebar view
+- ✅ Tabbed settings UI with model pull, index management, live progress
 - ✅ Tested on 4,097-document vault
 
-Total: 13 MCP tools registered and available
+Total: 15 MCP tools registered and available
 
 ### Dataview Integration
 
@@ -388,35 +393,74 @@ curl -X POST "https://your-tunnel-url/mcp?token=YOUR_TOKEN" \
 - Multiple machines with the same tunnel token = Cloudflare round-robins between them. Use Primary Machine to prevent this.
 - Orphaned cloudflared processes may accumulate if Obsidian crashes without cleanup.
 
-### Semantic Search & Iframe WASM Pattern
+### Semantic Search via Ollama + Orama
 
-The plugin includes semantic search powered by local WASM embeddings. This was challenging to implement due to Obsidian's hybrid Electron environment.
+The plugin provides semantic search using local Ollama embeddings stored in an Orama vector database. This replaced the earlier Smart Connections + iframe WASM approach for a simpler, more reliable architecture.
 
-**The Problem:**
-Obsidian's Electron renderer has both Node.js and browser APIs available. This confuses ONNX runtime's backend selection - it detects Node.js, tries native bindings, fails, then can't properly initialize WASM fallback.
+**Architecture:**
 
-**The Solution: Iframe Isolation**
-Create a hidden iframe with `srcdoc` to provide a clean browser-only context:
-
-```typescript
-// Create isolated browser context
-this.iframe = document.createElement('iframe');
-this.iframe.style.display = 'none';
-this.iframe.srcdoc = `
-  <script type="module">
-    const transformers = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.0');
-    // WASM initializes correctly in clean browser context!
-  </script>
-`;
-document.body.appendChild(this.iframe);
+```
+Query → OllamaProvider.embedQuery() → Ollama /api/embed → Orama hybrid search
+Files → OllamaProvider.embedDocuments() → Ollama /api/embed → Orama insert
 ```
 
 **Key Files:**
 
-- `src/embedding-service-iframe.ts` - Iframe-based embedding service (query embeddings only)
-- `src/smart-connections-reader.ts` - Reads pre-built embeddings from Smart Connections plugin
+- `src/ollama-provider.ts` — Ollama HTTP client (embed, model info, task prefixes)
+- `src/vector-store.ts` — Orama vector store (index, search, persist)
+- `src/search-view.ts` — Search panel sidebar UI
 
-**Credit:** The iframe isolation pattern was learned from the Smart Connections plugin's approach.
+**Embedding Model Task Prefixes:**
+
+Different embedding models require specific input prefixes for optimal retrieval quality. Without them, embeddings land in a generic space and similarity scores are meaningless.
+
+```typescript
+const MODEL_TASK_PREFIXES: Record<string, { document: string; query: string }> = {
+  'nomic-embed-text':     { document: 'search_document: ', query: 'search_query: ' },
+  'nomic-embed-text-v2-moe': { document: 'search_document: ', query: 'search_query: ' },
+  'mxbai-embed-large':    { document: '', query: 'Represent this sentence for searching relevant passages: ' },
+};
+```
+
+- **nomic-embed-text**: Both prefixes mandatory. Documents get `search_document: `, queries get `search_query: `.
+- **mxbai-embed-large**: Query prefix only. Documents embedded as-is.
+- **all-minilm, bge-m3, bge-large**: No prefixes needed.
+- Use `embedDocuments()` for indexing and `embedQuery()` for searching — never raw `embed()`.
+
+**Context Length & Pre-Truncation:**
+
+Ollama's `truncate: true` parameter is unreliable on some versions, so we pre-truncate on the client side as a safety net.
+
+```typescript
+// Actual context lengths from model architecture (NOT Modelfile num_ctx!)
+const MODEL_CONTEXT_TOKENS: Record<string, number> = {
+  'nomic-embed-text': 2048,   // nomic-bert.context_length (num_ctx 8192 is misleading)
+  'all-minilm': 256,
+  'mxbai-embed-large': 512,
+  // ...
+};
+
+const CHARS_PER_TOKEN = 2;  // Conservative — JSON/HTML/URLs can be ~1.5 chars/token
+```
+
+**Critical Gotcha — `num_ctx` vs `context_length`:** Ollama's Modelfile may set `num_ctx 8192`, but for BERT-based embedding models, the actual embedding context window is the architecture's `context_length` field from `/api/show → model_info`. For nomic-embed-text, this is 2048, not 8192. Using the wrong value causes 400 "index length exceeded context length" errors.
+
+**Dynamic Model Info Resolution:**
+
+Rather than relying solely on hardcoded maps, `OllamaProvider.resolveModelInfo()` queries `/api/show` once at startup to get the actual `embedding_length` (dimensions) and `context_length` from the model's architecture metadata. The hardcoded maps serve as fallbacks when Ollama is unreachable.
+
+**Minimum Content Length:**
+
+Short documents (e.g., a file containing just "gold") produce generic embeddings near the centre of the vector space. These match any query with spuriously high cosine similarity, polluting search results. The `minContentLength` setting (default 50 chars) filters these out at indexing time using `file.stat.size` as a proxy.
+
+**Index Persistence:**
+
+The Orama database is saved to `.witness/index.orama` as a JSON envelope with a schema version number. When the schema changes (e.g., adding the `content` field for BM25), the version is bumped and old indexes are discarded on load, triggering a full re-index.
+
+**Known Gotchas:**
+- `clearIndex()` must handle the case where `vectorStore` is null (e.g., after plugin restart before first search) — delete the file directly from disk.
+- The Build Index button must capture a local reference to `vectorStore` before the async indexing loop. If `clearIndex()` runs during indexing, the plugin-level reference goes null, causing "cannot read properties of null" errors.
+- `loadIndexCount()` (called on settings tab open) must not overwrite an existing `vectorStore` instance created by a concurrent operation.
 
 ### Token Authentication
 
