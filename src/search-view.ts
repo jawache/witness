@@ -192,21 +192,39 @@ export class WitnessSearchView extends ItemView {
 		});
 
 		for (const result of results) {
+			const isChunk = !!result.headingPath;
 			const item = this.resultsContainer.createEl('div', {
 				cls: 'witness-search-result',
 			});
 
-			// Header row: path + score
-			const header = item.createEl('div', { cls: 'witness-search-result-header' });
-			header.createEl('span', {
+			// Line 1: Title + score
+			const titleRow = item.createEl('div', { cls: 'witness-search-result-title-row' });
+			titleRow.createEl('span', {
+				text: result.title,
+				cls: 'witness-search-result-title',
+			});
+			titleRow.createEl('span', {
+				text: `${Math.round(result.score * 100)}%`,
+				cls: 'witness-search-result-score',
+			});
+
+			// Line 2: Path
+			item.createEl('div', {
 				text: result.path,
 				cls: 'witness-search-result-path',
 				title: result.path,
 			});
-			header.createEl('span', {
-				text: `${Math.round(result.score * 100)}%`,
-				cls: 'witness-search-result-score',
-			});
+
+			// Line 3: Section heading (only for chunk matches)
+			if (isChunk) {
+				const sectionRow = item.createEl('div', { cls: 'witness-search-result-section' });
+				sectionRow.createEl('span', {
+					text: '\u00A7', // § symbol
+					cls: 'witness-search-result-section-icon',
+				});
+				const heading = result.headingPath!.replace(/^##\s*/, '').replace(/ > ###\s*/g, ' > ');
+				sectionRow.createEl('span', { text: heading });
+			}
 
 			// Snippet
 			if (result.snippet) {
@@ -216,9 +234,15 @@ export class WitnessSearchView extends ItemView {
 				});
 			}
 
-			// Click to open file
+			// Click: chunk → navigate to heading, whole doc → just open file
 			item.addEventListener('click', () => {
-				this.app.workspace.openLinkText(result.path, '', false);
+				if (isChunk) {
+					const parts = result.headingPath!.split(' > ');
+					const last = parts[parts.length - 1].replace(/^#+\s*/, '');
+					this.app.workspace.openLinkText(`${result.path}#${last}`, '', false);
+				} else {
+					this.app.workspace.openLinkText(result.path, '', false);
+				}
 			});
 		}
 	}

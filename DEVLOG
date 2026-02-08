@@ -1521,3 +1521,76 @@ This session was a masterclass in how many layers of subtlety hide behind "just 
 ---
 
 *End of log entry*
+
+## 2026-02-08 - Markdown Chunking, Search Panel Polish & Unified Search Architecture
+
+**Objective**: Implement markdown chunking for better retrieval on long documents, polish the search panel UI, and design the next-generation search architecture.
+
+### What We Built
+
+- **Markdown chunker** (`src/chunker.ts`) — Splits documents by H2 boundaries with H3 subdivision and fixed-size fallback for oversized chunks. Each chunk carries its heading path for context.
+- **Schema v3 for VectorStore** — Added `sourcePath`, `headingPath`, `chunkIndex` fields. Documents are now multi-chunk with IDs like `filepath#0`, `filepath#1`.
+- **Search panel redesign** — New result layout: title + score row, file path, section indicator with § symbol, snippet. Click-to-heading navigation via `openLinkText()`.
+- **Frontmatter stripping** — Snippets now strip YAML frontmatter before showing the first 200 chars.
+- **MCP response formatting** — `semantic_search` results now include heading path and snippet in the markdown response.
+- **Unified search feature spec** (`docs/features/unified-search.md`) — Complete architecture for consolidating three search tools into two, switching BM25 → QPS, and adding tag/path filtering.
+- **Chunker test suite** (`test/unit/chunker.test.ts`) — 19 tests covering H2/H3 splitting, frontmatter handling, edge cases.
+
+### The Journey
+
+The session started with implementing the chunker — a satisfying piece of pure logic that splits markdown by heading boundaries. The interesting design decisions were: should H3s subdivide H2 chunks? (Yes, for better retrieval granularity.) What about chunks with no headings? (Use the whole document as one chunk.) What about enormous chunks? (Fixed-size fallback at 5000 chars.)
+
+With chunking working, the search panel needed a complete redesign. The old flat list of results didn't show which section of a document matched. The new layout shows the heading path with a § indicator, and clicking navigates directly to that heading in the document using Obsidian's `openLinkText()` with a heading anchor.
+
+Then came the deeper architectural question: we now have three overlapping search tools (`search`, `semantic_search`, `find_files`). The brute-force `search` tool reads every file and regex-matches line by line — returning 77KB of unranked `file:line - text` noise for common queries. We explored whether Obsidian's built-in search API could replace it, but discovered there's no official headless search API — only low-level `prepareSimpleSearch`/`prepareFuzzySearch` string matchers and an undocumented internal plugin hack.
+
+The breakthrough came from deep-diving into Orama's capabilities:
+- **All schema fields are optional at insert time** — documents without embeddings are simply omitted from vector index but remain fully searchable via BM25
+- **`enum[]` type** supports `containsAll`/`containsAny` operators — perfect for Obsidian tags
+- **`where` filters** support `and`/`or`/`not` logical combinators
+- **QPS (Quantum Proximity Scoring)** — a drop-in BM25 replacement that scores based on token proximity, making phrase-like queries ("carbon intensity") rank correctly
+
+This led to the unified search architecture: two tools (`search` for content, `find` for file discovery), a `SearchEngine` abstraction interface, two-phase indexing (content first, embeddings second), and QPS for better text matching.
+
+### Technical Achievements
+
+1. **Heading-aware chunking** with path tracking (e.g., "## Overview > ### Principles")
+2. **Multi-chunk deduplication** — search results show best chunk per file, not every chunk
+3. **Click-to-heading navigation** in search panel via `openLinkText()` with heading anchors
+4. **Complete feature spec** for unified search with MCP tool descriptions, schema design, and implementation plan
+5. **67/68 tests passing** across unit and integration suites
+
+### Key Learnings
+
+1. **Orama schema fields are optional at insert time** — this is the key insight that enables indexing all files regardless of embedding success. Just omit the `embedding` field; the document stays in BM25/QPS index.
+
+2. **QPS > BM25 for short queries** — Quantum Proximity Scoring tokenises into "quantums" and scores adjacency. For the 2-5 word queries typical in vault search, this dramatically improves relevance over BM25's bag-of-words approach.
+
+3. **No headless search API in Obsidian** — `prepareFuzzySearch()` and `prepareSimpleSearch()` are the only official search functions. They're low-level string matchers, not the full search panel experience. The internal `global-search` plugin requires the UI panel to be open and `setTimeout` guessing for results.
+
+4. **MCP tool descriptions are critical** — they're the only thing AI clients see when deciding how to use a tool. Must be comprehensive: list all parameters, example values, explain what each mode does, mention what requires Ollama vs what works without it.
+
+5. **Orama `enum[]` with `containsAny`/`containsAll`** — the right primitive for tag filtering. Combined with `where` clause logical operators, this gives us the filtering power we need without building a custom query parser.
+
+### Statistics
+
+- 7 files modified, 5 new files created
+- `src/chunker.ts`: 213 lines (new)
+- `test/unit/chunker.test.ts`: 251 lines (new)
+- `docs/features/unified-search.md`: 265 lines (new)
+- 67/68 tests passing (1 pre-existing integration test failure)
+- 19 new chunker tests + updated vector store tests
+
+### What's Next
+
+- **Unified search implementation** — Step 1: Engine abstraction, Step 2: Schema v5 + QPS, Step 3: Unified `search` tool, Step 4: `find` tool, Step 5: Update search panel, Step 6: Remove old tools
+- Background indexing with status bar indicator
+- Chaos triage MCP tools
+
+### Reflections
+
+This session was as much about architecture as implementation. The chunker was the coding deliverable, but the real value came from the deep exploration of search options — systematically comparing brute-force grep, Obsidian's API, and Orama's capabilities to arrive at a clear, well-reasoned architecture. The user's discovery of QPS was the final piece that made the all-in-Orama approach compelling. Sometimes the most productive sessions are the ones where you spend more time thinking than typing.
+
+---
+
+*End of log entry*

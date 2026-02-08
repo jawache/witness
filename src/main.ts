@@ -1316,7 +1316,8 @@ export default class WitnessPlugin extends Plugin {
 					}
 
 					const formattedResults = results.map((r, i) => {
-						return `${i + 1}. **${r.path}** (${(r.score * 100).toFixed(1)}%)`;
+						const section = r.headingPath ? ` > ${r.headingPath.replace(/^##\s*/, '').replace(/ > ###\s*/g, ' > ')}` : '';
+						return `${i + 1}. **${r.path}**${section} (${(r.score * 100).toFixed(1)}%)`;
 					}).join('\n\n');
 
 					return {

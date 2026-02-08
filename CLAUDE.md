@@ -169,8 +169,36 @@ Semantic Search via Ollama + Orama:
 - ✅ Search panel sidebar view
 - ✅ Tabbed settings UI with model pull, index management, live progress
 - ✅ Tested on 4,097-document vault
+- ✅ Markdown chunking by H2/H3 headings (`src/chunker.ts`)
+- ✅ Multi-chunk indexing with heading path tracking (schema v3)
+- ✅ Click-to-heading navigation in search panel
+- ✅ Frontmatter stripping from snippets
 
 Total: 15 MCP tools registered and available
+
+### Markdown Chunking
+
+Documents are split into chunks by markdown headings before embedding. Each chunk carries its heading path (e.g., "## Overview > ### Principles") for context.
+
+**Key files:**
+
+- `src/chunker.ts` — Pure function `chunkMarkdown()` that splits by H2 boundaries, H3 subdivision, fixed-size fallback at 5000 chars
+- `test/unit/chunker.test.ts` — 19 tests covering edge cases
+
+**Chunk IDs:** `filepath#0`, `filepath#1`, etc. The VectorStore's `removeBySourcePath()` removes all chunks for a file by iterating sequential IDs until one is not found.
+
+**Schema v3:** Added `sourcePath` (string), `headingPath` (string), `chunkIndex` (number) to the Orama schema. Bump from v2 forces full re-index.
+
+### Unified Search Architecture (Planned)
+
+See `docs/features/unified-search.md` for full spec. Key decisions:
+
+- **Two tools**: `search` (content search via Orama) and `find` (file discovery via vault API)
+- **QPS over BM25**: `@orama/plugin-qps` scores by token proximity — better for short phrase queries
+- **All files indexed**: Two-phase indexing — content+metadata first (always succeeds), embeddings second (may fail). No blind spots.
+- **Tag/path filtering**: Orama `enum[]` for tags, `enum` for folder, `where` clause filters
+- **Engine abstraction**: `SearchEngine` interface for future engine swaps
+- **Schema v5**: Adds `tags: 'enum[]'` and `folder: 'enum'` to existing fields
 
 ### Dataview Integration
 
@@ -461,6 +489,8 @@ The Orama database is saved to `.witness/index.orama` as a JSON envelope with a 
 - `clearIndex()` must handle the case where `vectorStore` is null (e.g., after plugin restart before first search) — delete the file directly from disk.
 - The Build Index button must capture a local reference to `vectorStore` before the async indexing loop. If `clearIndex()` runs during indexing, the plugin-level reference goes null, causing "cannot read properties of null" errors.
 - `loadIndexCount()` (called on settings tab open) must not overwrite an existing `vectorStore` instance created by a concurrent operation.
+- **Orama schema fields are optional at insert time** — documents without embeddings are omitted from vector index but remain fully searchable via BM25/QPS. Don't set embedding to `null` or `[]`; just omit the field entirely.
+- **No headless search API in Obsidian** — `prepareFuzzySearch()` and `prepareSimpleSearch()` are low-level string matchers. The internal `global-search` plugin requires UI panel open and `setTimeout` guessing. Don't try to use Obsidian's built-in search programmatically.
 
 ### Token Authentication
 

@@ -1,7 +1,8 @@
 /**
  * Vector store backed by Orama.
- * Stores document embeddings and supports hybrid (BM25 + vector),
+ * Stores chunk embeddings and supports hybrid (BM25 + vector),
  * vector-only, and fulltext-only search modes.
+ * Documents are split into chunks by markdown headings for better retrieval.
  * Persists to .witness/index.orama as a single JSON file.
  */
 
@@ -9,16 +10,19 @@ import { create, insert, remove, search, searchVector, save, load, count, getByI
 import type { AnyOrama, RawData } from '@orama/orama';
 import type { App, TFile } from 'obsidian';
 import { OllamaProvider } from './ollama-provider';
+import { chunkMarkdown } from './chunker';
 
 const STORE_PATH = '.witness/index.orama';
 
 // Bump this when the schema changes to force re-indexing on upgrade.
-const SCHEMA_VERSION = 2; // v1 = vector-only, v2 = hybrid (added content field)
+const SCHEMA_VERSION = 3; // v1 = vector-only, v2 = hybrid (content), v3 = chunked (sourcePath, headingPath, chunkIndex)
 
-interface VaultDocument {
-	path: string;
+interface ChunkDocument {
+	sourcePath: string;
 	title: string;
+	headingPath: string;
 	content: string;
+	chunkIndex: number;
 	mtime: number;
 	embedding: number[];
 }
@@ -27,6 +31,7 @@ export interface SearchResult {
 	path: string;
 	title: string;
 	score: number;
+	headingPath?: string;
 	snippet?: string;
 }
 
@@ -44,9 +49,11 @@ export class VectorStore {
 
 	private getSchema() {
 		return {
-			path: 'string' as const,
+			sourcePath: 'string' as const,
 			title: 'string' as const,
+			headingPath: 'string' as const,
 			content: 'string' as const,
+			chunkIndex: 'number' as const,
 			mtime: 'number' as const,
 			embedding: `vector[${this.dimensions}]` as const,
 		};
@@ -101,7 +108,7 @@ export class VectorStore {
 	}
 
 	/**
-	 * Get the number of indexed documents.
+	 * Get the number of indexed chunks (not files).
 	 */
 	getCount(): number {
 		if (!this.db) return 0;
@@ -109,26 +116,36 @@ export class VectorStore {
 	}
 
 	/**
-	 * Index a single file: read content, generate embedding via Ollama, store in Orama.
+	 * Index a single file: read content, chunk by headings, generate embeddings, store in Orama.
 	 */
 	async indexFile(file: TFile): Promise<void> {
 		if (!this.db) throw new Error('VectorStore not initialized');
 
 		const content = await this.app.vault.cachedRead(file);
-		const [embedding] = await this.ollama.embedDocuments([content]);
+		const chunks = chunkMarkdown(content);
 
-		// Remove existing entry for this path if present
-		await this.removeByPath(file.path);
+		// Remove all existing chunks for this file
+		await this.removeBySourcePath(file.path);
 
-		// Insert new entry — use file path as document ID for reliable lookups
-		await insert(this.db, {
-			id: file.path,
-			path: file.path,
-			title: file.basename,
-			content,
-			mtime: file.stat.mtime,
-			embedding,
-		});
+		// Embed all chunks — prepend heading path for context
+		const textsToEmbed = chunks.map(c =>
+			c.headingPath ? `${c.headingPath}\n${c.content}` : c.content
+		);
+		const embeddings = await this.ollama.embedDocuments(textsToEmbed);
+
+		// Insert each chunk
+		for (let i = 0; i < chunks.length; i++) {
+			await insert(this.db, {
+				id: `${file.path}#${i}`,
+				sourcePath: file.path,
+				title: file.basename,
+				headingPath: chunks[i].headingPath,
+				content: chunks[i].content,
+				chunkIndex: i,
+				mtime: file.stat.mtime,
+				embedding: embeddings[i],
+			});
+		}
 	}
 
 	/**
@@ -148,16 +165,29 @@ export class VectorStore {
 		for (const file of files) {
 			try {
 				const content = await this.app.vault.cachedRead(file);
-				const [embedding] = await this.ollama.embedDocuments([content]);
-				await this.removeByPath(file.path);
-				await insert(this.db, {
-					id: file.path,
-					path: file.path,
-					title: file.basename,
-					content,
-					mtime: file.stat.mtime,
-					embedding,
-				});
+				const chunks = chunkMarkdown(content);
+
+				await this.removeBySourcePath(file.path);
+
+				// Embed all chunks for this file — prepend heading path for context
+				const textsToEmbed = chunks.map(c =>
+					c.headingPath ? `${c.headingPath}\n${c.content}` : c.content
+				);
+				const embeddings = await this.ollama.embedDocuments(textsToEmbed);
+
+				for (let i = 0; i < chunks.length; i++) {
+					await insert(this.db, {
+						id: `${file.path}#${i}`,
+						sourcePath: file.path,
+						title: file.basename,
+						headingPath: chunks[i].headingPath,
+						content: chunks[i].content,
+						chunkIndex: i,
+						mtime: file.stat.mtime,
+						embedding: embeddings[i],
+					});
+				}
+
 				indexed++;
 			} catch (e) {
 				failed.push(file.path);
@@ -171,25 +201,42 @@ export class VectorStore {
 	}
 
 	/**
-	 * Remove a document by its vault path.
-	 * Uses path as document ID for direct lookup (no search needed).
+	 * Remove all chunks for a given source file path.
+	 * Chunks have IDs like "filepath#0", "filepath#1", etc.
 	 */
-	async removeByPath(filePath: string): Promise<void> {
+	async removeBySourcePath(filePath: string): Promise<void> {
 		if (!this.db) return;
 
+		// Try removing chunks by sequential ID pattern
+		for (let i = 0; i < 1000; i++) {
+			const id = `${filePath}#${i}`;
+			try {
+				const existing = getByID(this.db, id);
+				if (existing) {
+					await remove(this.db, id);
+				} else {
+					break; // No more chunks for this file
+				}
+			} catch {
+				break;
+			}
+		}
+
+		// Also try the bare path (legacy single-chunk entries from schema v2)
 		try {
 			const existing = getByID(this.db, filePath);
 			if (existing) {
 				await remove(this.db, filePath);
 			}
 		} catch {
-			// Document doesn't exist — nothing to remove
+			// Not found — fine
 		}
 	}
 
 	/**
 	 * Hybrid search: BM25 keyword matching + vector cosine similarity,
 	 * merged via Reciprocal Rank Fusion (RRF).
+	 * Deduplicates by sourcePath, keeping the highest-scoring chunk per file.
 	 */
 	async searchHybrid(
 		query: string,
@@ -202,21 +249,25 @@ export class VectorStore {
 
 		const queryEmbedding = await this.ollama.embedQuery(query);
 
+		// Fetch more results than needed to account for deduplication
+		const fetchLimit = limit * 5;
+
 		const results = await search(this.db, {
 			mode: 'hybrid',
 			term: query,
 			vector: { value: queryEmbedding, property: 'embedding' },
 			properties: ['title', 'content'],
 			similarity: minScore,
-			limit,
+			limit: fetchLimit,
 			hybridWeights: { text: 0.3, vector: 0.7 },
 		} as any);
 
-		return this.mapAndFilterHits(results.hits, options?.paths);
+		return this.deduplicateAndFilter(results.hits, options?.paths, limit);
 	}
 
 	/**
 	 * Vector-only search: cosine similarity on embeddings.
+	 * Deduplicates by sourcePath, keeping the highest-scoring chunk per file.
 	 */
 	async searchVector(
 		query: string,
@@ -229,18 +280,21 @@ export class VectorStore {
 
 		const queryEmbedding = await this.ollama.embedQuery(query);
 
+		const fetchLimit = limit * 5;
+
 		const results = await searchVector(this.db, {
 			mode: 'vector',
 			vector: { value: queryEmbedding, property: 'embedding' },
 			similarity: minScore,
-			limit,
+			limit: fetchLimit,
 		});
 
-		return this.mapAndFilterHits(results.hits, options?.paths);
+		return this.deduplicateAndFilter(results.hits, options?.paths, limit);
 	}
 
 	/**
 	 * Fulltext-only search: BM25 keyword matching, no embeddings needed.
+	 * Deduplicates by sourcePath, keeping the highest-scoring chunk per file.
 	 */
 	async searchFulltext(
 		query: string,
@@ -248,51 +302,79 @@ export class VectorStore {
 	): Promise<SearchResult[]> {
 		if (!this.db) throw new Error('VectorStore not initialized');
 
+		const limit = options?.limit ?? 10;
+		const fetchLimit = limit * 5;
+
 		const results = await search(this.db, {
 			term: query,
 			properties: ['title', 'content'],
-			limit: options?.limit ?? 10,
+			limit: fetchLimit,
 		});
 
 		// Normalize BM25 scores to 0-1 range (relative to top result)
-		const mapped = this.mapAndFilterHits(results.hits, options?.paths);
-		const maxScore = mapped.length > 0 ? mapped[0].score : 1;
+		const deduped = this.deduplicateAndFilter(results.hits, options?.paths, limit);
+		const maxScore = deduped.length > 0 ? deduped[0].score : 1;
 		if (maxScore > 1) {
-			return mapped.map((r) => ({ ...r, score: r.score / maxScore }));
+			return deduped.map((r) => ({ ...r, score: r.score / maxScore }));
 		}
-		return mapped;
+		return deduped;
 	}
 
 	/**
-	 * Map Orama hits to SearchResult[] and optionally filter by paths.
+	 * Deduplicate hits by sourcePath (best chunk per file), filter by paths, and limit.
 	 */
-	private mapAndFilterHits(
+	private deduplicateAndFilter(
 		hits: Array<{ document: unknown; score: number }>,
-		paths?: string[]
+		paths?: string[],
+		limit?: number
 	): SearchResult[] {
-		let results = hits.map((hit) => {
-			const doc = hit.document as unknown as VaultDocument;
-			const snippet = doc.content ? doc.content.slice(0, 200) : undefined;
-			return {
-				path: doc.path,
-				title: doc.title,
-				score: hit.score,
-				snippet,
-			};
-		});
+		const bestPerFile = new Map<string, SearchResult>();
 
-		if (paths?.length) {
-			results = results.filter((h) =>
-				paths.some((p) => h.path.startsWith(p))
-			);
+		for (const hit of hits) {
+			const doc = hit.document as unknown as ChunkDocument;
+			const sourcePath = doc.sourcePath;
+
+			// Path filtering
+			if (paths?.length && !paths.some(p => sourcePath.startsWith(p))) {
+				continue;
+			}
+
+			const existing = bestPerFile.get(sourcePath);
+			if (!existing || hit.score > existing.score) {
+				const snippet = doc.content ? this.extractSnippet(doc.content) : undefined;
+				bestPerFile.set(sourcePath, {
+					path: sourcePath,
+					title: doc.title,
+					score: hit.score,
+					headingPath: doc.headingPath || undefined,
+					snippet,
+				});
+			}
 		}
 
-		return results;
+		const results = Array.from(bestPerFile.values())
+			.sort((a, b) => b.score - a.score);
+
+		return limit ? results.slice(0, limit) : results;
+	}
+
+	/**
+	 * Extract a snippet from content, stripping YAML frontmatter if present.
+	 */
+	private extractSnippet(content: string): string {
+		let text = content;
+		if (text.startsWith('---')) {
+			const endIdx = text.indexOf('---', 3);
+			if (endIdx !== -1) {
+				text = text.slice(endIdx + 3).trimStart();
+			}
+		}
+		return text.slice(0, 200);
 	}
 
 	/**
 	 * Get files that need re-indexing (mtime changed or not indexed).
-	 * Uses path as document ID for direct lookup.
+	 * Checks the first chunk (index 0) for each file.
 	 */
 	async getStaleFiles(files: TFile[]): Promise<TFile[]> {
 		if (!this.db) return files;
@@ -301,9 +383,16 @@ export class VectorStore {
 
 		for (const file of files) {
 			try {
-				const doc = getByID(this.db, file.path) as unknown as VaultDocument | null;
+				// Check for chunk 0 of this file
+				const doc = getByID(this.db, `${file.path}#0`) as unknown as ChunkDocument | null;
 				if (!doc) {
-					stale.push(file);
+					// Also check legacy bare path entries
+					const legacyDoc = getByID(this.db, file.path) as unknown as ChunkDocument | null;
+					if (!legacyDoc) {
+						stale.push(file);
+					} else if (legacyDoc.mtime !== file.stat.mtime) {
+						stale.push(file);
+					}
 				} else if (doc.mtime !== file.stat.mtime) {
 					stale.push(file);
 				}

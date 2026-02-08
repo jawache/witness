@@ -16,9 +16,11 @@ function fakeEmbedding(seed: number): number[] {
 
 function createSchema() {
   return {
-    path: 'string' as const,
+    sourcePath: 'string' as const,
     title: 'string' as const,
+    headingPath: 'string' as const,
     content: 'string' as const,
+    chunkIndex: 'number' as const,
     mtime: 'number' as const,
     embedding: `vector[${DIMENSIONS}]` as const,
   };
@@ -27,34 +29,52 @@ function createSchema() {
 function createTestDocs() {
   return [
     {
-      id: 'topics/carbon.md',
-      path: 'topics/carbon.md',
+      id: 'topics/carbon.md#0',
+      sourcePath: 'topics/carbon.md',
       title: 'Carbon Accounting',
+      headingPath: '',
       content: 'Carbon accounting measures CO2 emissions from organizations',
+      chunkIndex: 0,
       mtime: 1000,
       embedding: fakeEmbedding(1),
     },
     {
-      id: 'topics/green.md',
-      path: 'topics/green.md',
+      id: 'topics/green.md#0',
+      sourcePath: 'topics/green.md',
       title: 'Green Software',
+      headingPath: '## Overview',
       content: 'Green software reduces greenhouse gas emissions from computing',
+      chunkIndex: 0,
       mtime: 2000,
       embedding: fakeEmbedding(2),
     },
     {
-      id: 'topics/quantum.md',
-      path: 'topics/quantum.md',
+      id: 'topics/green.md#1',
+      sourcePath: 'topics/green.md',
+      title: 'Green Software',
+      headingPath: '## Principles',
+      content: 'The principles of green software include energy efficiency and hardware efficiency',
+      chunkIndex: 1,
+      mtime: 2000,
+      embedding: fakeEmbedding(5),
+    },
+    {
+      id: 'topics/quantum.md#0',
+      sourcePath: 'topics/quantum.md',
       title: 'Quantum Computing',
+      headingPath: '',
       content: 'Quantum computing uses qubits for parallel computation',
+      chunkIndex: 0,
       mtime: 3000,
       embedding: fakeEmbedding(3),
     },
     {
-      id: 'notes/readme.md',
-      path: 'notes/readme.md',
+      id: 'notes/readme.md#0',
+      sourcePath: 'notes/readme.md',
       title: 'README',
+      headingPath: '',
       content: 'This vault contains notes about various topics',
+      chunkIndex: 0,
       mtime: 4000,
       embedding: fakeEmbedding(4),
     },
@@ -86,7 +106,7 @@ describe('Fulltext search (BM25)', () => {
     });
 
     expect(results.hits.length).toBeGreaterThan(0);
-    expect((results.hits[0].document as any).path).toBe('topics/carbon.md');
+    expect((results.hits[0].document as any).sourcePath).toBe('topics/carbon.md');
   });
 
   it('should return empty for non-matching keyword', async () => {
@@ -108,7 +128,7 @@ describe('Fulltext search (BM25)', () => {
     });
 
     expect(results.hits.length).toBeGreaterThan(0);
-    expect((results.hits[0].document as any).path).toBe('topics/quantum.md');
+    expect((results.hits[0].document as any).sourcePath).toBe('topics/quantum.md');
   });
 
   it('should respect limit parameter', async () => {
@@ -142,7 +162,7 @@ describe('Vector search (cosine)', () => {
 
     expect(results.hits.length).toBeGreaterThan(0);
     // The most similar should be the doc with matching embedding
-    expect((results.hits[0].document as any).path).toBe('topics/carbon.md');
+    expect((results.hits[0].document as any).sourcePath).toBe('topics/carbon.md');
     expect(results.hits[0].score).toBeGreaterThan(0.9); // Near-identical embedding
   });
 
@@ -197,7 +217,7 @@ describe('Hybrid search (BM25 + vector)', () => {
 
     expect(results.hits.length).toBeGreaterThan(0);
     // Carbon doc should rank first — matches both keyword and embedding
-    expect((results.hits[0].document as any).path).toBe('topics/carbon.md');
+    expect((results.hits[0].document as any).sourcePath).toBe('topics/carbon.md');
   });
 
   it('should boost documents matching both signals', async () => {
@@ -215,13 +235,13 @@ describe('Hybrid search (BM25 + vector)', () => {
     expect(results.hits.length).toBeGreaterThan(1);
     // With equal weights: carbon gets keyword boost, quantum gets vector boost
     // Both should appear in top results
-    const paths = results.hits.map((h: any) => h.document.path);
+    const paths = results.hits.map((h: any) => h.document.sourcePath);
     expect(paths).toContain('topics/carbon.md');
     expect(paths).toContain('topics/quantum.md');
   });
 });
 
-describe('Path filtering (mapAndFilterHits logic)', () => {
+describe('Path filtering (deduplication logic)', () => {
   it('should filter results by path prefix', async () => {
     const db = await createPopulatedDb();
 
@@ -234,10 +254,10 @@ describe('Path filtering (mapAndFilterHits logic)', () => {
     // All docs should be returned before filtering
     expect(results.hits.length).toBeGreaterThan(1);
 
-    // Simulate mapAndFilterHits path filtering
+    // Simulate deduplicateAndFilter path filtering
     const filtered = results.hits
       .map((hit: any) => ({
-        path: hit.document.path,
+        path: hit.document.sourcePath,
         title: hit.document.title,
         score: hit.score,
       }))
@@ -246,6 +266,36 @@ describe('Path filtering (mapAndFilterHits logic)', () => {
     // Only topic docs should remain
     expect(filtered.every((r: any) => r.path.startsWith('topics/'))).toBe(true);
     expect(filtered.some((r: any) => r.path.startsWith('notes/'))).toBe(false);
+  });
+
+  it('should deduplicate multi-chunk results by sourcePath', async () => {
+    const db = await createPopulatedDb();
+
+    // Search for "green" — should match both chunks of green.md
+    const results = await search(db, {
+      term: 'green software',
+      properties: ['title', 'content'],
+      limit: 10,
+    });
+
+    // May return multiple chunks from green.md
+    const greenHits = results.hits.filter((h: any) =>
+      h.document.sourcePath === 'topics/green.md'
+    );
+
+    // Simulate deduplication: keep best per sourcePath
+    const bestPerFile = new Map<string, { path: string; score: number }>();
+    for (const hit of results.hits) {
+      const doc = hit.document as any;
+      const existing = bestPerFile.get(doc.sourcePath);
+      if (!existing || hit.score > existing.score) {
+        bestPerFile.set(doc.sourcePath, { path: doc.sourcePath, score: hit.score });
+      }
+    }
+
+    // green.md should appear only once after deduplication
+    const greenEntries = Array.from(bestPerFile.values()).filter(r => r.path === 'topics/green.md');
+    expect(greenEntries).toHaveLength(1);
   });
 });
 
@@ -292,13 +342,13 @@ describe('Schema versioning', () => {
     const data = save(db);
 
     // Simulate what VectorStore.save() does
-    const SCHEMA_VERSION = 2;
+    const SCHEMA_VERSION = 3;
     const envelope = { schemaVersion: SCHEMA_VERSION, data };
     const json = JSON.stringify(envelope);
 
     // Parse and verify envelope structure
     const parsed = JSON.parse(json);
-    expect(parsed.schemaVersion).toBe(2);
+    expect(parsed.schemaVersion).toBe(3);
     expect(parsed.data).toBeDefined();
 
     // Simulate what VectorStore.initialize() does — load from envelope
@@ -306,7 +356,7 @@ describe('Schema versioning', () => {
     const loadedData = parsed.data;
     load(newDb, loadedData);
 
-    expect(count(newDb)).toBe(4); // 4 test documents
+    expect(count(newDb)).toBe(5); // 5 test chunks (green.md has 2)
   });
 
   it('should detect old schema version (missing schemaVersion)', () => {
@@ -317,16 +367,16 @@ describe('Schema versioning', () => {
     expect(version).toBe(1); // Missing field defaults to v1
   });
 
-  it('should detect old schema version (explicit v1)', () => {
-    const envelope = { schemaVersion: 1, data: {} };
-    const SCHEMA_VERSION = 2;
+  it('should detect old schema version (explicit v2)', () => {
+    const envelope = { schemaVersion: 2, data: {} };
+    const SCHEMA_VERSION = 3;
 
     expect(envelope.schemaVersion < SCHEMA_VERSION).toBe(true);
   });
 
   it('should accept current schema version', () => {
-    const envelope = { schemaVersion: 2, data: {} };
-    const SCHEMA_VERSION = 2;
+    const envelope = { schemaVersion: 3, data: {} };
+    const SCHEMA_VERSION = 3;
 
     expect(envelope.schemaVersion < SCHEMA_VERSION).toBe(false);
   });
