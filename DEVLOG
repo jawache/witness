@@ -1593,4 +1593,81 @@ This session was as much about architecture as implementation. The chunker was t
 
 ---
 
+## 2026-02-08 - Unified Search: From Spec to Implementation
+
+**Objective**: Implement the unified search feature spec from the previous session — consolidate three MCP tools into two, switch from BM25 to QPS, add tag/path filtering, and make all files searchable regardless of embedding success.
+
+### What We Built
+
+The full unified search architecture, from spec to working code:
+
+1. **`SearchEngine` interface** (`src/search-engine.ts`) — clean abstraction over search implementations, decoupling consumers from Orama
+2. **`OramaSearchEngine`** — renamed from `VectorStore`, implements the interface, schema v5 with QPS, tags, folders, two-phase indexing
+3. **Unified `search` MCP tool** — replaces the old brute-force `search` and `semantic_search` tools. Hybrid/vector/fulltext modes, tag and path filtering, quoted phrase support, structured JSON responses
+4. **`find` MCP tool** — replaces `find_files` with richer metadata. Pattern, path, tag, and frontmatter property filtering
+5. **Two-phase indexing** — Phase 1 indexes content + metadata (always succeeds), Phase 2 generates embeddings (may fail, file stays fulltext-searchable)
+6. **23 unit tests** covering QPS scoring, optional embeddings, tag/folder metadata, schema versioning
+7. **Two feature specs** for next-up enhancements: phrase search boosting and find tool sorting
+
+### The Journey
+
+The session started with a clear mandate: "go ahead, start implementing unified search." The previous session had produced a detailed spec in `docs/features/unified-search.md`, so the path was well-mapped.
+
+**Systematic execution.** Set up a 7-step todo list mirroring the spec's implementation plan: install QPS, create interface, refactor VectorStore, replace MCP tools, update search panel, update tests, verify. Each step built on the last with no backtracking.
+
+**The VectorStore refactor** was the meatiest change. Renamed to `OramaSearchEngine`, bumped schema to v5, added `tags: 'enum[]'` and `folder: 'enum'` fields, wired in `pluginQPS()`, and rewrote `indexFiles()` to support two-phase indexing with an options object. The key insight from the spec — that Orama schema fields are optional at insert time — made the two-phase approach clean: just omit the `embedding` field and the document stays in the QPS/fulltext index.
+
+**Three tools became two.** The old brute-force `search` (77KB of unranked grep output), `semantic_search` (Orama-backed but separate), and `find_files` (filename-only) were replaced by a unified `search` (all three modes + filtering + structured JSON) and `find` (vault API + metadataCache for rich metadata). The new `search` tool auto-initialises the engine and auto-indexes stale files on first use.
+
+**Testing was smooth.** Updated all 23 unit tests for the new schema, added suites for documents without embeddings, tag/folder metadata, and QPS proximity scoring. All passed on first run. The integration tests were updated for new tool names but expectedly fail against the old deployed plugin — they'll pass once the new build is deployed.
+
+**Deployed to main vault** for manual testing. The schema version bump (v3 → v5) triggers automatic re-indexing.
+
+**Feature planning.** After testing, the user identified two enhancement areas: phrase search quality (exact phrases should rank higher) and find tool sorting (sort by frontmatter dates). Rather than scope-creep the working implementation, we captured both as feature specs with detailed implementation plans for future sessions.
+
+### Technical Achievements
+
+1. **Clean engine abstraction** — `SearchEngine` interface means the Orama implementation can be swapped without touching consumers
+2. **No blind spots** — every markdown file in the vault is now fulltext-searchable, even if Ollama is down or embedding fails
+3. **14 MCP tools** — consolidated from 15, but more capable. The `search` tool alone replaces two previous tools with better filtering and structured output
+4. **Schema v5** — tags and folder metadata stored in Orama for efficient `where` clause filtering
+5. **Backwards compatibility** — `export const VectorStore = OramaSearchEngine` alias ensures no breakage during migration
+
+### Key Learnings
+
+1. **QPS is a drop-in BM25 replacement** — `pluginQPS()` slots into `create()` with zero API changes. Orama's search API is the same; only the scoring algorithm changes. This made the switch trivial.
+
+2. **Two-phase indexing is the right pattern** — separating content indexing from embedding generation means failures in one phase don't block the other. The `indexFiles()` options object (`generateEmbeddings`, `minContentLength`, `getFileTags`) keeps the API clean.
+
+3. **Feature specs pay dividends** — having a detailed spec from the previous session meant this implementation session was pure execution. No architecture debates, no design dead-ends. The spec's step-by-step plan mapped directly to the todo list.
+
+4. **Scope discipline matters** — the user correctly identified that phrase boosting and find sorting were separate features, not part of the current task. Creating feature specs instead of implementing them kept the PR focused and the working code stable.
+
+5. **Orama has no native phrase search** — investigated thoroughly. No phrase parameter, no exact phrase mode, no proximity search beyond what QPS provides. The current `filterByPhrases` post-filter approach is the only option; the phrase-search-boosting spec improves it from binary filter to boost.
+
+### Statistics
+
+- 12 files changed, 818 insertions, 396 deletions (unified search commit)
+- 1 new file created: `src/search-engine.ts` (66 lines)
+- 2 feature specs created: `phrase-search-boosting.md`, `find-sorting.md`
+- 37 unit tests passing (14 chunker + 23 vector-store)
+- 3 MCP tools removed, 2 added (net -1: 15 → 14 tools)
+- Schema version: v3 → v5
+
+### What's Next
+
+- **Phrase search boosting** — replace binary `filterByPhrases` with `boostByPhrases` that partitions results (phrase matches first, rest after) using full chunk content
+- **Find tool sorting** — add `sortBy` parameter with auto-detected date/datetime properties
+- **Manual testing** — verify unified search on the 4,097-document main vault
+- **Background indexing** — automatic incremental indexing with status bar indicator
+- **Chaos triage** — MCP tools for processing chaos items one at a time
+
+### Reflections
+
+This was a satisfying "spec → implementation" session. The previous session's exploration and spec work meant today was about methodical execution rather than exploration. Each of the 7 implementation steps completed cleanly, the build passed on first attempt, and all unit tests passed. The feature branch approach (`feature/unified-search`) keeps main clean while we verify the changes in the real vault.
+
+The user's instinct to stop and capture the phrase boosting and find sorting as separate feature specs rather than tacking them onto this PR was good engineering discipline. The unified search is a solid foundation; those enhancements can land independently without risking what's already working.
+
+---
+
 *End of log entry*

@@ -4,6 +4,8 @@
 
 ## Next Up
 
+- [ ] [Phrase search boosting](docs/features/phrase-search-boosting.md) — Boost exact phrase matches to the top instead of filtering them. Check full chunk content, not just snippet.
+- [ ] [Find tool sorting](docs/features/find-sorting.md) — Add sortBy parameter to find tool for sorting by frontmatter dates/properties.
 - [ ] [Chaos triage](docs/features/chaos-triage.md) — MCP tools and prompt for processing chaos items one at a time (get_next_chaos, triage_chaos)
 - [ ] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with status bar indicator and log viewer.
 - [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
