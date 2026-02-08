@@ -115,7 +115,7 @@ export class VectorStore {
 		if (!this.db) throw new Error('VectorStore not initialized');
 
 		const content = await this.app.vault.cachedRead(file);
-		const [embedding] = await this.ollama.embed([content]);
+		const [embedding] = await this.ollama.embedDocuments([content]);
 
 		// Remove existing entry for this path if present
 		await this.removeByPath(file.path);
@@ -148,7 +148,7 @@ export class VectorStore {
 		for (const file of files) {
 			try {
 				const content = await this.app.vault.cachedRead(file);
-				const [embedding] = await this.ollama.embed([content]);
+				const [embedding] = await this.ollama.embedDocuments([content]);
 				await this.removeByPath(file.path);
 				await insert(this.db, {
 					id: file.path,
@@ -200,7 +200,7 @@ export class VectorStore {
 		const limit = options?.limit ?? 10;
 		const minScore = options?.minScore ?? 0.3;
 
-		const queryEmbedding = await this.ollama.embedOne(query);
+		const queryEmbedding = await this.ollama.embedQuery(query);
 
 		const results = await search(this.db, {
 			mode: 'hybrid',
@@ -227,7 +227,7 @@ export class VectorStore {
 		const limit = options?.limit ?? 10;
 		const minScore = options?.minScore ?? 0.3;
 
-		const queryEmbedding = await this.ollama.embedOne(query);
+		const queryEmbedding = await this.ollama.embedQuery(query);
 
 		const results = await searchVector(this.db, {
 			mode: 'vector',

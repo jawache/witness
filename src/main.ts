@@ -178,6 +178,7 @@ interface WitnessSettings {
 	ollamaBaseUrl: string;
 	ollamaModel: string;
 	excludedFolders: string[];
+	minContentLength: number;
 }
 
 // Helper function to generate random credentials
@@ -211,6 +212,7 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	ollamaBaseUrl: 'http://localhost:11434',
 	ollamaModel: 'nomic-embed-text',
 	excludedFolders: [],
+	minContentLength: 50,
 }
 
 export default class WitnessPlugin extends Plugin {
@@ -312,10 +314,18 @@ export default class WitnessPlugin extends Plugin {
 	getIndexableFiles(): TFile[] {
 		const allFiles = this.app.vault.getMarkdownFiles();
 		const excluded = this.settings.excludedFolders;
-		if (!excluded || excluded.length === 0) return allFiles;
-		return allFiles.filter(f =>
-			!excluded.some(folder => f.path.startsWith(folder + '/') || f.path === folder)
-		);
+		const minLen = this.settings.minContentLength ?? 50;
+		return allFiles.filter(f => {
+			// Exclude by folder
+			if (excluded?.length && excluded.some(folder => f.path.startsWith(folder + '/') || f.path === folder)) {
+				return false;
+			}
+			// Exclude files shorter than minimum content length (use file size as proxy)
+			if (minLen > 0 && f.stat.size < minLen) {
+				return false;
+			}
+			return true;
+		});
 	}
 
 	async clearIndex(): Promise<void> {
@@ -2355,9 +2365,13 @@ class WitnessSettingTab extends PluginSettingTab {
 				});
 				await this.plugin.ollamaProvider.resolveModelInfo();
 			}
-			this.plugin.vectorStore = new VectorStore(this.app, this.plugin.ollamaProvider);
-			await this.plugin.vectorStore.initialize();
-			return this.plugin.getIndexCount();
+			const vs = new VectorStore(this.app, this.plugin.ollamaProvider);
+			await vs.initialize();
+			// Only assign to plugin if nothing else created one during our await
+			if (!this.plugin.vectorStore) {
+				this.plugin.vectorStore = vs;
+			}
+			return this.plugin.vectorStore.getCount();
 		} catch {
 			return 0;
 		}
@@ -2544,8 +2558,10 @@ class WitnessSettingTab extends PluginSettingTab {
 								this.plugin.vectorStore = new VectorStore(this.app, this.plugin.ollamaProvider);
 								await this.plugin.vectorStore.initialize();
 							}
+							// Capture local reference — prevents null errors if clearIndex/reset runs during indexing
+							const vs = this.plugin.vectorStore;
 							const mdFiles = this.plugin.getIndexableFiles();
-							const staleFiles = await this.plugin.vectorStore.getStaleFiles(mdFiles);
+							const staleFiles = await vs.getStaleFiles(mdFiles);
 							if (staleFiles.length === 0) {
 								indexStatusSetting.setDesc(`${this.plugin.getIndexCount()} documents indexed — all up to date`);
 								return;
@@ -2553,13 +2569,13 @@ class WitnessSettingTab extends PluginSettingTab {
 							button.setDisabled(true);
 							button.setButtonText('Indexing...');
 							indexStatusSetting.setDesc(`Indexing 0/${staleFiles.length}...`);
-							const result = await this.plugin.vectorStore.indexFiles(staleFiles, (done, total) => {
+							const result = await vs.indexFiles(staleFiles, (done, total) => {
 								indexStatusSetting.setDesc(`Indexing ${done}/${total}...`);
 							}, (level, msg, data) => {
 								if (level === 'error') this.plugin.logger.error(msg, data);
 								else this.plugin.logger.info(msg);
 							});
-							await this.plugin.vectorStore.save();
+							await vs.save();
 							button.setDisabled(false);
 							button.setButtonText('Build Index');
 							if (result.failed.length > 0) {
@@ -2589,6 +2605,23 @@ class WitnessSettingTab extends PluginSettingTab {
 						indexStatusSetting.setDesc('Index cleared — will be rebuilt on next semantic search');
 					}));
 			});
+
+		// Indexing filters
+		new SettingGroup(pane)
+			.setHeading('Indexing Filters')
+			.addSetting(s => s
+				.setName('Minimum content length')
+				.setDesc('Skip files shorter than this many characters. Short files produce noisy embeddings.')
+				.addText(text => text
+					.setValue(String(this.plugin.settings.minContentLength ?? 50))
+					.setPlaceholder('50')
+					.onChange(async (value) => {
+						const num = parseInt(value, 10);
+						if (!isNaN(num) && num >= 0) {
+							this.plugin.settings.minContentLength = num;
+							await this.plugin.saveSettings();
+						}
+					})));
 
 		// Folder exclusions
 		const exclusionsGroup = new SettingGroup(pane)

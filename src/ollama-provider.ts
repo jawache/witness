@@ -64,6 +64,14 @@ const MODEL_CONTEXT_TOKENS: Record<string, number> = {
 	'snowflake-arctic-embed': 512,
 };
 
+// Task prefixes required by some embedding models for optimal retrieval.
+// Without these, embeddings are in a generic space and similarity is meaningless.
+const MODEL_TASK_PREFIXES: Record<string, { document: string; query: string }> = {
+	'nomic-embed-text': { document: 'search_document: ', query: 'search_query: ' },
+	'nomic-embed-text-v2-moe': { document: 'search_document: ', query: 'search_query: ' },
+	'mxbai-embed-large': { document: '', query: 'Represent this sentence for searching relevant passages: ' },
+};
+
 // Conservative chars-per-token estimate. English averages ~4, but JSON, URLs,
 // special syntax, and non-ASCII can be as low as ~1.5. Use 2 for safety.
 const CHARS_PER_TOKEN = 2;
@@ -232,6 +240,32 @@ export class OllamaProvider {
 	async embedOne(text: string): Promise<number[]> {
 		const [embedding] = await this.embed([text]);
 		return embedding;
+	}
+
+	/**
+	 * Embed documents for storage. Adds model-specific task prefix if required.
+	 */
+	async embedDocuments(texts: string[]): Promise<number[][]> {
+		const prefix = this.getTaskPrefix();
+		if (prefix) {
+			return this.embed(texts.map(t => prefix.document + t));
+		}
+		return this.embed(texts);
+	}
+
+	/**
+	 * Embed a query for search. Adds model-specific task prefix if required.
+	 */
+	async embedQuery(text: string): Promise<number[]> {
+		const prefix = this.getTaskPrefix();
+		const input = prefix ? prefix.query + text : text;
+		const [embedding] = await this.embed([input]);
+		return embedding;
+	}
+
+	private getTaskPrefix(): { document: string; query: string } | null {
+		const baseName = this.model.split(':')[0];
+		return MODEL_TASK_PREFIXES[baseName] ?? null;
 	}
 
 	getModel(): string {
