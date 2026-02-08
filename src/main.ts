@@ -756,32 +756,14 @@ export default class WitnessPlugin extends Plugin {
 						};
 					}
 
-					// Parse quoted phrases from query for post-filtering
-					const { cleanQuery, phrases } = this.parseQuotedPhrases(query);
-
-					// Search using the unified interface
-					this.logger.info(`Search (${mode}) for: "${query}"`);
-					const paths = path ? [path] : undefined;
-					const tags = tag ? [tag] : undefined;
-
-					// Over-fetch when phrases are present — boosting may reorder significantly
-					const effectiveLimit = phrases.length > 0 ? Math.max(limit * 3, 30) : limit;
-
-					let results = await this.vectorStore.search(cleanQuery || query, {
+					// Use the shared search method (handles phrases, stop words, boosting)
+					const results = await this.search(query, {
 						mode: mode ?? 'hybrid',
-						limit: effectiveLimit,
+						limit,
 						minScore,
-						paths,
-						tags,
+						paths: path ? [path] : undefined,
+						tags: tag ? [tag] : undefined,
 					});
-
-					// Boost results containing exact phrase matches to the top
-					if (phrases.length > 0 && results.length > 0) {
-						results = this.boostByPhrases(results, phrases);
-					}
-
-					// Trim back to requested limit
-					results = results.slice(0, limit);
 
 					// Return structured JSON
 					if (results.length === 0) {
@@ -1380,6 +1362,18 @@ export default class WitnessPlugin extends Plugin {
 
 	}
 
+	/** Common English stop words that pollute QPS scoring without adding meaning. */
+	private static readonly STOP_WORDS = new Set([
+		'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+		'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'shall',
+		'should', 'can', 'could', 'may', 'might', 'must', 'of', 'in', 'to',
+		'for', 'with', 'on', 'at', 'by', 'from', 'as', 'into', 'through',
+		'and', 'but', 'or', 'nor', 'not', 'so', 'yet', 'if', 'then',
+		'it', 'its', 'this', 'that', 'these', 'those',
+		'he', 'him', 'his', 'she', 'her', 'we', 'us', 'our', 'they', 'them', 'their',
+		'i', 'me', 'my', 'you', 'your', 'what', 'which', 'who', 'whom',
+	]);
+
 	/**
 	 * Parse quoted phrases from a search query.
 	 * Returns the clean query (without quotes) and extracted phrases.
@@ -1391,6 +1385,19 @@ export default class WitnessPlugin extends Plugin {
 			return phrase; // Keep the words in the query for QPS scoring
 		});
 		return { cleanQuery: cleanQuery.trim(), phrases };
+	}
+
+	/**
+	 * Strip stop words from query to improve QPS scoring.
+	 * Stop words like "the" pollute QPS results without adding search value.
+	 * Returns empty string if all words are stop words (caller should fall back to original).
+	 */
+	stripStopWords(query: string): string {
+		return query
+			.split(/\s+/)
+			.filter(w => !WitnessPlugin.STOP_WORDS.has(w.toLowerCase()))
+			.join(' ')
+			.trim();
 	}
 
 	/**
@@ -1416,6 +1423,50 @@ export default class WitnessPlugin extends Plugin {
 		}
 
 		return [...phraseMatches, ...rest];
+	}
+
+	/**
+	 * Unified search method used by both MCP tool and sidebar.
+	 * Handles phrase parsing, stop word stripping, over-fetching, and phrase boosting.
+	 */
+	async search(query: string, options: {
+		mode?: 'hybrid' | 'vector' | 'fulltext';
+		limit?: number;
+		minScore?: number;
+		paths?: string[];
+		tags?: string[];
+	} = {}): Promise<SearchResult[]> {
+		if (!this.vectorStore) {
+			throw new Error('Search index not available');
+		}
+
+		const { mode = 'hybrid', limit = 10, minScore, paths, tags } = options;
+
+		// Parse quoted phrases for post-boost
+		const { cleanQuery, phrases } = this.parseQuotedPhrases(query);
+
+		// Over-fetch when phrases present — boosting may reorder significantly
+		const effectiveLimit = phrases.length > 0 ? Math.max(limit * 3, 30) : limit;
+
+		// Strip stop words to improve QPS scoring
+		const oramaQuery = this.stripStopWords(cleanQuery || query) || cleanQuery || query;
+
+		this.logger.info(`Search (${mode}) for: "${query}" → orama: "${oramaQuery}"${phrases.length > 0 ? ` [phrases: ${phrases.join(', ')}]` : ''}`);
+
+		let results = await this.vectorStore.search(oramaQuery, {
+			mode,
+			limit: effectiveLimit,
+			minScore,
+			paths,
+			tags,
+		});
+
+		// Boost results containing exact phrase matches to the top
+		if (phrases.length > 0 && results.length > 0) {
+			results = this.boostByPhrases(results, phrases);
+		}
+
+		return results.slice(0, limit);
 	}
 
 	private async handleMCPRequest(req: IncomingMessage, res: ServerResponse) {

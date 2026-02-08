@@ -153,7 +153,8 @@ export class WitnessSearchView extends ItemView {
 		const startTime = performance.now();
 
 		try {
-			const results = await this.plugin.vectorStore.search(query, {
+			// Use shared search method (handles phrases, stop words, boosting)
+			const results = await this.plugin.search(query, {
 				mode: this.currentMode,
 				limit: 20,
 			});
