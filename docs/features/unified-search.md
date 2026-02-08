@@ -1,6 +1,6 @@
 # Feature Spec: Unified Search
 
-**Status:** Planned
+**Status:** Complete
 **Created:** 2026-02-08
 **Last Updated:** 2026-02-08
 

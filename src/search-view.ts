@@ -5,7 +5,7 @@
 
 import { ItemView, WorkspaceLeaf } from 'obsidian';
 import type WitnessPlugin from './main';
-import type { SearchResult } from './vector-store';
+import type { SearchResult } from './search-engine';
 
 export const VIEW_TYPE_SEARCH = 'witness-search';
 
@@ -130,8 +130,8 @@ export class WitnessSearchView extends ItemView {
 				}
 			}
 
-			const { VectorStore } = await import('./vector-store');
-			this.plugin.vectorStore = new VectorStore(this.app, this.plugin.ollamaProvider!);
+			const { OramaSearchEngine } = await import('./vector-store');
+			this.plugin.vectorStore = new OramaSearchEngine(this.app, this.plugin.ollamaProvider!);
 			await this.plugin.vectorStore.initialize();
 		}
 
@@ -153,19 +153,10 @@ export class WitnessSearchView extends ItemView {
 		const startTime = performance.now();
 
 		try {
-			let results: SearchResult[];
-
-			switch (this.currentMode) {
-				case 'hybrid':
-					results = await this.plugin.vectorStore.searchHybrid(query, { limit: 20 });
-					break;
-				case 'vector':
-					results = await this.plugin.vectorStore.searchVector(query, { limit: 20 });
-					break;
-				case 'fulltext':
-					results = await this.plugin.vectorStore.searchFulltext(query, { limit: 20 });
-					break;
-			}
+			const results = await this.plugin.vectorStore.search(query, {
+				mode: this.currentMode,
+				limit: 20,
+			});
 
 			const elapsed = Math.round(performance.now() - startTime);
 			this.renderResults(results, elapsed);

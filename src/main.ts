@@ -10,7 +10,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { OllamaProvider, type EmbeddingModelInfo } from './ollama-provider';
-import { VectorStore } from './vector-store';
+import { OramaSearchEngine } from './vector-store';
+import type { SearchResult } from './search-engine';
 import { WitnessSearchView, VIEW_TYPE_SEARCH } from './search-view';
 
 /**
@@ -156,6 +157,7 @@ interface WitnessSettings {
 		list_files?: string;
 		edit_file?: string;
 		search?: string;
+		find?: string;
 		find_files?: string;
 		move_file?: string;
 		create_folder?: string;
@@ -224,7 +226,7 @@ export default class WitnessPlugin extends Plugin {
 	private tunnelProcess: Tunnel | null = null;
 	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
-	vectorStore: VectorStore | null = null;
+	vectorStore: OramaSearchEngine | null = null;
 	ollamaProvider: OllamaProvider | null = null;
 
 	async onload() {
@@ -314,18 +316,42 @@ export default class WitnessPlugin extends Plugin {
 	getIndexableFiles(): TFile[] {
 		const allFiles = this.app.vault.getMarkdownFiles();
 		const excluded = this.settings.excludedFolders;
-		const minLen = this.settings.minContentLength ?? 50;
 		return allFiles.filter(f => {
 			// Exclude by folder
 			if (excluded?.length && excluded.some(folder => f.path.startsWith(folder + '/') || f.path === folder)) {
 				return false;
 			}
-			// Exclude files shorter than minimum content length (use file size as proxy)
-			if (minLen > 0 && f.stat.size < minLen) {
-				return false;
-			}
 			return true;
 		});
+	}
+
+	/**
+	 * Extract tags from a file via Obsidian's metadataCache.
+	 * Returns tags with # prefix (e.g., ['#topic', '#recipe']).
+	 */
+	getFileTags(file: TFile): string[] {
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (!cache) return [];
+		const tags: string[] = [];
+		// Tags in frontmatter
+		if (cache.frontmatter?.tags) {
+			const fmTags = Array.isArray(cache.frontmatter.tags)
+				? cache.frontmatter.tags
+				: [cache.frontmatter.tags];
+			for (const t of fmTags) {
+				const tag = String(t).startsWith('#') ? String(t) : `#${t}`;
+				tags.push(tag);
+			}
+		}
+		// Inline tags
+		if (cache.tags) {
+			for (const t of cache.tags) {
+				if (!tags.includes(t.tag)) {
+					tags.push(t.tag);
+				}
+			}
+		}
+		return tags;
 	}
 
 	async clearIndex(): Promise<void> {
@@ -639,99 +665,233 @@ export default class WitnessPlugin extends Plugin {
 			}
 		);
 
-		// Register search tool (READ-ONLY)
+		// Register unified search tool (READ-ONLY)
+		// Replaces the old brute-force search and semantic_search tools
 		this.mcpServer.tool(
 			'search',
-			this.getToolDescription('search', 'Search for text content across all files in the vault'),
+			this.getToolDescription('search',
+				'Search for documents by meaning, keyword, or both. Returns ranked results with snippets.\n' +
+				'Modes: "hybrid" (default, combines keyword + semantic), "vector" (semantic only), "fulltext" (keyword only).\n' +
+				'Use "quoted phrases" in the query for exact phrase matching (e.g., \'"carbon intensity"\').\n' +
+				'Use path to limit results to a folder (e.g., "chaos/" or "order/knowledge/").\n' +
+				'Use tag to filter by Obsidian tag (e.g., "#recipe", "#topic").\n' +
+				'Fulltext mode works without Ollama. Vector and hybrid modes require Ollama running with an embedding model.\n' +
+				'Results are ranked by relevance score and deduplicated per file, returning the best-matching section.'),
 			{
-				query: z.string().describe('Text to search for'),
-				caseSensitive: z.boolean().optional().describe('Case sensitive search (default: false)'),
-				path: z.string().optional().describe('Limit search to specific folder (default: entire vault)'),
+				query: z.string().describe('Search query. Supports quoted phrases for exact matching.'),
+				mode: z.enum(['hybrid', 'vector', 'fulltext']).optional().default('hybrid')
+					.describe('Search mode: hybrid (keyword+semantic), vector (semantic only), fulltext (keyword only)'),
+				path: z.string().optional().describe('Limit to files under this folder (e.g., "chaos/" or "order/knowledge/")'),
+				tag: z.string().optional().describe('Only files with this tag (e.g., "#recipe", "#topic")'),
+				limit: z.number().optional().default(10).describe('Maximum number of results to return'),
+				minScore: z.number().optional().default(0.3).describe('Minimum similarity score (0-1, applies to hybrid and vector modes)'),
 			},
 			{
 				readOnlyHint: true,
 			},
-			async ({ query, caseSensitive = false, path }) => {
-				const allFiles = this.app.vault.getMarkdownFiles();
-				const results: Array<{ file: string; line: number; text: string }> = [];
+			async ({ query, mode, path, tag, limit, minScore }) => {
+				try {
+					// Initialize Ollama provider on first use
+					if (!this.ollamaProvider) {
+						this.ollamaProvider = new OllamaProvider({
+							baseUrl: this.settings.ollamaBaseUrl,
+							model: this.settings.ollamaModel,
+							log: (level, msg, data) => {
+								if (level === 'error') this.logger.error(msg, data);
+								else this.logger.info(msg);
+							},
+						});
+						await this.ollamaProvider.resolveModelInfo();
+					}
 
-				// Filter by path if specified
-				const filesToSearch = path
-					? allFiles.filter(f => f.path.startsWith(path))
-					: allFiles;
-
-				const searchRegex = new RegExp(
-					query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-					caseSensitive ? 'g' : 'gi'
-				);
-
-				for (const file of filesToSearch) {
-					const content = await this.app.vault.read(file);
-					const lines = content.split('\n');
-
-					lines.forEach((lineText, index) => {
-						if (searchRegex.test(lineText)) {
-							results.push({
-								file: file.path,
-								line: index + 1,
-								text: lineText.trim(),
-							});
+					// For vector/hybrid modes, check Ollama availability
+					if (mode !== 'fulltext') {
+						if (!(await this.ollamaProvider.isAvailable())) {
+							return {
+								content: [{
+									type: 'text',
+									text: 'Ollama is not running. Start Ollama for hybrid/vector search, or use mode: "fulltext" for keyword-only search.\n\n  ollama pull nomic-embed-text',
+								}],
+								isError: true,
+							};
 						}
+					}
+
+					// Initialize search engine on first use
+					if (!this.vectorStore) {
+						this.vectorStore = new OramaSearchEngine(this.app, this.ollamaProvider);
+						await this.vectorStore.initialize();
+						this.logger.info(`Search engine initialized with ${this.vectorStore.getCount()} documents`);
+
+						// Auto-index if needed
+						const mdFiles = this.getIndexableFiles();
+						const staleFiles = await this.vectorStore.getStaleFiles(mdFiles);
+
+						if (staleFiles.length > 0) {
+							this.logger.info(`Indexing ${staleFiles.length} new/changed files...`);
+							const result = await this.vectorStore.indexFiles(staleFiles, {
+								generateEmbeddings: mode !== 'fulltext',
+								minContentLength: this.settings.minContentLength ?? 50,
+								getFileTags: (f) => this.getFileTags(f),
+								onProgress: (done, total) => {
+									this.logger.info(`Indexing progress: ${done}/${total}`);
+								},
+								onLog: (level, msg, data) => {
+									if (level === 'error') this.logger.error(msg, data);
+									else this.logger.info(msg);
+								},
+							});
+							await this.vectorStore.save();
+							this.logger.info(`Indexed ${result.indexed} files (${result.embedded} embedded, ${result.failed.length} failed), total: ${this.vectorStore.getCount()}`);
+						}
+					}
+
+					if (this.vectorStore.getCount() === 0) {
+						return {
+							content: [{
+								type: 'text',
+								text: 'No documents indexed yet. Ensure your vault has markdown files. For hybrid/vector search, Ollama must be running.',
+							}],
+							isError: true,
+						};
+					}
+
+					// Parse quoted phrases from query for post-filtering
+					const { cleanQuery, phrases } = this.parseQuotedPhrases(query);
+
+					// Search using the unified interface
+					this.logger.info(`Search (${mode}) for: "${query}"`);
+					const paths = path ? [path] : undefined;
+					const tags = tag ? [tag] : undefined;
+
+					let results = await this.vectorStore.search(cleanQuery || query, {
+						mode: mode ?? 'hybrid',
+						limit,
+						minScore,
+						paths,
+						tags,
 					});
-				}
 
-				const summary = `Found ${results.length} match(es) across ${filesToSearch.length} file(s)`;
-				const resultText = results.length > 0
-					? results.map(r => `${r.file}:${r.line} - ${r.text}`).join('\n')
-					: 'No matches found';
+					// Post-filter by quoted phrases
+					if (phrases.length > 0 && results.length > 0) {
+						results = this.filterByPhrases(results, phrases);
+					}
 
-				return {
-					content: [
-						{
+					// Return structured JSON
+					if (results.length === 0) {
+						return {
+							content: [{
+								type: 'text',
+								text: `No results found for: "${query}"`,
+							}],
+							isError: false,
+						};
+					}
+
+					const jsonResults = results.map(r => ({
+						path: r.path,
+						title: r.title,
+						section: r.headingPath ? r.headingPath.replace(/^##\s*/, '').replace(/ > ###\s*/g, ' > ') : undefined,
+						score: Math.round(r.score * 100) / 100,
+						snippet: r.snippet,
+					}));
+
+					return {
+						content: [{
 							type: 'text',
-							text: `${summary}\n\n${resultText}`,
-						},
-					],
-					isError: false,
-				};
+							text: JSON.stringify(jsonResults, null, 2),
+						}],
+						isError: false,
+					};
+				} catch (error) {
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					this.logger.error('Search error:', errorMessage);
+					return {
+						content: [{
+							type: 'text',
+							text: `Search failed: ${errorMessage}`,
+						}],
+						isError: true,
+					};
+				}
 			}
 		);
 
-		// Register find_files tool (READ-ONLY)
+		// Register find tool (READ-ONLY)
+		// Replaces the old find_files tool with richer metadata
 		this.mcpServer.tool(
-			'find_files',
-			this.getToolDescription('find_files', 'Find files by filename pattern (fast, name-only search)'),
+			'find',
+			this.getToolDescription('find',
+				'Find files and folders in the vault by name, path, tag, or frontmatter property.\n' +
+				'Use pattern to match filenames (e.g., "weekly" finds all files with "weekly" in the name).\n' +
+				'Use path to limit results to a specific folder (e.g., "chaos/inbox").\n' +
+				'Use tag to find files with a specific tag (e.g., "#recipe", "#meeting").\n' +
+				'Use property to match frontmatter values (e.g., {"key": "status", "value": "draft"}).\n' +
+				'Returns file paths with metadata (size, modified time, tags). Does not search file contents — use the search tool for that.'),
 			{
-				pattern: z.string().describe('Pattern to match in filename (case-insensitive)'),
-				path: z.string().optional().describe('Limit search to specific folder (default: entire vault)'),
+				pattern: z.string().optional().describe('Pattern to match in filename (case-insensitive)'),
+				path: z.string().optional().describe('Limit to files under this folder'),
+				tag: z.string().optional().describe('Only files with this tag (e.g., "#recipe")'),
+				property: z.object({
+					key: z.string(),
+					value: z.string(),
+				}).optional().describe('Match frontmatter property (e.g., {"key": "status", "value": "draft"})'),
+				limit: z.number().optional().default(50).describe('Maximum number of results'),
 			},
 			{
 				readOnlyHint: true,
 			},
-			async ({ pattern, path }) => {
-				const allFiles = this.app.vault.getMarkdownFiles();
+			async ({ pattern, path, tag, property, limit }) => {
+				let files = this.app.vault.getMarkdownFiles() as TFile[];
 
-				// Filter by path if specified
-				const filesToSearch = path
-					? allFiles.filter(f => f.path.startsWith(path))
-					: allFiles;
+				// Filter by path
+				if (path) {
+					files = files.filter(f => f.path.startsWith(path));
+				}
 
-				// Search in filename only (not content)
-				const searchRegex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-				const matches = filesToSearch.filter(f => searchRegex.test(f.name) || searchRegex.test(f.path));
+				// Filter by filename pattern
+				if (pattern) {
+					const searchRegex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+					files = files.filter(f => searchRegex.test(f.name) || searchRegex.test(f.path));
+				}
 
-				const summary = `Found ${matches.length} file(s) matching "${pattern}"`;
-				const resultText = matches.length > 0
-					? matches.map(f => f.path).join('\n')
-					: 'No matching files found';
+				// Filter by tag
+				if (tag) {
+					const normalizedTag = tag.startsWith('#') ? tag : `#${tag}`;
+					files = files.filter(f => {
+						const fileTags = this.getFileTags(f);
+						return fileTags.includes(normalizedTag);
+					});
+				}
+
+				// Filter by frontmatter property
+				if (property) {
+					files = files.filter(f => {
+						const cache = this.app.metadataCache.getFileCache(f);
+						if (!cache?.frontmatter) return false;
+						return String(cache.frontmatter[property.key]) === property.value;
+					});
+				}
+
+				// Apply limit
+				const limitedFiles = files.slice(0, limit);
+
+				// Build results with metadata
+				const results = limitedFiles.map(f => {
+					const tags = this.getFileTags(f);
+					return {
+						path: f.path,
+						size: f.stat.size,
+						mtime: f.stat.mtime,
+						tags: tags.length > 0 ? tags : undefined,
+					};
+				});
 
 				return {
-					content: [
-						{
-							type: 'text',
-							text: `${summary}\n\n${resultText}`,
-						},
-					],
+					content: [{
+						type: 'text',
+						text: JSON.stringify(results, null, 2),
+					}],
 					isError: false,
 				};
 			}
@@ -1212,139 +1372,36 @@ export default class WitnessPlugin extends Plugin {
 			);
 		}
 
-		// Semantic Search tool (uses Ollama embeddings + Orama vector store)
-		this.mcpServer.tool(
-			'semantic_search',
-			this.settings.coreToolDescriptions?.semantic_search ||
-				'Search for documents by meaning using semantic similarity, keyword matching, or both. Requires Ollama running with an embedding model.',
-			{
-				query: z.string().describe('Natural language search query'),
-				mode: z.enum(['hybrid', 'vector', 'fulltext']).optional().default('hybrid')
-					.describe('Search mode: hybrid (keyword+semantic, best for most queries), vector (semantic only), fulltext (keyword only)'),
-				limit: z.number().optional().default(10).describe('Maximum number of results to return'),
-				minScore: z.number().optional().default(0.3).describe('Minimum similarity score (0-1, applies to hybrid and vector modes)'),
-				paths: z.array(z.string()).optional().describe('Filter results to documents in these paths'),
-			},
-			{
-				readOnlyHint: true,
-			},
-			async ({ query, mode, limit, minScore, paths }) => {
-				try {
-					// Initialize Ollama provider on first use
-					if (!this.ollamaProvider) {
-						this.ollamaProvider = new OllamaProvider({
-							baseUrl: this.settings.ollamaBaseUrl,
-							model: this.settings.ollamaModel,
-							log: (level, msg, data) => {
-								if (level === 'error') this.logger.error(msg, data);
-								else this.logger.info(msg);
-							},
-						});
-						await this.ollamaProvider.resolveModelInfo();
-					}
+	}
 
-					// Check Ollama availability
-					if (!(await this.ollamaProvider.isAvailable())) {
-						return {
-							content: [
-								{
-									type: 'text',
-									text: 'Ollama is not running. Start Ollama and ensure nomic-embed-text is pulled:\n\n  ollama pull nomic-embed-text',
-								},
-							],
-							isError: true,
-						};
-					}
+	/**
+	 * Parse quoted phrases from a search query.
+	 * Returns the clean query (without quotes) and extracted phrases.
+	 */
+	private parseQuotedPhrases(query: string): { cleanQuery: string; phrases: string[] } {
+		const phrases: string[] = [];
+		const cleanQuery = query.replace(/"([^"]+)"/g, (_, phrase) => {
+			phrases.push(phrase);
+			return phrase; // Keep the words in the query for QPS scoring
+		});
+		return { cleanQuery: cleanQuery.trim(), phrases };
+	}
 
-					// Initialize vector store on first use
-					if (!this.vectorStore) {
-						this.vectorStore = new VectorStore(this.app, this.ollamaProvider);
-						await this.vectorStore.initialize();
-						this.logger.info(`Vector store initialized with ${this.vectorStore.getCount()} documents`);
-
-						// If index is empty or stale, do an incremental index
-						const mdFiles = this.getIndexableFiles();
-						const staleFiles = await this.vectorStore.getStaleFiles(mdFiles);
-
-						if (staleFiles.length > 0) {
-							this.logger.info(`Indexing ${staleFiles.length} new/changed files...`);
-							const result = await this.vectorStore.indexFiles(staleFiles, (done, total) => {
-								this.logger.info(`Indexing progress: ${done}/${total}`);
-							}, (level, msg, data) => {
-								if (level === 'error') this.logger.error(msg, data);
-								else this.logger.info(msg);
-							});
-							await this.vectorStore.save();
-							this.logger.info(`Indexed ${result.indexed} files (${result.failed.length} failed), total: ${this.vectorStore.getCount()}`);
-						}
-					}
-
-					if (this.vectorStore.getCount() === 0) {
-						return {
-							content: [
-								{
-									type: 'text',
-									text: 'No documents indexed yet. Ensure your vault has markdown files and Ollama is running.',
-								},
-							],
-							isError: true,
-						};
-					}
-
-					// Search using the requested mode
-					this.logger.info(`Search (${mode}) for: "${query}"`);
-					let results;
-					if (mode === 'vector') {
-						results = await this.vectorStore.searchVector(query, { limit, minScore, paths });
-					} else if (mode === 'fulltext') {
-						results = await this.vectorStore.searchFulltext(query, { limit, paths });
-					} else {
-						results = await this.vectorStore.searchHybrid(query, { limit, minScore, paths });
-					}
-
-					// Format results
-					if (results.length === 0) {
-						return {
-							content: [
-								{
-									type: 'text',
-									text: `No results found for: "${query}"\n\nTry lowering the minScore (currently ${minScore}) or using different search terms.`,
-								},
-							],
-							isError: false,
-						};
-					}
-
-					const formattedResults = results.map((r, i) => {
-						const section = r.headingPath ? ` > ${r.headingPath.replace(/^##\s*/, '').replace(/ > ###\s*/g, ' > ')}` : '';
-						return `${i + 1}. **${r.path}**${section} (${(r.score * 100).toFixed(1)}%)`;
-					}).join('\n\n');
-
-					return {
-						content: [
-							{
-								type: 'text',
-								text: `Found ${results.length} result(s) for: "${query}"\n\n${formattedResults}`,
-							},
-						],
-						isError: false,
-					};
-				} catch (error) {
-					const errorMessage = error instanceof Error ? error.message : String(error);
-					this.logger.error('Semantic search error:', errorMessage);
-
-					return {
-						content: [
-							{
-								type: 'text',
-								text: `Semantic search failed: ${errorMessage}`,
-							},
-						],
-						isError: true,
-					};
-				}
-			}
-		);
+	/**
+	 * Post-filter search results by exact phrase matching.
+	 * Reads file content and checks if all phrases appear in the matching section.
+	 */
+	private filterByPhrases(results: SearchResult[], phrases: string[]): SearchResult[] {
+		// For now, filter based on snippet content (already available)
+		// A more thorough approach would read the full chunk content
+		return results.filter(r => {
+			const text = (r.snippet || '').toLowerCase();
+			const title = (r.title || '').toLowerCase();
+			return phrases.every(p => {
+				const lower = p.toLowerCase();
+				return text.includes(lower) || title.includes(lower);
+			});
+		});
 	}
 
 	private async handleMCPRequest(req: IncomingMessage, res: ServerResponse) {
@@ -2366,7 +2423,7 @@ class WitnessSettingTab extends PluginSettingTab {
 				});
 				await this.plugin.ollamaProvider.resolveModelInfo();
 			}
-			const vs = new VectorStore(this.app, this.plugin.ollamaProvider);
+			const vs = new OramaSearchEngine(this.app, this.plugin.ollamaProvider);
 			await vs.initialize();
 			// Only assign to plugin if nothing else created one during our await
 			if (!this.plugin.vectorStore) {
@@ -2556,7 +2613,7 @@ class WitnessSettingTab extends PluginSettingTab {
 								return;
 							}
 							if (!this.plugin.vectorStore) {
-								this.plugin.vectorStore = new VectorStore(this.app, this.plugin.ollamaProvider);
+								this.plugin.vectorStore = new OramaSearchEngine(this.app, this.plugin.ollamaProvider);
 								await this.plugin.vectorStore.initialize();
 							}
 							// Capture local reference — prevents null errors if clearIndex/reset runs during indexing
@@ -2570,11 +2627,17 @@ class WitnessSettingTab extends PluginSettingTab {
 							button.setDisabled(true);
 							button.setButtonText('Indexing...');
 							indexStatusSetting.setDesc(`Indexing 0/${staleFiles.length}...`);
-							const result = await vs.indexFiles(staleFiles, (done, total) => {
-								indexStatusSetting.setDesc(`Indexing ${done}/${total}...`);
-							}, (level, msg, data) => {
-								if (level === 'error') this.plugin.logger.error(msg, data);
-								else this.plugin.logger.info(msg);
+							const result = await vs.indexFiles(staleFiles, {
+								generateEmbeddings: true,
+								minContentLength: this.plugin.settings.minContentLength ?? 50,
+								getFileTags: (f) => this.plugin.getFileTags(f),
+								onProgress: (done, total) => {
+									indexStatusSetting.setDesc(`Indexing ${done}/${total}...`);
+								},
+								onLog: (level, msg, data) => {
+									if (level === 'error') this.plugin.logger.error(msg, data);
+									else this.plugin.logger.info(msg);
+								},
 							});
 							await vs.save();
 							button.setDisabled(false);
@@ -2583,10 +2646,10 @@ class WitnessSettingTab extends PluginSettingTab {
 								const failedPreview = result.failed.slice(0, 5).join('\n');
 								const moreText = result.failed.length > 5 ? `\n...and ${result.failed.length - 5} more (see logs)` : '';
 								indexStatusSetting.setDesc(
-									`${result.indexed} documents indexed, ${result.failed.length} failed:\n${failedPreview}${moreText}`
+									`${result.indexed} documents indexed (${result.embedded} with embeddings), ${result.failed.length} failed:\n${failedPreview}${moreText}`
 								);
 							} else {
-								indexStatusSetting.setDesc(`${this.plugin.getIndexCount()} documents indexed`);
+								indexStatusSetting.setDesc(`${this.plugin.getIndexCount()} documents indexed (${result.embedded} with embeddings)`);
 							}
 						} catch (e) {
 							this.plugin.logger.error('Indexing failed', e);

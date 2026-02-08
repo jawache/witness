@@ -1,10 +1,12 @@
 /**
- * Unit tests for VectorStore search modes and helpers.
+ * Unit tests for OramaSearchEngine (formerly VectorStore).
+ * Tests Orama with QPS plugin, schema v5 (tags, folder, optional embeddings).
  * Uses Orama directly with fake embeddings — no Obsidian or Ollama needed.
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import { create, insert, search, searchVector, save, load, count } from '@orama/orama';
+import { pluginQPS } from '@orama/plugin-qps';
 
 const DIMENSIONS = 4;
 
@@ -22,6 +24,8 @@ function createSchema() {
     content: 'string' as const,
     chunkIndex: 'number' as const,
     mtime: 'number' as const,
+    tags: 'enum[]' as const,
+    folder: 'enum' as const,
     embedding: `vector[${DIMENSIONS}]` as const,
   };
 }
@@ -36,6 +40,8 @@ function createTestDocs() {
       content: 'Carbon accounting measures CO2 emissions from organizations',
       chunkIndex: 0,
       mtime: 1000,
+      tags: ['#topic', '#climate'],
+      folder: 'topics',
       embedding: fakeEmbedding(1),
     },
     {
@@ -46,6 +52,8 @@ function createTestDocs() {
       content: 'Green software reduces greenhouse gas emissions from computing',
       chunkIndex: 0,
       mtime: 2000,
+      tags: ['#topic', '#software'],
+      folder: 'topics',
       embedding: fakeEmbedding(2),
     },
     {
@@ -56,6 +64,8 @@ function createTestDocs() {
       content: 'The principles of green software include energy efficiency and hardware efficiency',
       chunkIndex: 1,
       mtime: 2000,
+      tags: ['#topic', '#software'],
+      folder: 'topics',
       embedding: fakeEmbedding(5),
     },
     {
@@ -66,6 +76,8 @@ function createTestDocs() {
       content: 'Quantum computing uses qubits for parallel computation',
       chunkIndex: 0,
       mtime: 3000,
+      tags: ['#topic'],
+      folder: 'topics',
       embedding: fakeEmbedding(3),
     },
     {
@@ -76,6 +88,8 @@ function createTestDocs() {
       content: 'This vault contains notes about various topics',
       chunkIndex: 0,
       mtime: 4000,
+      tags: [],
+      folder: 'notes',
       embedding: fakeEmbedding(4),
     },
   ];
@@ -84,14 +98,18 @@ function createTestDocs() {
 let dbCounter = 0;
 async function createPopulatedDb() {
   const docs = createTestDocs();
-  const db = create({ schema: createSchema(), id: `test-vectors-${++dbCounter}` });
+  const db = create({
+    schema: createSchema(),
+    id: `test-vectors-${++dbCounter}`,
+    plugins: [pluginQPS()],
+  });
   for (const doc of docs) {
     await insert(db, doc);
   }
   return db;
 }
 
-describe('Fulltext search (BM25)', () => {
+describe('Fulltext search (QPS)', () => {
   let db: any;
 
   beforeAll(async () => {
@@ -197,7 +215,7 @@ describe('Vector search (cosine)', () => {
   });
 });
 
-describe('Hybrid search (BM25 + vector)', () => {
+describe('Hybrid search (QPS + vector)', () => {
   let db: any;
 
   beforeAll(async () => {
@@ -241,6 +259,126 @@ describe('Hybrid search (BM25 + vector)', () => {
   });
 });
 
+describe('Documents without embeddings', () => {
+  it('should index and find documents without embedding field', async () => {
+    const db = create({
+      schema: createSchema(),
+      id: `test-no-embed-${++dbCounter}`,
+      plugins: [pluginQPS()],
+    });
+
+    // Insert a document WITHOUT the embedding field
+    await insert(db, {
+      id: 'no-embed.md#0',
+      sourcePath: 'no-embed.md',
+      title: 'No Embedding Document',
+      headingPath: '',
+      content: 'This document has no embedding vector but should be findable via fulltext',
+      chunkIndex: 0,
+      mtime: 5000,
+      tags: ['#test'],
+      folder: 'notes',
+      // Note: no embedding field
+    });
+
+    // Should be findable via fulltext search
+    const results = await search(db, {
+      term: 'embedding vector',
+      properties: ['title', 'content'],
+      limit: 10,
+    });
+
+    expect(results.hits.length).toBeGreaterThan(0);
+    expect((results.hits[0].document as any).sourcePath).toBe('no-embed.md');
+  });
+
+  it('should have correct count including docs without embeddings', async () => {
+    const db = create({
+      schema: createSchema(),
+      id: `test-mixed-embed-${++dbCounter}`,
+      plugins: [pluginQPS()],
+    });
+
+    // One doc with embedding
+    await insert(db, {
+      id: 'with-embed.md#0',
+      sourcePath: 'with-embed.md',
+      title: 'With Embedding',
+      headingPath: '',
+      content: 'This has an embedding',
+      chunkIndex: 0,
+      mtime: 1000,
+      tags: [],
+      folder: '',
+      embedding: fakeEmbedding(1),
+    });
+
+    // One doc without
+    await insert(db, {
+      id: 'without-embed.md#0',
+      sourcePath: 'without-embed.md',
+      title: 'Without Embedding',
+      headingPath: '',
+      content: 'This does not have an embedding',
+      chunkIndex: 0,
+      mtime: 2000,
+      tags: [],
+      folder: '',
+    });
+
+    expect(count(db)).toBe(2);
+  });
+});
+
+describe('Tag and folder metadata', () => {
+  let db: any;
+
+  beforeAll(async () => {
+    db = await createPopulatedDb();
+  });
+
+  it('should store and retrieve tags', async () => {
+    const results = await search(db, {
+      term: 'carbon',
+      properties: ['title', 'content'],
+      limit: 10,
+    });
+
+    expect(results.hits.length).toBeGreaterThan(0);
+    const doc = results.hits[0].document as any;
+    expect(doc.tags).toContain('#topic');
+    expect(doc.tags).toContain('#climate');
+  });
+
+  it('should store and retrieve folder', async () => {
+    const results = await search(db, {
+      term: 'carbon',
+      properties: ['title', 'content'],
+      limit: 10,
+    });
+
+    expect(results.hits.length).toBeGreaterThan(0);
+    expect((results.hits[0].document as any).folder).toBe('topics');
+  });
+
+  it('should filter by tag using where clause', async () => {
+    // Search for docs with #climate tag
+    const results = await search(db, {
+      term: 'emissions',
+      properties: ['title', 'content'],
+      limit: 10,
+      where: { tags: { containsAll: ['#climate'] } },
+    } as any);
+
+    // Only carbon.md has #climate tag
+    expect(results.hits.length).toBeGreaterThan(0);
+    const paths = results.hits.map((h: any) => h.document.sourcePath);
+    expect(paths).toContain('topics/carbon.md');
+    // green.md also mentions emissions but doesn't have #climate
+    expect(paths).not.toContain('topics/green.md');
+  });
+});
+
 describe('Path filtering (deduplication logic)', () => {
   it('should filter results by path prefix', async () => {
     const db = await createPopulatedDb();
@@ -278,11 +416,6 @@ describe('Path filtering (deduplication logic)', () => {
       limit: 10,
     });
 
-    // May return multiple chunks from green.md
-    const greenHits = results.hits.filter((h: any) =>
-      h.document.sourcePath === 'topics/green.md'
-    );
-
     // Simulate deduplication: keep best per sourcePath
     const bestPerFile = new Map<string, { path: string; score: number }>();
     for (const hit of results.hits) {
@@ -299,9 +432,8 @@ describe('Path filtering (deduplication logic)', () => {
   });
 });
 
-describe('BM25 score normalization', () => {
+describe('Score normalization', () => {
   it('should normalize scores > 1 relative to top result', () => {
-    // Simulate what searchFulltext does
     const rawResults = [
       { path: 'a.md', title: 'A', score: 3.4 },
       { path: 'b.md', title: 'B', score: 1.2 },
@@ -326,7 +458,6 @@ describe('BM25 score normalization', () => {
     const maxScore = results[0].score;
     // The normalization only triggers if maxScore > 1
     if (maxScore > 1) {
-      // Would normalize — but it shouldn't in this case
       expect(true).toBe(false);
     }
 
@@ -341,18 +472,22 @@ describe('Schema versioning', () => {
     const db = await createPopulatedDb();
     const data = save(db);
 
-    // Simulate what VectorStore.save() does
-    const SCHEMA_VERSION = 3;
+    // Simulate what OramaSearchEngine.save() does
+    const SCHEMA_VERSION = 5;
     const envelope = { schemaVersion: SCHEMA_VERSION, data };
     const json = JSON.stringify(envelope);
 
     // Parse and verify envelope structure
     const parsed = JSON.parse(json);
-    expect(parsed.schemaVersion).toBe(3);
+    expect(parsed.schemaVersion).toBe(5);
     expect(parsed.data).toBeDefined();
 
-    // Simulate what VectorStore.initialize() does — load from envelope
-    const newDb = create({ schema: createSchema(), id: 'test-load' });
+    // Simulate what OramaSearchEngine.initialize() does — load from envelope
+    const newDb = create({
+      schema: createSchema(),
+      id: 'test-load',
+      plugins: [pluginQPS()],
+    });
     const loadedData = parsed.data;
     load(newDb, loadedData);
 
@@ -360,24 +495,70 @@ describe('Schema versioning', () => {
   });
 
   it('should detect old schema version (missing schemaVersion)', () => {
-    // Old format: raw Orama data without envelope
     const oldData = { some: 'raw-orama-data' };
     const version = (oldData as any).schemaVersion ?? 1;
 
     expect(version).toBe(1); // Missing field defaults to v1
   });
 
-  it('should detect old schema version (explicit v2)', () => {
-    const envelope = { schemaVersion: 2, data: {} };
-    const SCHEMA_VERSION = 3;
+  it('should detect old schema version (explicit v3)', () => {
+    const envelope = { schemaVersion: 3, data: {} };
+    const SCHEMA_VERSION = 5;
 
     expect(envelope.schemaVersion < SCHEMA_VERSION).toBe(true);
   });
 
   it('should accept current schema version', () => {
-    const envelope = { schemaVersion: 3, data: {} };
-    const SCHEMA_VERSION = 3;
+    const envelope = { schemaVersion: 5, data: {} };
+    const SCHEMA_VERSION = 5;
 
     expect(envelope.schemaVersion < SCHEMA_VERSION).toBe(false);
+  });
+});
+
+describe('QPS proximity scoring', () => {
+  it('should rank adjacent words higher than scattered words', async () => {
+    const db = create({
+      schema: createSchema(),
+      id: `test-proximity-${++dbCounter}`,
+      plugins: [pluginQPS()],
+    });
+
+    // Document where "green software" appears as adjacent words
+    await insert(db, {
+      id: 'adjacent.md#0',
+      sourcePath: 'adjacent.md',
+      title: 'Adjacent',
+      headingPath: '',
+      content: 'This document discusses green software engineering practices',
+      chunkIndex: 0,
+      mtime: 1000,
+      tags: [],
+      folder: '',
+    });
+
+    // Document where "green" and "software" are scattered
+    await insert(db, {
+      id: 'scattered.md#0',
+      sourcePath: 'scattered.md',
+      title: 'Scattered',
+      headingPath: '',
+      content: 'The green meadow has nothing to do with software development in general',
+      chunkIndex: 0,
+      mtime: 2000,
+      tags: [],
+      folder: '',
+    });
+
+    const results = await search(db, {
+      term: 'green software',
+      properties: ['content'],
+      limit: 10,
+    });
+
+    expect(results.hits.length).toBe(2);
+    // Adjacent document should rank higher with QPS
+    expect((results.hits[0].document as any).sourcePath).toBe('adjacent.md');
+    expect(results.hits[0].score).toBeGreaterThan(results.hits[1].score);
   });
 });

@@ -38,7 +38,7 @@ describe('MCP Server Integration Tests', () => {
       expect(toolNames).toContain('list_files');
       expect(toolNames).toContain('edit_file');
       expect(toolNames).toContain('search');
-      expect(toolNames).toContain('find_files');
+      expect(toolNames).toContain('find');
       expect(toolNames).toContain('move_file');
       expect(toolNames).toContain('execute_command');
       expect(toolNames).toContain('get_orientation');
@@ -165,15 +165,15 @@ describe('MCP Server Integration Tests', () => {
   });
 
   describe('search', () => {
-    it('should find text across files', async () => {
-      const result = await client.callTool('search', { query: 'Hello World' });
+    it('should find text across files (fulltext mode)', async () => {
+      const result = await client.callTool('search', { query: 'Hello World', mode: 'fulltext' });
       const content = getTextContent(result);
 
       expect(content).toContain('test-read.md');
     });
 
     it('should return empty for non-matching query', async () => {
-      const result = await client.callTool('search', { query: 'xyznonexistentxyz' });
+      const result = await client.callTool('search', { query: 'xyznonexistentxyz', mode: 'fulltext' });
       const content = getTextContent(result);
 
       // Should either be empty or indicate no matches
@@ -181,16 +181,16 @@ describe('MCP Server Integration Tests', () => {
     });
   });
 
-  describe('find_files', () => {
+  describe('find', () => {
     it('should find files by name pattern', async () => {
-      const result = await client.callTool('find_files', { pattern: 'test' });
+      const result = await client.callTool('find', { pattern: 'test' });
       const content = getTextContent(result);
 
       expect(content).toContain('test-read.md');
     });
 
     it('should find nested files', async () => {
-      const result = await client.callTool('find_files', { pattern: 'nested' });
+      const result = await client.callTool('find', { pattern: 'nested' });
       const content = getTextContent(result);
 
       expect(content).toContain('nested.md');
@@ -412,7 +412,7 @@ describe('MCP Server Integration Tests', () => {
     });
   });
 
-  describe('semantic_search', () => {
+  describe('search (semantic modes)', () => {
     // Check if Ollama is available — skip tests gracefully if not
     let ollamaAvailable = false;
 
@@ -428,7 +428,7 @@ describe('MCP Server Integration Tests', () => {
     it('should return results for hybrid search (default mode)', async () => {
       if (!ollamaAvailable) return;
 
-      const result = await client.callTool('semantic_search', {
+      const result = await client.callTool('search', {
         query: 'carbon emissions',
       });
 
@@ -440,7 +440,7 @@ describe('MCP Server Integration Tests', () => {
     it('should return results for vector search', async () => {
       if (!ollamaAvailable) return;
 
-      const result = await client.callTool('semantic_search', {
+      const result = await client.callTool('search', {
         query: 'carbon emissions',
         mode: 'vector',
       });
@@ -450,48 +450,32 @@ describe('MCP Server Integration Tests', () => {
       expect(content).toContain('carbon-accounting');
     });
 
-    it('should return results for fulltext search', async () => {
+    it('should return structured JSON results', async () => {
       if (!ollamaAvailable) return;
 
-      const result = await client.callTool('semantic_search', {
+      const result = await client.callTool('search', {
         query: 'carbon',
         mode: 'fulltext',
       });
 
       expect(result.isError).not.toBe(true);
       const content = getTextContent(result);
-      expect(content).toContain('carbon-accounting');
+      // Results are now structured JSON
+      const parsed = JSON.parse(content);
+      expect(Array.isArray(parsed)).toBe(true);
+      expect(parsed.length).toBeGreaterThan(0);
+      expect(parsed[0]).toHaveProperty('path');
+      expect(parsed[0]).toHaveProperty('title');
+      expect(parsed[0]).toHaveProperty('score');
     });
 
-    it('should return different result counts per mode', async () => {
+    it('should filter results by path', async () => {
       if (!ollamaAvailable) return;
 
-      // Fulltext for "carbon" should only find docs containing the word
-      const fulltext = await client.callTool('semantic_search', {
+      const result = await client.callTool('search', {
         query: 'carbon',
         mode: 'fulltext',
-      });
-      const fulltextContent = getTextContent(fulltext);
-
-      // Vector should find more docs via semantic similarity
-      const vector = await client.callTool('semantic_search', {
-        query: 'carbon',
-        mode: 'vector',
-      });
-      const vectorContent = getTextContent(vector);
-
-      const fulltextCount = (fulltextContent.match(/\d+\.\s\*\*/g) || []).length;
-      const vectorCount = (vectorContent.match(/\d+\.\s\*\*/g) || []).length;
-      expect(vectorCount).toBeGreaterThan(fulltextCount);
-    });
-
-    it('should filter results by paths', async () => {
-      if (!ollamaAvailable) return;
-
-      const result = await client.callTool('semantic_search', {
-        query: 'carbon',
-        mode: 'fulltext',
-        paths: ['topics/'],
+        path: 'topics/',
       });
 
       expect(result.isError).not.toBe(true);
@@ -502,7 +486,7 @@ describe('MCP Server Integration Tests', () => {
     it('should respect limit parameter', async () => {
       if (!ollamaAvailable) return;
 
-      const result = await client.callTool('semantic_search', {
+      const result = await client.callTool('search', {
         query: 'test',
         mode: 'vector',
         limit: 2,
@@ -510,8 +494,8 @@ describe('MCP Server Integration Tests', () => {
 
       expect(result.isError).not.toBe(true);
       const content = getTextContent(result);
-      const matchCount = (content.match(/\d+\.\s\*\*/g) || []).length;
-      expect(matchCount).toBeLessThanOrEqual(2);
+      const parsed = JSON.parse(content);
+      expect(parsed.length).toBeLessThanOrEqual(2);
     });
   });
 

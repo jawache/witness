@@ -1,21 +1,28 @@
 /**
- * Vector store backed by Orama.
- * Stores chunk embeddings and supports hybrid (BM25 + vector),
+ * OramaSearchEngine — SearchEngine implementation backed by Orama.
+ * Stores chunk embeddings and supports hybrid (QPS + vector),
  * vector-only, and fulltext-only search modes.
  * Documents are split into chunks by markdown headings for better retrieval.
  * Persists to .witness/index.orama as a single JSON file.
+ *
+ * Schema v5: sourcePath, title, headingPath, content, chunkIndex, mtime,
+ * tags (enum[]), folder (enum), embedding (optional vector).
+ * Uses QPS (Quantum Proximity Scoring) instead of BM25 for better phrase matching.
  */
 
 import { create, insert, remove, search, searchVector, save, load, count, getByID } from '@orama/orama';
+import { pluginQPS } from '@orama/plugin-qps';
 import type { AnyOrama, RawData } from '@orama/orama';
 import type { App, TFile } from 'obsidian';
 import { OllamaProvider } from './ollama-provider';
 import { chunkMarkdown } from './chunker';
+import type { SearchEngine, SearchOptions, SearchResult, IndexFileOptions } from './search-engine';
 
 const STORE_PATH = '.witness/index.orama';
 
 // Bump this when the schema changes to force re-indexing on upgrade.
-const SCHEMA_VERSION = 3; // v1 = vector-only, v2 = hybrid (content), v3 = chunked (sourcePath, headingPath, chunkIndex)
+// v1 = vector-only, v2 = hybrid (content), v3 = chunked, v4 = skipped, v5 = QPS + tags + folder + optional embeddings
+const SCHEMA_VERSION = 5;
 
 interface ChunkDocument {
 	sourcePath: string;
@@ -24,18 +31,15 @@ interface ChunkDocument {
 	content: string;
 	chunkIndex: number;
 	mtime: number;
+	tags: string[];
+	folder: string;
 	embedding: number[];
 }
 
-export interface SearchResult {
-	path: string;
-	title: string;
-	score: number;
-	headingPath?: string;
-	snippet?: string;
-}
+// Re-export SearchResult for backwards compatibility
+export type { SearchResult } from './search-engine';
 
-export class VectorStore {
+export class OramaSearchEngine implements SearchEngine {
 	private db: AnyOrama | null = null;
 	private app: App;
 	private ollama: OllamaProvider;
@@ -55,8 +59,18 @@ export class VectorStore {
 			content: 'string' as const,
 			chunkIndex: 'number' as const,
 			mtime: 'number' as const,
+			tags: 'enum[]' as const,
+			folder: 'enum' as const,
 			embedding: `vector[${this.dimensions}]` as const,
 		};
+	}
+
+	private createDb() {
+		return create({
+			schema: this.getSchema(),
+			id: 'witness-vectors',
+			plugins: [pluginQPS()],
+		});
 	}
 
 	/**
@@ -64,8 +78,7 @@ export class VectorStore {
 	 * otherwise creates a fresh empty database.
 	 */
 	async initialize(): Promise<void> {
-		const schema = this.getSchema();
-		this.db = create({ schema, id: 'witness-vectors' });
+		this.db = this.createDb();
 
 		// Try to load existing index
 		if (await this.app.vault.adapter.exists(STORE_PATH)) {
@@ -76,8 +89,8 @@ export class VectorStore {
 				// Check schema version — discard old indexes to force re-index
 				const version = envelope.schemaVersion ?? 1;
 				if (version < SCHEMA_VERSION) {
-					console.warn(`VectorStore: Schema v${version} → v${SCHEMA_VERSION}, discarding old index`);
-					this.db = create({ schema, id: 'witness-vectors' });
+					console.warn(`OramaSearchEngine: Schema v${version} → v${SCHEMA_VERSION}, discarding old index`);
+					this.db = this.createDb();
 					return;
 				}
 
@@ -85,8 +98,8 @@ export class VectorStore {
 				load(this.db, data);
 			} catch (e) {
 				// Corrupted or incompatible index — start fresh
-				console.warn('VectorStore: Failed to load saved index, starting fresh:', e);
-				this.db = create({ schema, id: 'witness-vectors' });
+				console.warn('OramaSearchEngine: Failed to load saved index, starting fresh:', e);
+				this.db = this.createDb();
 			}
 		}
 	}
@@ -116,26 +129,31 @@ export class VectorStore {
 	}
 
 	/**
-	 * Index a single file: read content, chunk by headings, generate embeddings, store in Orama.
+	 * Index a single file's content into the search engine.
+	 * Content is chunked by headings. Tags and folder are stored as metadata.
+	 * Embeddings are optional — files without embeddings are still fulltext-searchable.
 	 */
-	async indexFile(file: TFile): Promise<void> {
-		if (!this.db) throw new Error('VectorStore not initialized');
+	async indexFile(file: TFile, content: string, options?: IndexFileOptions): Promise<void> {
+		if (!this.db) throw new Error('OramaSearchEngine not initialized');
 
-		const content = await this.app.vault.cachedRead(file);
 		const chunks = chunkMarkdown(content);
 
 		// Remove all existing chunks for this file
-		await this.removeBySourcePath(file.path);
+		await this.removeFile(file.path);
 
-		// Embed all chunks — prepend heading path for context
-		const textsToEmbed = chunks.map(c =>
-			c.headingPath ? `${c.headingPath}\n${c.content}` : c.content
-		);
-		const embeddings = await this.ollama.embedDocuments(textsToEmbed);
+		const tags = options?.tags ?? [];
+		const folder = options?.folder ?? '';
+
+		// Generate embeddings if we have an Ollama provider and no pre-computed embeddings
+		let embeddings: number[][] | null = null;
+		if (options?.embedding) {
+			// Single pre-computed embedding — only valid for single-chunk docs
+			embeddings = [options.embedding];
+		}
 
 		// Insert each chunk
 		for (let i = 0; i < chunks.length; i++) {
-			await insert(this.db, {
+			const doc: Record<string, unknown> = {
 				id: `${file.path}#${i}`,
 				sourcePath: file.path,
 				title: file.basename,
@@ -143,40 +161,57 @@ export class VectorStore {
 				content: chunks[i].content,
 				chunkIndex: i,
 				mtime: file.stat.mtime,
-				embedding: embeddings[i],
-			});
+				tags,
+				folder,
+			};
+
+			// Only add embedding if we have one for this chunk
+			if (embeddings && embeddings[i]) {
+				doc.embedding = embeddings[i];
+			}
+
+			await insert(this.db, doc);
 		}
 	}
 
 	/**
-	 * Index multiple files in batches for efficiency.
+	 * Index multiple files with two-phase approach:
+	 * Phase 1: Content + metadata (always succeeds)
+	 * Phase 2: Embeddings (may fail — files remain fulltext-searchable)
 	 */
 	async indexFiles(
 		files: TFile[],
-		onProgress?: (done: number, total: number) => void,
-		onLog?: (level: string, message: string, data?: any) => void,
-	): Promise<{ indexed: number; failed: string[] }> {
-		if (!this.db) throw new Error('VectorStore not initialized');
+		options?: {
+			generateEmbeddings?: boolean;
+			minContentLength?: number;
+			getFileTags?: (file: TFile) => string[];
+			onProgress?: (done: number, total: number) => void;
+			onLog?: (level: string, message: string, data?: any) => void;
+		},
+	): Promise<{ indexed: number; embedded: number; failed: string[] }> {
+		if (!this.db) throw new Error('OramaSearchEngine not initialized');
 
 		let indexed = 0;
+		let embedded = 0;
 		const failed: string[] = [];
 		const total = files.length;
+		const generateEmbeddings = options?.generateEmbeddings ?? true;
+		const minContentLength = options?.minContentLength ?? 0;
 
 		for (const file of files) {
 			try {
 				const content = await this.app.vault.cachedRead(file);
 				const chunks = chunkMarkdown(content);
 
-				await this.removeBySourcePath(file.path);
+				await this.removeFile(file.path);
 
-				// Embed all chunks for this file — prepend heading path for context
-				const textsToEmbed = chunks.map(c =>
-					c.headingPath ? `${c.headingPath}\n${c.content}` : c.content
-				);
-				const embeddings = await this.ollama.embedDocuments(textsToEmbed);
+				// Extract metadata
+				const tags = options?.getFileTags?.(file) ?? [];
+				const folder = this.extractFolder(file.path);
 
+				// Phase 1: Insert content + metadata (no embeddings yet)
 				for (let i = 0; i < chunks.length; i++) {
-					await insert(this.db, {
+					const doc: Record<string, unknown> = {
 						id: `${file.path}#${i}`,
 						sourcePath: file.path,
 						title: file.basename,
@@ -184,27 +219,68 @@ export class VectorStore {
 						content: chunks[i].content,
 						chunkIndex: i,
 						mtime: file.stat.mtime,
-						embedding: embeddings[i],
-					});
+						tags,
+						folder,
+					};
+					await insert(this.db, doc);
 				}
 
 				indexed++;
+
+				// Phase 2: Generate embeddings if enabled and file is large enough
+				if (generateEmbeddings && file.stat.size >= minContentLength) {
+					try {
+						const textsToEmbed = chunks.map(c =>
+							c.headingPath ? `${c.headingPath}\n${c.content}` : c.content
+						);
+						const embeddings = await this.ollama.embedDocuments(textsToEmbed);
+
+						// Remove and re-insert with embeddings
+						for (let i = 0; i < chunks.length; i++) {
+							await remove(this.db, `${file.path}#${i}`);
+							await insert(this.db, {
+								id: `${file.path}#${i}`,
+								sourcePath: file.path,
+								title: file.basename,
+								headingPath: chunks[i].headingPath,
+								content: chunks[i].content,
+								chunkIndex: i,
+								mtime: file.stat.mtime,
+								tags,
+								folder,
+								embedding: embeddings[i],
+							});
+						}
+						embedded++;
+					} catch (e) {
+						// Embedding failed — file is still indexed for fulltext search
+						options?.onLog?.('warn', `Embedding failed for ${file.path}: ${(e as Error).message}`);
+					}
+				}
 			} catch (e) {
 				failed.push(file.path);
-				onLog?.('error', `Failed to index ${file.path}: ${(e as Error).message}`);
+				options?.onLog?.('error', `Failed to index ${file.path}: ${(e as Error).message}`);
 			}
 
-			onProgress?.(indexed + failed.length, total);
+			options?.onProgress?.(indexed + failed.length, total);
 		}
 
-		return { indexed, failed };
+		return { indexed, embedded, failed };
+	}
+
+	/**
+	 * Extract top-level folder from path (e.g., "chaos/inbox/note.md" → "chaos").
+	 */
+	private extractFolder(path: string): string {
+		const firstSlash = path.indexOf('/');
+		return firstSlash > 0 ? path.slice(0, firstSlash) : '';
 	}
 
 	/**
 	 * Remove all chunks for a given source file path.
 	 * Chunks have IDs like "filepath#0", "filepath#1", etc.
 	 */
-	async removeBySourcePath(filePath: string): Promise<void> {
+	async removeFile(filePath: string): Promise<void> {
 		if (!this.db) return;
 
 		// Try removing chunks by sequential ID pattern
@@ -222,7 +298,7 @@ export class VectorStore {
 			}
 		}
 
-		// Also try the bare path (legacy single-chunk entries from schema v2)
+		// Also try the bare path (legacy single-chunk entries from older schemas)
 		try {
 			const existing = getByID(this.db, filePath);
 			if (existing) {
@@ -234,25 +310,39 @@ export class VectorStore {
 	}
 
 	/**
-	 * Hybrid search: BM25 keyword matching + vector cosine similarity,
-	 * merged via Reciprocal Rank Fusion (RRF).
-	 * Deduplicates by sourcePath, keeping the highest-scoring chunk per file.
+	 * Unified search: dispatches to hybrid, vector, or fulltext based on mode.
+	 * Supports path and tag filtering via Orama where clauses.
 	 */
-	async searchHybrid(
-		query: string,
-		options?: { limit?: number; minScore?: number; paths?: string[] }
-	): Promise<SearchResult[]> {
-		if (!this.db) throw new Error('VectorStore not initialized');
+	async search(query: string, options: SearchOptions): Promise<SearchResult[]> {
+		if (!this.db) throw new Error('OramaSearchEngine not initialized');
 
-		const limit = options?.limit ?? 10;
-		const minScore = options?.minScore ?? 0.3;
+		switch (options.mode) {
+			case 'hybrid':
+				return this.searchHybrid(query, options);
+			case 'vector':
+				return this.searchVector(query, options);
+			case 'fulltext':
+				return this.searchFulltext(query, options);
+			default:
+				return this.searchHybrid(query, options);
+		}
+	}
+
+	/**
+	 * Hybrid search: QPS keyword matching + vector cosine similarity,
+	 * merged via Reciprocal Rank Fusion (RRF).
+	 */
+	private async searchHybrid(
+		query: string,
+		options: SearchOptions,
+	): Promise<SearchResult[]> {
+		const limit = options.limit ?? 10;
+		const minScore = options.minScore ?? 0.3;
+		const fetchLimit = limit * 5;
 
 		const queryEmbedding = await this.ollama.embedQuery(query);
 
-		// Fetch more results than needed to account for deduplication
-		const fetchLimit = limit * 5;
-
-		const results = await search(this.db, {
+		const searchParams: Record<string, unknown> = {
 			mode: 'hybrid',
 			term: query,
 			vector: { value: queryEmbedding, property: 'embedding' },
@@ -260,64 +350,90 @@ export class VectorStore {
 			similarity: minScore,
 			limit: fetchLimit,
 			hybridWeights: { text: 0.3, vector: 0.7 },
-		} as any);
+		};
 
-		return this.deduplicateAndFilter(results.hits, options?.paths, limit);
+		const where = this.buildWhereClause(options);
+		if (where) searchParams.where = where;
+
+		const results = await search(this.db!, searchParams as any);
+		return this.deduplicateAndFilter(results.hits, options.paths, limit);
 	}
 
 	/**
 	 * Vector-only search: cosine similarity on embeddings.
-	 * Deduplicates by sourcePath, keeping the highest-scoring chunk per file.
 	 */
-	async searchVector(
+	private async searchVector(
 		query: string,
-		options?: { limit?: number; minScore?: number; paths?: string[] }
+		options: SearchOptions,
 	): Promise<SearchResult[]> {
-		if (!this.db) throw new Error('VectorStore not initialized');
-
-		const limit = options?.limit ?? 10;
-		const minScore = options?.minScore ?? 0.3;
+		const limit = options.limit ?? 10;
+		const minScore = options.minScore ?? 0.3;
+		const fetchLimit = limit * 5;
 
 		const queryEmbedding = await this.ollama.embedQuery(query);
 
-		const fetchLimit = limit * 5;
-
-		const results = await searchVector(this.db, {
+		const searchParams: Record<string, unknown> = {
 			mode: 'vector',
 			vector: { value: queryEmbedding, property: 'embedding' },
 			similarity: minScore,
 			limit: fetchLimit,
-		});
+		};
 
-		return this.deduplicateAndFilter(results.hits, options?.paths, limit);
+		const where = this.buildWhereClause(options);
+		if (where) searchParams.where = where;
+
+		const results = await searchVector(this.db!, searchParams as any);
+		return this.deduplicateAndFilter(results.hits, options.paths, limit);
 	}
 
 	/**
-	 * Fulltext-only search: BM25 keyword matching, no embeddings needed.
-	 * Deduplicates by sourcePath, keeping the highest-scoring chunk per file.
+	 * Fulltext-only search: QPS keyword matching, no embeddings needed.
 	 */
-	async searchFulltext(
+	private async searchFulltext(
 		query: string,
-		options?: { limit?: number; paths?: string[] }
+		options: SearchOptions,
 	): Promise<SearchResult[]> {
-		if (!this.db) throw new Error('VectorStore not initialized');
-
-		const limit = options?.limit ?? 10;
+		const limit = options.limit ?? 10;
 		const fetchLimit = limit * 5;
 
-		const results = await search(this.db, {
+		const searchParams: Record<string, unknown> = {
 			term: query,
 			properties: ['title', 'content'],
 			limit: fetchLimit,
-		});
+		};
 
-		// Normalize BM25 scores to 0-1 range (relative to top result)
-		const deduped = this.deduplicateAndFilter(results.hits, options?.paths, limit);
+		const where = this.buildWhereClause(options);
+		if (where) searchParams.where = where;
+
+		const results = await search(this.db!, searchParams as any);
+
+		// Normalize scores to 0-1 range (relative to top result)
+		const deduped = this.deduplicateAndFilter(results.hits, options.paths, limit);
 		const maxScore = deduped.length > 0 ? deduped[0].score : 1;
 		if (maxScore > 1) {
 			return deduped.map((r) => ({ ...r, score: r.score / maxScore }));
 		}
 		return deduped;
+	}
+
+	/**
+	 * Build Orama where clause from search options.
+	 * Supports tag filtering (enum[] containsAll) and folder filtering.
+	 */
+	private buildWhereClause(options: SearchOptions): Record<string, unknown> | null {
+		const conditions: Record<string, unknown>[] = [];
+
+		if (options.tags?.length) {
+			conditions.push({ tags: { containsAll: options.tags } });
+		}
+
+		// Path filtering can be done both via where (folder enum) and post-filter (paths prefix)
+		// Use folder enum for top-level folder filtering if a single path matches a folder
+		// Post-filtering via deduplicateAndFilter handles arbitrary path prefixes
+
+		if (conditions.length === 0) return null;
+		if (conditions.length === 1) return conditions[0];
+		return { and: conditions };
 	}
 
 	/**
@@ -409,8 +525,7 @@ export class VectorStore {
 	 * Clear the entire index and delete the stored file.
 	 */
 	async clear(): Promise<void> {
-		const schema = this.getSchema();
-		this.db = create({ schema, id: 'witness-vectors' });
+		this.db = this.createDb();
 
 		if (await this.app.vault.adapter.exists(STORE_PATH)) {
 			await this.app.vault.adapter.remove(STORE_PATH);
@@ -421,3 +536,6 @@ export class VectorStore {
 		this.db = null;
 	}
 }
+
+// Backwards compatibility alias
+export const VectorStore = OramaSearchEngine;

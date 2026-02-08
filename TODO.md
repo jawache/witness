@@ -2,8 +2,6 @@
 
 ## High Priority
 
-- [ ] [Unified search](docs/features/unified-search.md) — Consolidate search/semantic_search/find_files into two tools (search + find), switch BM25 → QPS, add tag/path filtering, index all files with optional embeddings.
-
 ## Next Up
 
 - [ ] [Chaos triage](docs/features/chaos-triage.md) — MCP tools and prompt for processing chaos items one at a time (get_next_chaos, triage_chaos)
@@ -34,3 +32,4 @@ Implement Cloudflare Tunnel or similar for remote access to the MCP server from 
 - [x] Tabbed settings UI with Ollama configuration and model pull
 - [x] Hybrid search — BM25 + semantic via Orama's built-in hybrid mode with RRF
 - [x] Unit + integration test suite (53 tests)
+- [x] [Unified search](docs/features/unified-search.md) — Consolidated search/semantic_search/find_files into two tools (search + find), QPS scoring, tag/path filtering, two-phase indexing

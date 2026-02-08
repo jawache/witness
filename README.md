@@ -29,21 +29,20 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
-**15 MCP Tools Available**:
+**14 MCP Tools Available**:
 
 - `read_file` - Read file contents (with optional Dataview rendering)
 - `write_file` - Create/modify files
 - `list_files` - Browse directories
 - `edit_file` - Find and replace text
-- `search` - Full-text search with filters
-- `find_files` - Search files by name pattern
+- `search` - Unified content search: hybrid (keyword + semantic), vector, or fulltext modes with tag/path filtering
+- `find` - Find files by name, path, tag, or frontmatter property with metadata
 - `move_file` - Move or rename files
 - `copy_file` - Copy files to new location
 - `create_folder` - Create folders (with mkdir -p support)
 - `delete` - Delete files/folders (with trash support)
 - `execute_command` - Run Obsidian commands
 - `get_vault_context` - Load your vault's context document (auto-renders Dataview)
-- `semantic_search` - Find documents by meaning (requires Ollama with an embedding model)
 - `dataview_query` - Execute Dataview queries, get structured vault data (requires Dataview plugin)
 - `copy-obsidian-url` - Copy the internal Obsidian URL for the current file
 
@@ -306,11 +305,11 @@ Witness provides semantic search powered by [Ollama](https://ollama.com/) for lo
 
 #### Search Modes
 
-The `semantic_search` MCP tool (and the Search panel) supports three modes:
+The `search` MCP tool (and the Search panel) supports three modes:
 
-- **Hybrid** (default): Combines BM25 keyword matching with vector cosine similarity using Reciprocal Rank Fusion (RRF). Best for most queries — gets the precision of keywords with the recall of semantic understanding. Weighted 30% text / 70% vector.
+- **Hybrid** (default): Combines QPS keyword matching with vector cosine similarity. Best for most queries — gets the precision of keywords with the recall of semantic understanding.
 - **Vector**: Pure semantic similarity. Finds conceptually related documents even when they don't share keywords. Good for exploratory queries like "notes about improving sleep quality".
-- **Fulltext**: Pure BM25 keyword matching. Fast and precise when you know the exact terms. No embeddings needed.
+- **Fulltext**: Pure QPS (Quantum Proximity Scoring) keyword matching. Fast and precise when you know the exact terms. No embeddings needed. Scores by token proximity — "carbon intensity" as adjacent words ranks higher than scattered occurrences.
 
 #### Supported Embedding Models
 

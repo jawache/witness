@@ -174,7 +174,7 @@ Semantic Search via Ollama + Orama:
 - ✅ Click-to-heading navigation in search panel
 - ✅ Frontmatter stripping from snippets
 
-Total: 15 MCP tools registered and available
+Total: 14 MCP tools registered and available
 
 ### Markdown Chunking
 
@@ -212,7 +212,7 @@ See `docs/features/unified-search.md` for full spec. Key decisions:
 
 **Dataview API Access:** `(this.app as any).plugins.plugins.dataview?.api` — returns the DV API or undefined.
 
-Total: 15 MCP tools registered and available
+Total: 14 MCP tools registered and available
 
 ## MCP Implementation Details
 
@@ -434,9 +434,19 @@ Files → OllamaProvider.embedDocuments() → Ollama /api/embed → Orama insert
 
 **Key Files:**
 
+- `src/search-engine.ts` — `SearchEngine` interface (abstraction over search implementations)
 - `src/ollama-provider.ts` — Ollama HTTP client (embed, model info, task prefixes)
-- `src/vector-store.ts` — Orama vector store (index, search, persist)
+- `src/vector-store.ts` — `OramaSearchEngine implements SearchEngine` (index, search, persist)
 - `src/search-view.ts` — Search panel sidebar UI
+
+**Unified Search Architecture:**
+
+Three old MCP tools (`search`, `find_files`, `semantic_search`) were consolidated into two:
+
+- `search` — Unified content search with hybrid/vector/fulltext modes, tag/path filtering, quoted phrase support
+- `find` — File discovery by name, path, tag, or frontmatter property (uses vault API directly, no index needed)
+
+Uses QPS (Quantum Proximity Scoring) instead of BM25 for better phrase matching. Two-phase indexing ensures all files are fulltext-searchable even if embedding generation fails. Schema v5 adds `tags` (`enum[]`) and `folder` (`enum`) fields.
 
 **Embedding Model Task Prefixes:**
 
