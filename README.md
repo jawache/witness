@@ -21,6 +21,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **File Operations**: Read, write, edit, and list files in your vault via AI
 - **Full-Text Search**: Search across all markdown files with optional filters
 - **Semantic Search**: Find documents by meaning using local Ollama embeddings + Orama vector store
+- **Search Panel**: Sidebar search with path and tag filtering via fuzzy autocomplete
 - **Command Execution**: Execute any Obsidian command via AI
 - **Claude Desktop Integration**: Connect directly from Claude Desktop app
 - **Remote Access**: Cloudflare Quick Tunnel or Named Tunnel (permanent URL) for access from anywhere

@@ -1670,4 +1670,75 @@ The user's instinct to stop and capture the phrase boosting and find sorting as 
 
 ---
 
+## 2026-02-08 - Search Refinements & Panel Filters
+
+**Objective**: Polish the search experience — enrich the `find` tool response, implement phrase search boosting and find tool sorting from existing specs, and add path/tag filtering to the search panel sidebar.
+
+### What We Built
+
+This was a multi-feature session spanning four distinct improvements across two extended conversations:
+
+1. **Phrase search boosting** — replaced the binary `filterByPhrases` with `boostByPhrases` that partitions results into phrase-match and rest groups, keeping all results instead of discarding non-matches
+2. **Find tool sorting** — added `sortBy` parameter with auto-detected ISO date properties, configurable direction, and nulls-to-end
+3. **Find tool response enrichment** — added title, full frontmatter, and lowered default limit from 50 to 20
+4. **Search panel filters** — added path and tag filtering to the sidebar search panel using Obsidian's `AbstractInputSuggest` with fuzzy autocomplete
+
+### The Journey
+
+The session began by implementing the two feature specs from the previous session — phrase boosting and find sorting. Both had detailed step-by-step plans which made implementation straightforward.
+
+**Phrase boosting** was a clean partition-and-concatenate approach. After Orama returns results, split into two groups: results where the full chunk content contains ALL quoted phrases, and results where it doesn't. Phrase matches appear first, preserving score order within each group. The key insight was over-fetching (3x the limit) when phrases are present, since QPS might rank a phrase match low even though it's the most relevant result.
+
+**Find tool sorting** required auto-detecting ISO dates from the actual data. Rather than asking users to declare types, we sample the first 20 files and check if values match `/^\d{4}-\d{2}-\d{2}/`. Dates default to `desc`, strings to `asc`. Nulls always sort to end regardless of direction. ISO date strings sort correctly with `localeCompare`, so no Date parsing is needed.
+
+After deploying to the main vault and testing via MCP, the user noticed the `find` tool response was too sparse — just paths. We enriched it with title (`file.basename`), full frontmatter (excluding Obsidian's internal `position` key), tags, size, and mtime. The default limit dropped from 50 to 20 since this is primarily an AI-consumed tool.
+
+The final feature — **search panel filters** — was the most interesting from a UI perspective. Research into Obsidian's API revealed `AbstractInputSuggest`, a built-in class for inline autocomplete popovers that handles keyboard navigation, scrolling, and positioning automatically. Combined with `prepareFuzzySearch()` and `renderResults()` for highlighted fuzzy matching, it provided a polished autocomplete experience with minimal code.
+
+Two suggest classes were created: `FolderSuggest` (using `vault.getAllFolders()`) and `TagSuggest` (using the undocumented but efficient `metadataCache.getTags()` with a fallback to `getAllTags()`). Selected filters appear as removable chips below the inputs. Adding or removing a filter re-triggers the current search.
+
+### Technical Achievements
+
+- **`AbstractInputSuggest` integration** — first use of Obsidian's built-in autocomplete in the plugin, providing native-feeling folder and tag suggestions
+- **Fuzzy-highlighted suggestions** — `prepareFuzzySearch()` + `renderResults()` gives users the same highlighting they see in Obsidian's core search
+- **Undocumented API discovery** — `(app.metadataCache as any).getTags()` returns all vault tags with counts in a single call, much more efficient than iterating every file
+- **Clean partition boosting** — phrase matches always appear first without tuning magic score bonuses
+- **ISO date auto-detection** — sort direction inferred from data, no schema declarations needed
+
+### Key Learnings
+
+1. **`AbstractInputSuggest` is the right tool for sidebar autocomplete** — not a modal, positions near the input, handles keyboard nav and scrolling automatically. Works perfectly in sidebar panels.
+
+2. **Obsidian's `SearchResult` type collides with ours** — needed to alias the import as `ObsidianSearchResult` to avoid conflicts with our own `SearchResult` from `search-engine.ts`.
+
+3. **`metadataCache.getTags()` is undocumented but stable** — returns `Record<string, number>` with tag names as keys and counts as values. Much faster than iterating all files.
+
+4. **Over-fetching is essential for phrase boosting** — without 3x the limit, phrase matches that QPS scored low get cut off before the boost can promote them.
+
+5. **Frontmatter's `position` key is internal** — Obsidian adds this to `cache.frontmatter` for internal tracking. Must be excluded when sending frontmatter to MCP clients.
+
+### Statistics
+
+- 12 commits across two conversation sessions
+- 21 files changed, 2,664 insertions, 442 deletions (from v0.7.0 baseline)
+- 4 feature specs created/completed
+- 3 feature branches merged to main
+- 37 unit tests passing (14 chunker + 23 vector-store)
+- 2 new `AbstractInputSuggest` subclasses
+- Search panel: 3 UI elements added (2 filter inputs + chip container)
+
+### What's Next
+
+- **Background indexing** — automatic incremental indexing with status bar indicator
+- **Chaos triage** — MCP tools for processing chaos items one at a time
+- **Re-ranking** — optional Ollama-based re-ranking for higher precision results
+
+### Reflections
+
+This session demonstrated the value of the spec-first approach. Four features landed cleanly because each had a clear plan before any code was written. The phrase boosting and find sorting specs from the previous session were pure execution — no design debates, no dead ends. The search panel filters feature went from research (discovering `AbstractInputSuggest`) to spec to implementation to deployment in a single flow.
+
+The user's instinct to test features against the real 4,097-document vault via MCP before considering them done has been invaluable. It's caught issues like sparse response payloads and sorting edge cases that unit tests wouldn't surface.
+
+---
+
 *End of log entry*
