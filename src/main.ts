@@ -815,6 +815,8 @@ export default class WitnessPlugin extends Plugin {
 				'Use path to limit results to a specific folder (e.g., "chaos/inbox").\n' +
 				'Use tag to find files with a specific tag (e.g., "#recipe", "#meeting").\n' +
 				'Use property to match frontmatter values (e.g., {"key": "status", "value": "draft"}).\n' +
+				'Use sortBy to order results by a property (e.g., {"property": "created"} for newest first, {"property": "name", "direction": "asc"} for alphabetical).\n' +
+				'Built-in sort properties: "mtime" (modified time), "size", "name". Any frontmatter property also works.\n' +
 				'Returns file paths with metadata (size, modified time, tags). Does not search file contents — use the search tool for that.'),
 			{
 				pattern: z.string().optional().describe('Pattern to match in filename (case-insensitive)'),
@@ -824,12 +826,16 @@ export default class WitnessPlugin extends Plugin {
 					key: z.string(),
 					value: z.string(),
 				}).optional().describe('Match frontmatter property (e.g., {"key": "status", "value": "draft"})'),
+				sortBy: z.object({
+					property: z.string().describe('Property to sort by: frontmatter name (e.g., "created") or built-in: "mtime", "size", "name"'),
+					direction: z.enum(['asc', 'desc']).optional().describe('Sort direction. Defaults to "desc" for dates/mtime, "asc" for strings'),
+				}).optional().describe('Sort results by a property'),
 				limit: z.number().optional().default(50).describe('Maximum number of results'),
 			},
 			{
 				readOnlyHint: true,
 			},
-			async ({ pattern, path, tag, property, limit }) => {
+			async ({ pattern, path, tag, property, sortBy, limit }) => {
 				let files = this.app.vault.getMarkdownFiles() as TFile[];
 
 				// Filter by path
@@ -858,6 +864,53 @@ export default class WitnessPlugin extends Plugin {
 						const cache = this.app.metadataCache.getFileCache(f);
 						if (!cache?.frontmatter) return false;
 						return String(cache.frontmatter[property.key]) === property.value;
+					});
+				}
+
+				// Sort results
+				if (sortBy) {
+					const prop = sortBy.property;
+					const builtins = new Set(['mtime', 'size', 'name']);
+
+					// Extract sort value for each file
+					const getSortValue = (f: TFile): string | number | null => {
+						if (prop === 'mtime') return f.stat.mtime;
+						if (prop === 'size') return f.stat.size;
+						if (prop === 'name') return f.basename;
+						const cache = this.app.metadataCache.getFileCache(f);
+						const val = cache?.frontmatter?.[prop];
+						return val != null ? String(val) : null;
+					};
+
+					// Auto-detect dates: check if values match ISO date/datetime pattern
+					const isDateProp = prop === 'mtime' || (!builtins.has(prop) && (() => {
+						const sample = files.slice(0, 20);
+						return sample.some(f => {
+							const val = getSortValue(f);
+							return typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val);
+						});
+					})());
+
+					// Default direction: desc for dates/mtime, asc otherwise
+					const direction = sortBy.direction ?? (isDateProp ? 'desc' : 'asc');
+
+					files.sort((a, b) => {
+						const va = getSortValue(a);
+						const vb = getSortValue(b);
+
+						// Nulls always sort to end
+						if (va == null && vb == null) return 0;
+						if (va == null) return 1;
+						if (vb == null) return -1;
+
+						let cmp: number;
+						if (typeof va === 'number' && typeof vb === 'number') {
+							cmp = va - vb;
+						} else {
+							cmp = String(va).localeCompare(String(vb));
+						}
+
+						return direction === 'desc' ? -cmp : cmp;
 					});
 				}
 

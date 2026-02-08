@@ -4,8 +4,6 @@
 
 ## Next Up
 
-- [ ] [Phrase search boosting](docs/features/phrase-search-boosting.md) — Boost exact phrase matches to the top instead of filtering them. Check full chunk content, not just snippet.
-- [ ] [Find tool sorting](docs/features/find-sorting.md) — Add sortBy parameter to find tool for sorting by frontmatter dates/properties.
 - [ ] [Chaos triage](docs/features/chaos-triage.md) — MCP tools and prompt for processing chaos items one at a time (get_next_chaos, triage_chaos)
 - [ ] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with status bar indicator and log viewer.
 - [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
@@ -35,3 +33,5 @@ Implement Cloudflare Tunnel or similar for remote access to the MCP server from 
 - [x] Hybrid search — BM25 + semantic via Orama's built-in hybrid mode with RRF
 - [x] Unit + integration test suite (53 tests)
 - [x] [Unified search](docs/features/unified-search.md) — Consolidated search/semantic_search/find_files into two tools (search + find), QPS scoring, tag/path filtering, two-phase indexing
+- [x] [Phrase search boosting](docs/features/phrase-search-boosting.md) — Stop word stripping, phrase boost via partition, shared search method for MCP + sidebar
+- [x] [Find tool sorting](docs/features/find-sorting.md) — sortBy parameter with date auto-detection, nulls-to-end
