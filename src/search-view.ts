@@ -1,13 +1,151 @@
 /**
  * Search panel view for Witness.
  * Provides a side panel UI for searching the vault with hybrid, vector, and fulltext modes.
+ * Includes path and tag filtering with autocomplete.
  */
 
-import { ItemView, WorkspaceLeaf } from 'obsidian';
+import { ItemView, WorkspaceLeaf, AbstractInputSuggest, prepareFuzzySearch, renderResults, getAllTags } from 'obsidian';
+import type { SearchResult as ObsidianSearchResult } from 'obsidian';
 import type WitnessPlugin from './main';
 import type { SearchResult } from './search-engine';
 
 export const VIEW_TYPE_SEARCH = 'witness-search';
+
+/**
+ * Folder autocomplete suggest for the path filter input.
+ * Uses Obsidian's built-in AbstractInputSuggest with fuzzy matching.
+ */
+class FolderSuggest extends AbstractInputSuggest<string> {
+	private plugin: WitnessPlugin;
+	private onSelectCallback: (value: string) => void;
+
+	constructor(app: import('obsidian').App, inputEl: HTMLInputElement, plugin: WitnessPlugin, onSelect: (value: string) => void) {
+		super(app, inputEl);
+		this.plugin = plugin;
+		this.onSelectCallback = onSelect;
+		this.limit = 20;
+	}
+
+	protected getSuggestions(query: string): string[] {
+		const folders = this.app.vault.getAllFolders()
+			.map(f => f.path)
+			.filter(p => p !== '/');
+
+		if (!query.trim()) {
+			return folders.sort();
+		}
+
+		const fuzzy = prepareFuzzySearch(query);
+		const matches: { path: string; score: number }[] = [];
+
+		for (const path of folders) {
+			const result = fuzzy(path);
+			if (result) {
+				matches.push({ path, score: result.score });
+			}
+		}
+
+		return matches.sort((a, b) => b.score - a.score).map(m => m.path);
+	}
+
+	renderSuggestion(value: string, el: HTMLElement): void {
+		const query = this.getValue();
+		if (query.trim()) {
+			const fuzzy = prepareFuzzySearch(query);
+			const result = fuzzy(value);
+			if (result) {
+				renderResults(el, value, result as ObsidianSearchResult);
+				return;
+			}
+		}
+		el.setText(value);
+	}
+
+	selectSuggestion(value: string, _evt: MouseEvent | KeyboardEvent): void {
+		this.setValue('');
+		this.onSelectCallback(value);
+		this.close();
+	}
+}
+
+/**
+ * Tag autocomplete suggest for the tag filter input.
+ * Collects all tags from the vault metadata cache.
+ */
+class TagSuggest extends AbstractInputSuggest<string> {
+	private plugin: WitnessPlugin;
+	private onSelectCallback: (value: string) => void;
+
+	constructor(app: import('obsidian').App, inputEl: HTMLInputElement, plugin: WitnessPlugin, onSelect: (value: string) => void) {
+		super(app, inputEl);
+		this.plugin = plugin;
+		this.onSelectCallback = onSelect;
+		this.limit = 20;
+	}
+
+	protected getSuggestions(query: string): string[] {
+		const tags = this.getAllVaultTags();
+
+		if (!query.trim()) {
+			return tags.sort();
+		}
+
+		const fuzzy = prepareFuzzySearch(query);
+		const matches: { tag: string; score: number }[] = [];
+
+		for (const tag of tags) {
+			const result = fuzzy(tag);
+			if (result) {
+				matches.push({ tag, score: result.score });
+			}
+		}
+
+		return matches.sort((a, b) => b.score - a.score).map(m => m.tag);
+	}
+
+	renderSuggestion(value: string, el: HTMLElement): void {
+		const query = this.getValue();
+		if (query.trim()) {
+			const fuzzy = prepareFuzzySearch(query);
+			const result = fuzzy(value);
+			if (result) {
+				renderResults(el, value, result as ObsidianSearchResult);
+				return;
+			}
+		}
+		el.setText(value);
+	}
+
+	selectSuggestion(value: string, _evt: MouseEvent | KeyboardEvent): void {
+		this.setValue('');
+		this.onSelectCallback(value);
+		this.close();
+	}
+
+	private getAllVaultTags(): string[] {
+		// Use the undocumented but efficient getTags() if available
+		const mc = this.app.metadataCache as any;
+		if (typeof mc.getTags === 'function') {
+			const tagCounts: Record<string, number> = mc.getTags();
+			return Object.keys(tagCounts);
+		}
+
+		// Fallback: iterate all files
+		const tagSet = new Set<string>();
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const cache = this.app.metadataCache.getFileCache(file);
+			if (cache) {
+				const tags = getAllTags(cache);
+				if (tags) {
+					for (const tag of tags) {
+						tagSet.add(tag);
+					}
+				}
+			}
+		}
+		return Array.from(tagSet);
+	}
+}
 
 export class WitnessSearchView extends ItemView {
 	private plugin: WitnessPlugin;
@@ -15,6 +153,9 @@ export class WitnessSearchView extends ItemView {
 	private currentQuery = '';
 	private resultsContainer: HTMLElement;
 	private inputEl: HTMLInputElement;
+	private selectedPaths: string[] = [];
+	private selectedTags: string[] = [];
+	private chipContainer: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: WitnessPlugin) {
 		super(leaf);
@@ -47,6 +188,7 @@ export class WitnessSearchView extends ItemView {
 	private buildUI(container: HTMLElement): void {
 		this.buildSearchInput(container);
 		this.buildModeSelector(container);
+		this.buildFilters(container);
 		this.resultsContainer = container.createDiv({ cls: 'witness-search-results' });
 
 		// Show initial empty state
@@ -98,6 +240,79 @@ export class WitnessSearchView extends ItemView {
 				this.executeSearch(this.currentQuery);
 			}
 		});
+	}
+
+	private buildFilters(container: HTMLElement): void {
+		const filterRow = container.createDiv({ cls: 'witness-filter-row' });
+
+		// Path filter input
+		const pathInput = filterRow.createEl('input', {
+			type: 'text',
+			placeholder: 'Filter by folder...',
+			cls: 'witness-filter-input',
+		});
+
+		new FolderSuggest(this.app, pathInput, this.plugin, (path: string) => {
+			if (!this.selectedPaths.includes(path)) {
+				this.selectedPaths.push(path);
+				this.renderChips();
+				this.rerunSearch();
+			}
+		});
+
+		// Tag filter input
+		const tagInput = filterRow.createEl('input', {
+			type: 'text',
+			placeholder: 'Filter by tag...',
+			cls: 'witness-filter-input',
+		});
+
+		new TagSuggest(this.app, tagInput, this.plugin, (tag: string) => {
+			if (!this.selectedTags.includes(tag)) {
+				this.selectedTags.push(tag);
+				this.renderChips();
+				this.rerunSearch();
+			}
+		});
+
+		// Chip container for active filters
+		this.chipContainer = container.createDiv({ cls: 'witness-filter-chips' });
+	}
+
+	private renderChips(): void {
+		this.chipContainer.empty();
+
+		for (const path of this.selectedPaths) {
+			this.createChip(path, 'path', () => {
+				this.selectedPaths = this.selectedPaths.filter(p => p !== path);
+				this.renderChips();
+				this.rerunSearch();
+			});
+		}
+
+		for (const tag of this.selectedTags) {
+			this.createChip(tag, 'tag', () => {
+				this.selectedTags = this.selectedTags.filter(t => t !== tag);
+				this.renderChips();
+				this.rerunSearch();
+			});
+		}
+	}
+
+	private createChip(label: string, type: 'path' | 'tag', onRemove: () => void): void {
+		const chip = this.chipContainer.createDiv({ cls: `witness-filter-chip witness-filter-chip-${type}` });
+		chip.createSpan({ text: label, cls: 'witness-filter-chip-label' });
+		const removeBtn = chip.createSpan({ text: '\u00D7', cls: 'witness-filter-chip-remove' });
+		removeBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			onRemove();
+		});
+	}
+
+	private rerunSearch(): void {
+		if (this.currentQuery) {
+			this.executeSearch(this.currentQuery);
+		}
 	}
 
 	private async executeSearch(query: string): Promise<void> {
@@ -157,6 +372,8 @@ export class WitnessSearchView extends ItemView {
 			const results = await this.plugin.search(query, {
 				mode: this.currentMode,
 				limit: 20,
+				paths: this.selectedPaths.length > 0 ? this.selectedPaths : undefined,
+				tags: this.selectedTags.length > 0 ? this.selectedTags : undefined,
 			});
 
 			const elapsed = Math.round(performance.now() - startTime);
