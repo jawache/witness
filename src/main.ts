@@ -17,23 +17,26 @@ import { WitnessSearchView, VIEW_TYPE_SEARCH } from './search-view';
 /**
  * Logger that writes to both console and file.
  * Logs are stored in .obsidian/plugins/witness/logs/
+ * Prefix determines the log file name (e.g. 'mcp' → mcp-2026-02-08.log).
  */
-class MCPLogger {
+class FileLogger {
 	private app: App;
 	private pluginId: string;
+	private prefix: string;
 	private buffer: string[] = [];
 	private flushTimeout: NodeJS.Timeout | null = null;
 	private readonly FLUSH_INTERVAL = 1000; // Flush every second
 	private readonly MAX_BUFFER = 50; // Or when buffer reaches 50 entries
 
-	constructor(app: App, pluginId: string) {
+	constructor(app: App, pluginId: string, prefix: string = 'mcp') {
 		this.app = app;
 		this.pluginId = pluginId;
+		this.prefix = prefix;
 	}
 
 	private getLogPath(): string {
 		const date = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-		return normalizePath(`.obsidian/plugins/${this.pluginId}/logs/mcp-${date}.log`);
+		return normalizePath(`.obsidian/plugins/${this.pluginId}/logs/${this.prefix}-${date}.log`);
 	}
 
 	private formatMessage(level: string, message: string, data?: any): string {
@@ -81,7 +84,7 @@ class MCPLogger {
 			}
 		} catch (err) {
 			// Don't recurse - just log to console if file write fails
-			console.error('[MCPLogger] Failed to write log file:', err);
+			console.error(`[FileLogger:${this.prefix}] Failed to write log file:`, err);
 		}
 	}
 
@@ -129,6 +132,49 @@ class MCPLogger {
 			this.flushTimeout = null;
 		}
 		await this.flush();
+	}
+}
+
+/**
+ * Debounce queue for background indexing.
+ * Accumulates file change events and fires a callback after a per-file debounce delay.
+ */
+class IndexQueue {
+	private pending = new Map<string, { action: 'index' | 'delete'; timer: number }>();
+	private debounceMs: number;
+	private onReady: () => void;
+
+	constructor(debounceMs: number, onReady: () => void) {
+		this.debounceMs = debounceMs;
+		this.onReady = onReady;
+	}
+
+	add(path: string, event: 'create' | 'modify' | 'delete' | 'rename') {
+		const existing = this.pending.get(path);
+		if (existing) window.clearTimeout(existing.timer);
+
+		const action = event === 'delete' ? 'delete' as const : 'index' as const;
+
+		const timer = window.setTimeout(() => {
+			this.onReady();
+		}, this.debounceMs);
+
+		this.pending.set(path, { action, timer });
+	}
+
+	drain(): Array<{ path: string; action: 'index' | 'delete' }> {
+		const items = Array.from(this.pending.entries()).map(
+			([path, { action }]) => ({ path, action })
+		);
+		this.pending.clear();
+		return items;
+	}
+
+	clear() {
+		for (const { timer } of this.pending.values()) {
+			window.clearTimeout(timer);
+		}
+		this.pending.clear();
 	}
 }
 
@@ -222,20 +268,29 @@ export default class WitnessPlugin extends Plugin {
 	private httpServer: http.Server | null = null;
 	private mcpServer: McpServer | null = null;
 	private transports: Map<string, StreamableHTTPServerTransport> = new Map();
-	logger: MCPLogger;
+	logger: FileLogger;
 	private tunnelProcess: Tunnel | null = null;
 	private tunnelStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 	private tunnelStatusCallback: ((status: string, url: string | null) => void) | null = null;
 	vectorStore: OramaSearchEngine | null = null;
 	ollamaProvider: OllamaProvider | null = null;
+	private indexLogger: FileLogger;
+	private indexQueue: IndexQueue;
+	private statusBarEl: HTMLElement | null = null;
+	private backgroundIndexing = false;
 
 	async onload() {
 		await this.loadSettings();
 
-		// Initialize logger
-		this.logger = new MCPLogger(this.app, this.manifest.id);
+		// Initialize loggers
+		this.logger = new FileLogger(this.app, this.manifest.id);
+		this.indexLogger = new FileLogger(this.app, this.manifest.id, 'indexing');
 
 		this.logger.info('Witness plugin loaded');
+
+		// Status bar
+		this.statusBarEl = this.addStatusBarItem();
+		this.updateStatusBar('loading...');
 
 		// Add settings tab
 		this.addSettingTab(new WitnessSettingTab(this.app, this));
@@ -257,6 +312,68 @@ export default class WitnessPlugin extends Plugin {
 			},
 		});
 
+		// Add reindex vault command
+		this.addCommand({
+			id: 'reindex-vault',
+			name: 'Reindex vault',
+			callback: async () => {
+				try {
+					await this.ensureSearchEngine();
+					if (!this.vectorStore) return;
+
+					await this.vectorStore.clear();
+					const mdFiles = this.getIndexableFiles();
+					this.indexLogger.info(`Manual reindex: ${mdFiles.length} files`);
+					this.updateStatusBar(`reindexing ${mdFiles.length} files...`);
+
+					const result = await this.vectorStore.indexFiles(mdFiles, {
+						generateEmbeddings: true,
+						minContentLength: this.settings.minContentLength ?? 50,
+						getFileTags: (f) => this.getFileTags(f),
+						onProgress: (done, total) => {
+							this.updateStatusBar(`reindexing ${done}/${total}...`);
+						},
+						onLog: (level, msg) => this.indexLogger.info(msg),
+					});
+
+					await this.vectorStore.save();
+					this.indexLogger.info(`Manual reindex complete: ${result.indexed} indexed, ${result.embedded} embedded`);
+					this.updateStatusBar();
+				} catch (err) {
+					this.indexLogger.error('Manual reindex failed', err);
+					this.updateStatusBar('reindex failed');
+				}
+			},
+		});
+
+		// Background indexing: vault event listeners
+		this.indexQueue = new IndexQueue(3000, () => this.processQueue());
+
+		this.registerEvent(this.app.vault.on('create', (file) => {
+			if (file instanceof TFile && file.extension === 'md') {
+				this.indexQueue.add(file.path, 'create');
+			}
+		}));
+
+		this.registerEvent(this.app.vault.on('modify', (file) => {
+			if (file instanceof TFile && file.extension === 'md') {
+				this.indexQueue.add(file.path, 'modify');
+			}
+		}));
+
+		this.registerEvent(this.app.vault.on('delete', (file) => {
+			if (file instanceof TFile && file.extension === 'md') {
+				this.indexQueue.add(file.path, 'delete');
+			}
+		}));
+
+		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+			if (file instanceof TFile && file.extension === 'md') {
+				this.indexQueue.add(oldPath, 'delete');
+				this.indexQueue.add(file.path, 'create');
+			}
+		}));
+
 		// Start MCP server if enabled
 		if (this.settings.mcpEnabled) {
 			await this.startMCPServer();
@@ -266,10 +383,14 @@ export default class WitnessPlugin extends Plugin {
 		if (this.settings.enableTunnel && this.settings.mcpEnabled) {
 			this.startTunnel();
 		}
+
+		// Non-blocking startup indexing (5s delay to avoid competing with Obsidian's startup I/O)
+		setTimeout(() => this.startupIndexing(), 5000);
 	}
 
 	async onunload() {
 		this.logger.info('Witness plugin unloading');
+		this.indexQueue?.clear();
 		this.stopTunnel();
 		this.stopMCPServer();
 		if (this.vectorStore) {
@@ -278,6 +399,7 @@ export default class WitnessPlugin extends Plugin {
 			this.vectorStore = null;
 		}
 		this.ollamaProvider = null;
+		await this.indexLogger?.close();
 		await this.logger.close();
 	}
 
@@ -364,6 +486,137 @@ export default class WitnessPlugin extends Plugin {
 				await this.app.vault.adapter.remove('.witness/index.orama');
 			}
 		}
+	}
+
+	/**
+	 * Update the status bar text. Call with no args to show idle state.
+	 */
+	private updateStatusBar(text?: string) {
+		if (!this.statusBarEl) return;
+		if (text) {
+			this.statusBarEl.setText(`Witness: ${text}`);
+		} else {
+			const count = this.getIndexCount();
+			this.statusBarEl.setText(count > 0 ? `Witness: ${count.toLocaleString()} indexed` : 'Witness');
+		}
+	}
+
+	/**
+	 * Ensure OllamaProvider and VectorStore are initialized.
+	 * Consolidates the duplicate initialization logic from multiple call sites.
+	 */
+	async ensureSearchEngine(): Promise<void> {
+		if (this.vectorStore) return;
+		if (!this.ollamaProvider) {
+			this.ollamaProvider = new OllamaProvider({
+				baseUrl: this.settings.ollamaBaseUrl,
+				model: this.settings.ollamaModel,
+				log: (level: string, msg: string, data?: any) => {
+					if (level === 'error') this.logger.error(msg, data);
+					else this.logger.info(msg);
+				},
+			});
+			await this.ollamaProvider.resolveModelInfo();
+		}
+		this.vectorStore = new OramaSearchEngine(this.app, this.ollamaProvider);
+		await this.vectorStore.initialize();
+	}
+
+	/**
+	 * Process the background indexing queue.
+	 * Called when a debounce timer fires after vault events.
+	 */
+	private async processQueue(): Promise<void> {
+		if (this.backgroundIndexing) return;
+		if (!this.vectorStore) return;
+		this.backgroundIndexing = true;
+
+		try {
+			const items = this.indexQueue.drain();
+			if (items.length === 0) return;
+
+			const toDelete = items.filter(i => i.action === 'delete');
+			const toIndex = items.filter(i => i.action === 'index');
+
+			// Process deletes
+			for (const item of toDelete) {
+				await this.vectorStore!.removeFile(item.path);
+				this.indexLogger.info(`Removed: ${item.path}`);
+			}
+
+			// Process indexes
+			if (toIndex.length > 0) {
+				const files = toIndex
+					.map(i => this.app.vault.getAbstractFileByPath(i.path))
+					.filter((f): f is TFile => f instanceof TFile);
+
+				if (files.length > 0) {
+					this.updateStatusBar(`indexing ${files.length} file${files.length > 1 ? 's' : ''}...`);
+					const result = await this.vectorStore!.indexFiles(files, {
+						generateEmbeddings: true,
+						minContentLength: this.settings.minContentLength ?? 50,
+						getFileTags: (f) => this.getFileTags(f),
+						onProgress: (done, total) => {
+							this.updateStatusBar(`indexing ${done}/${total}...`);
+						},
+						onLog: (_level, msg) => this.indexLogger.info(msg),
+					});
+					this.indexLogger.info(`Indexed ${result.indexed} file${result.indexed > 1 ? 's' : ''} (${result.embedded} embedded)`);
+				}
+			}
+
+			if (toDelete.length > 0 || toIndex.length > 0) {
+				await this.vectorStore!.save();
+			}
+		} catch (err) {
+			this.indexLogger.error('Background indexing failed', err);
+			this.updateStatusBar('indexing error');
+		} finally {
+			this.backgroundIndexing = false;
+			this.updateStatusBar();
+		}
+	}
+
+	/**
+	 * Run on plugin startup after a delay. Checks for stale files and indexes them.
+	 */
+	private async startupIndexing(): Promise<void> {
+		try {
+			await this.ensureSearchEngine();
+		} catch (err) {
+			this.indexLogger.info('Could not initialize search engine, skipping startup indexing');
+			this.updateStatusBar();
+			return;
+		}
+
+		const mdFiles = this.getIndexableFiles();
+		const staleFiles = await this.vectorStore!.getStaleFiles(mdFiles);
+
+		if (staleFiles.length === 0) {
+			this.indexLogger.info(`Startup: all ${mdFiles.length} files up to date`);
+			this.updateStatusBar();
+			return;
+		}
+
+		this.indexLogger.info(`Startup: ${staleFiles.length}/${mdFiles.length} files need indexing`);
+		this.updateStatusBar(`indexing ${staleFiles.length} files...`);
+
+		const result = await this.vectorStore!.indexFiles(staleFiles, {
+			generateEmbeddings: true,
+			minContentLength: this.settings.minContentLength ?? 50,
+			getFileTags: (f) => this.getFileTags(f),
+			onProgress: (done, total) => {
+				this.updateStatusBar(`indexing ${done}/${total}...`);
+			},
+			onLog: (_level, msg) => this.indexLogger.info(msg),
+		});
+
+		await this.vectorStore!.save();
+		this.indexLogger.info(`Startup complete: ${result.indexed} indexed, ${result.embedded} embedded, ${result.failed.length} failed`);
+		this.updateStatusBar();
+
+		// Process any events that queued during startup
+		await this.processQueue();
 	}
 
 	async loadSettings() {
@@ -691,21 +944,11 @@ export default class WitnessPlugin extends Plugin {
 			},
 			async ({ query, mode, path, tag, limit, minScore }) => {
 				try {
-					// Initialize Ollama provider on first use
-					if (!this.ollamaProvider) {
-						this.ollamaProvider = new OllamaProvider({
-							baseUrl: this.settings.ollamaBaseUrl,
-							model: this.settings.ollamaModel,
-							log: (level, msg, data) => {
-								if (level === 'error') this.logger.error(msg, data);
-								else this.logger.info(msg);
-							},
-						});
-						await this.ollamaProvider.resolveModelInfo();
-					}
+					// Initialize search engine on first use
+					await this.ensureSearchEngine();
 
 					// For vector/hybrid modes, check Ollama availability
-					if (mode !== 'fulltext') {
+					if (mode !== 'fulltext' && this.ollamaProvider) {
 						if (!(await this.ollamaProvider.isAvailable())) {
 							return {
 								content: [{
@@ -717,36 +960,7 @@ export default class WitnessPlugin extends Plugin {
 						}
 					}
 
-					// Initialize search engine on first use
-					if (!this.vectorStore) {
-						this.vectorStore = new OramaSearchEngine(this.app, this.ollamaProvider);
-						await this.vectorStore.initialize();
-						this.logger.info(`Search engine initialized with ${this.vectorStore.getCount()} documents`);
-
-						// Auto-index if needed
-						const mdFiles = this.getIndexableFiles();
-						const staleFiles = await this.vectorStore.getStaleFiles(mdFiles);
-
-						if (staleFiles.length > 0) {
-							this.logger.info(`Indexing ${staleFiles.length} new/changed files...`);
-							const result = await this.vectorStore.indexFiles(staleFiles, {
-								generateEmbeddings: mode !== 'fulltext',
-								minContentLength: this.settings.minContentLength ?? 50,
-								getFileTags: (f) => this.getFileTags(f),
-								onProgress: (done, total) => {
-									this.logger.info(`Indexing progress: ${done}/${total}`);
-								},
-								onLog: (level, msg, data) => {
-									if (level === 'error') this.logger.error(msg, data);
-									else this.logger.info(msg);
-								},
-							});
-							await this.vectorStore.save();
-							this.logger.info(`Indexed ${result.indexed} files (${result.embedded} embedded, ${result.failed.length} failed), total: ${this.vectorStore.getCount()}`);
-						}
-					}
-
-					if (this.vectorStore.getCount() === 0) {
+					if (this.vectorStore!.getCount() === 0) {
 						return {
 							content: [{
 								type: 'text',
