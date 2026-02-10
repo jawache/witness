@@ -57,6 +57,21 @@ export interface SearchEngine {
 	/** Number of indexed chunks. */
 	getCount(): number;
 
+	/** Number of unique indexed files. */
+	getFileCount(): number;
+
+	/**
+	 * Move/rename a file in the index without re-generating embeddings.
+	 * Returns the number of chunks moved (0 if file not found).
+	 */
+	moveFile(oldPath: string, newPath: string, newFile: TFile): Promise<number>;
+
+	/**
+	 * Find indexed file paths that no longer exist in the vault.
+	 * Used by periodic reconciliation to clean up orphaned entries.
+	 */
+	getOrphanedPaths(vaultPaths: Set<string>): string[];
+
 	/** Persist the index to disk. */
 	save(): Promise<void>;
 

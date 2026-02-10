@@ -44,6 +44,7 @@ export class OramaSearchEngine implements SearchEngine {
 	private app: App;
 	private ollama: OllamaProvider;
 	private dimensions: number;
+	private indexedFiles = new Set<string>();
 
 	constructor(app: App, ollama: OllamaProvider) {
 		this.app = app;
@@ -96,6 +97,11 @@ export class OramaSearchEngine implements SearchEngine {
 
 				const data = (envelope.data ?? envelope) as RawData;
 				load(this.db, data);
+
+				// Restore tracked file set
+				if (Array.isArray(envelope.indexedFiles)) {
+					this.indexedFiles = new Set(envelope.indexedFiles);
+				}
 			} catch (e) {
 				// Corrupted or incompatible index — start fresh
 				console.warn('OramaSearchEngine: Failed to load saved index, starting fresh:', e);
@@ -116,7 +122,11 @@ export class OramaSearchEngine implements SearchEngine {
 		}
 
 		const data = save(this.db);
-		const envelope = { schemaVersion: SCHEMA_VERSION, data };
+		const envelope = {
+			schemaVersion: SCHEMA_VERSION,
+			data,
+			indexedFiles: Array.from(this.indexedFiles),
+		};
 		await this.app.vault.adapter.write(STORE_PATH, JSON.stringify(envelope));
 	}
 
@@ -126,6 +136,13 @@ export class OramaSearchEngine implements SearchEngine {
 	getCount(): number {
 		if (!this.db) return 0;
 		return count(this.db) as number;
+	}
+
+	/**
+	 * Get the number of unique files in the index.
+	 */
+	getFileCount(): number {
+		return this.indexedFiles.size;
 	}
 
 	/**
@@ -172,6 +189,8 @@ export class OramaSearchEngine implements SearchEngine {
 
 			await insert(this.db, doc);
 		}
+
+		this.indexedFiles.add(file.path);
 	}
 
 	/**
@@ -226,6 +245,7 @@ export class OramaSearchEngine implements SearchEngine {
 				}
 
 				indexed++;
+				this.indexedFiles.add(file.path);
 
 				// Phase 2: Generate embeddings if enabled and file is large enough
 				if (generateEmbeddings && file.stat.size >= minContentLength) {
@@ -307,6 +327,74 @@ export class OramaSearchEngine implements SearchEngine {
 		} catch {
 			// Not found — fine
 		}
+
+		this.indexedFiles.delete(filePath);
+	}
+
+	/**
+	 * Move/rename a file in the index without re-generating embeddings.
+	 * Updates sourcePath, title, folder, and chunk IDs.
+	 * Returns the number of chunks moved (0 if file not found in index).
+	 */
+	async moveFile(oldPath: string, newPath: string, newFile: TFile): Promise<number> {
+		if (!this.db) return 0;
+
+		let moved = 0;
+		const newTitle = newFile.basename;
+		const newFolder = this.extractFolder(newPath);
+
+		for (let i = 0; i < 1000; i++) {
+			const id = `${oldPath}#${i}`;
+			try {
+				const existing = getByID(this.db, id) as unknown as ChunkDocument | null;
+				if (!existing) break;
+
+				await remove(this.db, id);
+
+				const doc: Record<string, unknown> = {
+					id: `${newPath}#${i}`,
+					sourcePath: newPath,
+					title: newTitle,
+					headingPath: existing.headingPath,
+					content: existing.content,
+					chunkIndex: existing.chunkIndex,
+					mtime: existing.mtime,
+					tags: existing.tags,
+					folder: newFolder,
+				};
+
+				// Preserve embedding if it exists
+				if (existing.embedding?.length > 0) {
+					doc.embedding = existing.embedding;
+				}
+
+				await insert(this.db, doc);
+				moved++;
+			} catch {
+				break;
+			}
+		}
+
+		if (moved > 0) {
+			this.indexedFiles.delete(oldPath);
+			this.indexedFiles.add(newPath);
+		}
+
+		return moved;
+	}
+
+	/**
+	 * Find indexed file paths that no longer exist in the vault.
+	 * Compares the tracked indexedFiles set against the provided vault paths.
+	 */
+	getOrphanedPaths(vaultPaths: Set<string>): string[] {
+		const orphaned: string[] = [];
+		for (const path of this.indexedFiles) {
+			if (!vaultPaths.has(path)) {
+				orphaned.push(path);
+			}
+		}
+		return orphaned;
 	}
 
 	/**
@@ -315,6 +403,7 @@ export class OramaSearchEngine implements SearchEngine {
 	 */
 	async search(query: string, options: SearchOptions): Promise<SearchResult[]> {
 		if (!this.db) throw new Error('OramaSearchEngine not initialized');
+		if (this.getCount() === 0) return [];
 
 		switch (options.mode) {
 			case 'hybrid':
@@ -509,9 +598,13 @@ export class OramaSearchEngine implements SearchEngine {
 						stale.push(file);
 					} else if (legacyDoc.mtime !== file.stat.mtime) {
 						stale.push(file);
+					} else {
+						this.indexedFiles.add(file.path);
 					}
 				} else if (doc.mtime !== file.stat.mtime) {
 					stale.push(file);
+				} else {
+					this.indexedFiles.add(file.path);
 				}
 			} catch {
 				// Document not found — needs indexing
@@ -527,6 +620,7 @@ export class OramaSearchEngine implements SearchEngine {
 	 */
 	async clear(): Promise<void> {
 		this.db = this.createDb();
+		this.indexedFiles.clear();
 
 		if (await this.app.vault.adapter.exists(STORE_PATH)) {
 			await this.app.vault.adapter.remove(STORE_PATH);

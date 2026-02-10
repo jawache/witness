@@ -324,34 +324,16 @@ export class WitnessSearchView extends ItemView {
 
 		this.currentQuery = query;
 
-		// Check if vector store is ready
-		if (!this.plugin.vectorStore) {
-			// For fulltext mode, we need to initialize the store first
-			if (!this.plugin.ollamaProvider) {
-				const { OllamaProvider } = await import('./ollama-provider');
-				this.plugin.ollamaProvider = new OllamaProvider({
-					baseUrl: this.plugin.settings.ollamaBaseUrl,
-					model: this.plugin.settings.ollamaModel,
-				});
-				await this.plugin.ollamaProvider.resolveModelInfo();
-			}
-
-			// Check Ollama for vector/hybrid modes
-			if (this.currentMode !== 'fulltext') {
-				const available = await this.plugin.ollamaProvider!.isAvailable();
-				if (!available) {
-					this.showError('Ollama is not available. Fulltext search still works.');
-					return;
-				}
-			}
-
-			const { OramaSearchEngine } = await import('./vector-store');
-			this.plugin.vectorStore = new OramaSearchEngine(this.app, this.plugin.ollamaProvider!);
-			await this.plugin.vectorStore.initialize();
+		// Ensure search engine is initialised
+		try {
+			await this.plugin.ensureSearchEngine();
+		} catch {
+			this.showError('Could not initialise search engine. Check that Ollama is running.');
+			return;
 		}
 
-		if (this.plugin.vectorStore.getCount() === 0) {
-			this.showError('No documents indexed yet. Build the index in Settings \u2192 Witness \u2192 Semantic Search.');
+		if (this.plugin.vectorStore!.getCount() === 0) {
+			this.showError('No documents indexed. Build the index in Settings \u2192 Witness \u2192 Semantic Search.');
 			return;
 		}
 

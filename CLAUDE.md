@@ -173,8 +173,13 @@ Semantic Search via Ollama + Orama:
 - ✅ Multi-chunk indexing with heading path tracking (schema v3)
 - ✅ Click-to-heading navigation in search panel
 - ✅ Frontmatter stripping from snippets
+- ✅ Background indexing with vault event listeners (create/modify/delete/rename)
+- ✅ Light file moves — renames update metadata without re-embedding
+- ✅ Periodic reconciliation (60s) — catches orphans and stale files missed by events
+- ✅ `indexedFiles` Set for accurate file count tracking
+- ✅ Status bar with file count and indexing progress
 
-Total: 14 MCP tools registered and available
+Total: 15 MCP tools registered and available
 
 ### Markdown Chunking
 
@@ -188,6 +193,27 @@ Documents are split into chunks by markdown headings before embedding. Each chun
 **Chunk IDs:** `filepath#0`, `filepath#1`, etc. The VectorStore's `removeBySourcePath()` removes all chunks for a file by iterating sequential IDs until one is not found.
 
 **Schema v3:** Added `sourcePath` (string), `headingPath` (string), `chunkIndex` (number) to the Orama schema. Bump from v2 forces full re-index.
+
+### Background Indexing & Reconciliation
+
+The index stays up-to-date through two mechanisms working together:
+
+**Event-driven indexing** (instant): Vault event listeners (create/modify/delete/rename) feed an `IndexQueue` with a 3-second per-file debounce. `processQueue()` handles deletes, renames (light metadata update via `moveFile()`), and indexes (full embedding). This handles the 99% case — user edits a file, it's re-indexed within seconds.
+
+**Periodic reconciliation** (safety net): Every 60 seconds, `reconcile()` runs a bidirectional scan:
+
+- **Forward**: `getStaleFiles()` compares vault file mtimes against indexed mtimes → finds new/modified files
+- **Reverse**: `getOrphanedPaths()` compares `indexedFiles` Set against vault paths → finds deleted files
+
+This catches everything events miss: files changed while the plugin was off, Obsidian Sync drift, external tools touching files, plugin restarts.
+
+**Key implementation details:**
+
+- `backgroundIndexing` flag acts as a mutex — prevents concurrent indexing from events and reconciliation
+- `indexedFiles` Set tracks all indexed file paths, persisted in the save envelope, and self-heals via `getStaleFiles()` (adds up-to-date files it encounters)
+- `moveFile()` does O(n chunks) remove+insert with `getByID()` — preserves the embedding vector, only updates sourcePath/title/folder/id
+- `startBackgroundIndexing()` runs after a 5-second startup delay: init search engine → clear queued events → reconcile once → start 60-second timer
+- The sync-settling mechanism (`waitForSync`/`syncSettling`/`pendingSyncActions`) was removed — reconciliation handles sync naturally
 
 ### Unified Search Architecture (Planned)
 

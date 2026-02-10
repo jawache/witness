@@ -140,7 +140,7 @@ class FileLogger {
  * Accumulates file change events and fires a callback after a per-file debounce delay.
  */
 class IndexQueue {
-	private pending = new Map<string, { action: 'index' | 'delete'; timer: number }>();
+	private pending = new Map<string, { action: 'index' | 'delete' | 'rename'; timer: number; oldPath?: string }>();
 	private debounceMs: number;
 	private onReady: () => void;
 
@@ -149,22 +149,29 @@ class IndexQueue {
 		this.onReady = onReady;
 	}
 
-	add(path: string, event: 'create' | 'modify' | 'delete' | 'rename') {
+	add(path: string, event: 'create' | 'modify' | 'delete', oldPath?: string) {
 		const existing = this.pending.get(path);
 		if (existing) window.clearTimeout(existing.timer);
 
-		const action = event === 'delete' ? 'delete' as const : 'index' as const;
+		let action: 'index' | 'delete' | 'rename';
+		if (event === 'delete') {
+			action = 'delete';
+		} else if (oldPath) {
+			action = 'rename';
+		} else {
+			action = 'index';
+		}
 
 		const timer = window.setTimeout(() => {
 			this.onReady();
 		}, this.debounceMs);
 
-		this.pending.set(path, { action, timer });
+		this.pending.set(path, { action, timer, oldPath });
 	}
 
-	drain(): Array<{ path: string; action: 'index' | 'delete' }> {
+	drain(): Array<{ path: string; action: 'index' | 'delete' | 'rename'; oldPath?: string }> {
 		const items = Array.from(this.pending.entries()).map(
-			([path, { action }]) => ({ path, action })
+			([path, { action, oldPath }]) => ({ path, action, oldPath })
 		);
 		this.pending.clear();
 		return items;
@@ -223,6 +230,7 @@ interface WitnessSettings {
 	// Authentication (simple token)
 	enableAuth: boolean;
 	// Ollama / Semantic Search
+	enableSemanticSearch: boolean;
 	ollamaBaseUrl: string;
 	ollamaModel: string;
 	excludedFolders: string[];
@@ -257,6 +265,7 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	tunnelToken: '',
 	tunnelPrimaryHost: '',
 	enableAuth: false,
+	enableSemanticSearch: true,
 	ollamaBaseUrl: 'http://localhost:11434',
 	ollamaModel: 'nomic-embed-text',
 	excludedFolders: [],
@@ -278,6 +287,7 @@ export default class WitnessPlugin extends Plugin {
 	private indexQueue: IndexQueue;
 	private statusBarEl: HTMLElement | null = null;
 	private backgroundIndexing = false;
+	private reconcileTimer: number | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -369,8 +379,7 @@ export default class WitnessPlugin extends Plugin {
 
 		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
 			if (file instanceof TFile && file.extension === 'md') {
-				this.indexQueue.add(oldPath, 'delete');
-				this.indexQueue.add(file.path, 'create');
+				this.indexQueue.add(file.path, 'create', oldPath);
 			}
 		}));
 
@@ -384,12 +393,18 @@ export default class WitnessPlugin extends Plugin {
 			this.startTunnel();
 		}
 
-		// Non-blocking startup indexing (5s delay to avoid competing with Obsidian's startup I/O)
-		setTimeout(() => this.startupIndexing(), 5000);
+		// Non-blocking background indexing (5s delay to avoid competing with Obsidian's startup I/O)
+		if (this.settings.enableSemanticSearch) {
+			setTimeout(() => this.startBackgroundIndexing(), 5000);
+		}
 	}
 
 	async onunload() {
 		this.logger.info('Witness plugin unloading');
+		if (this.reconcileTimer) {
+			window.clearInterval(this.reconcileTimer);
+			this.reconcileTimer = null;
+		}
 		this.indexQueue?.clear();
 		this.stopTunnel();
 		this.stopMCPServer();
@@ -486,18 +501,20 @@ export default class WitnessPlugin extends Plugin {
 				await this.app.vault.adapter.remove('.witness/index.orama');
 			}
 		}
+		this.ollamaProvider = null;
+		this.updateStatusBar();
 	}
 
 	/**
 	 * Update the status bar text. Call with no args to show idle state.
 	 */
-	private updateStatusBar(text?: string) {
+	updateStatusBar(text?: string) {
 		if (!this.statusBarEl) return;
 		if (text) {
 			this.statusBarEl.setText(`Witness: ${text}`);
 		} else {
-			const count = this.getIndexCount();
-			this.statusBarEl.setText(count > 0 ? `Witness: ${count.toLocaleString()} indexed` : 'Witness');
+			const fileCount = this.vectorStore?.getFileCount() ?? 0;
+			this.statusBarEl.setText(fileCount > 0 ? `Witness: ${fileCount.toLocaleString()} files indexed` : 'Witness');
 		}
 	}
 
@@ -527,6 +544,7 @@ export default class WitnessPlugin extends Plugin {
 	 * Called when a debounce timer fires after vault events.
 	 */
 	private async processQueue(): Promise<void> {
+		if (!this.settings.enableSemanticSearch) return;
 		if (this.backgroundIndexing) return;
 		if (!this.vectorStore) return;
 		this.backgroundIndexing = true;
@@ -536,36 +554,58 @@ export default class WitnessPlugin extends Plugin {
 			if (items.length === 0) return;
 
 			const toDelete = items.filter(i => i.action === 'delete');
+			const toRename = items.filter(i => i.action === 'rename');
 			const toIndex = items.filter(i => i.action === 'index');
+			let changed = false;
 
 			// Process deletes
 			for (const item of toDelete) {
 				await this.vectorStore!.removeFile(item.path);
 				this.indexLogger.info(`Removed: ${item.path}`);
+				changed = true;
 			}
 
-			// Process indexes
-			if (toIndex.length > 0) {
-				const files = toIndex
-					.map(i => this.app.vault.getAbstractFileByPath(i.path))
-					.filter((f): f is TFile => f instanceof TFile);
-
-				if (files.length > 0) {
-					this.updateStatusBar(`indexing ${files.length} file${files.length > 1 ? 's' : ''}...`);
-					const result = await this.vectorStore!.indexFiles(files, {
-						generateEmbeddings: true,
-						minContentLength: this.settings.minContentLength ?? 50,
-						getFileTags: (f) => this.getFileTags(f),
-						onProgress: (done, total) => {
-							this.updateStatusBar(`indexing ${done}/${total}...`);
-						},
-						onLog: (_level, msg) => this.indexLogger.info(msg),
-					});
-					this.indexLogger.info(`Indexed ${result.indexed} file${result.indexed > 1 ? 's' : ''} (${result.embedded} embedded)`);
+			// Process renames (light metadata update, no re-embedding)
+			const renameFallbacks: TFile[] = [];
+			for (const item of toRename) {
+				if (!item.oldPath) continue;
+				const file = this.app.vault.getAbstractFileByPath(item.path);
+				if (file instanceof TFile) {
+					const moved = await this.vectorStore!.moveFile(item.oldPath, item.path, file);
+					if (moved > 0) {
+						this.indexLogger.info(`Moved: ${item.oldPath} → ${item.path} (${moved} chunks)`);
+						changed = true;
+					} else {
+						// Old path not in index — fall back to full index
+						renameFallbacks.push(file);
+					}
 				}
 			}
 
-			if (toDelete.length > 0 || toIndex.length > 0) {
+			// Process indexes (including rename fallbacks)
+			const filesToIndex = [
+				...toIndex
+					.map(i => this.app.vault.getAbstractFileByPath(i.path))
+					.filter((f): f is TFile => f instanceof TFile),
+				...renameFallbacks,
+			];
+
+			if (filesToIndex.length > 0) {
+				this.updateStatusBar(`indexing ${filesToIndex.length} file${filesToIndex.length > 1 ? 's' : ''}...`);
+				const result = await this.vectorStore!.indexFiles(filesToIndex, {
+					generateEmbeddings: true,
+					minContentLength: this.settings.minContentLength ?? 50,
+					getFileTags: (f) => this.getFileTags(f),
+					onProgress: (done, total) => {
+						this.updateStatusBar(`indexing ${done}/${total}...`);
+					},
+					onLog: (_level, msg) => this.indexLogger.info(msg),
+				});
+				this.indexLogger.info(`Indexed ${result.indexed} file${result.indexed > 1 ? 's' : ''} (${result.embedded} embedded)`);
+				changed = true;
+			}
+
+			if (changed) {
 				await this.vectorStore!.save();
 			}
 		} catch (err) {
@@ -578,45 +618,79 @@ export default class WitnessPlugin extends Plugin {
 	}
 
 	/**
-	 * Run on plugin startup after a delay. Checks for stale files and indexes them.
+	 * Start background indexing: initialise the search engine, run an initial
+	 * reconciliation, then start a periodic reconciliation timer.
 	 */
-	private async startupIndexing(): Promise<void> {
+	private async startBackgroundIndexing(): Promise<void> {
 		try {
 			await this.ensureSearchEngine();
+		} catch {
+			this.indexLogger.info('Could not initialize search engine, skipping background indexing');
+			this.updateStatusBar();
+			return;
+		}
+
+		// Discard any events queued during the startup delay — reconcile catches everything
+		this.indexQueue.clear();
+
+		// Run initial reconciliation immediately
+		await this.reconcile();
+
+		// Start periodic reconciliation (every 60 seconds)
+		this.reconcileTimer = window.setInterval(() => this.reconcile(), 60_000);
+	}
+
+	/**
+	 * Bidirectional reconciliation scan.
+	 * Forward: find stale files (new/modified since last index).
+	 * Reverse: find orphaned index entries (files deleted while plugin was off).
+	 */
+	private async reconcile(): Promise<void> {
+		if (!this.settings.enableSemanticSearch) return;
+		if (this.backgroundIndexing) return;
+		if (!this.vectorStore) return;
+		this.backgroundIndexing = true;
+
+		try {
+			const mdFiles = this.getIndexableFiles();
+			const vaultPaths = new Set(mdFiles.map(f => f.path));
+
+			// Reverse: find orphaned index entries (files deleted while plugin was off)
+			const orphanedPaths = this.vectorStore.getOrphanedPaths(vaultPaths);
+
+			// Forward: find files needing indexing (new/modified)
+			const staleFiles = await this.vectorStore.getStaleFiles(mdFiles);
+
+			if (staleFiles.length === 0 && orphanedPaths.length === 0) return;
+
+			// Remove orphans
+			for (const path of orphanedPaths) {
+				await this.vectorStore.removeFile(path);
+				this.indexLogger.info(`Reconcile removed orphan: ${path}`);
+			}
+
+			// Index stale files
+			if (staleFiles.length > 0) {
+				this.updateStatusBar(`indexing ${staleFiles.length} files...`);
+				await this.vectorStore.indexFiles(staleFiles, {
+					generateEmbeddings: true,
+					minContentLength: this.settings.minContentLength ?? 50,
+					getFileTags: (f) => this.getFileTags(f),
+					onProgress: (done, total) => this.updateStatusBar(`indexing ${done}/${total}...`),
+					onLog: (_level, msg) => this.indexLogger.info(msg),
+				});
+			}
+
+			if (staleFiles.length > 0 || orphanedPaths.length > 0) {
+				await this.vectorStore.save();
+				this.indexLogger.info(`Reconcile: ${staleFiles.length} indexed, ${orphanedPaths.length} orphans removed`);
+			}
 		} catch (err) {
-			this.indexLogger.info('Could not initialize search engine, skipping startup indexing');
+			this.indexLogger.error('Reconciliation failed', err);
+		} finally {
+			this.backgroundIndexing = false;
 			this.updateStatusBar();
-			return;
 		}
-
-		const mdFiles = this.getIndexableFiles();
-		const staleFiles = await this.vectorStore!.getStaleFiles(mdFiles);
-
-		if (staleFiles.length === 0) {
-			this.indexLogger.info(`Startup: all ${mdFiles.length} files up to date`);
-			this.updateStatusBar();
-			return;
-		}
-
-		this.indexLogger.info(`Startup: ${staleFiles.length}/${mdFiles.length} files need indexing`);
-		this.updateStatusBar(`indexing ${staleFiles.length} files...`);
-
-		const result = await this.vectorStore!.indexFiles(staleFiles, {
-			generateEmbeddings: true,
-			minContentLength: this.settings.minContentLength ?? 50,
-			getFileTags: (f) => this.getFileTags(f),
-			onProgress: (done, total) => {
-				this.updateStatusBar(`indexing ${done}/${total}...`);
-			},
-			onLog: (_level, msg) => this.indexLogger.info(msg),
-		});
-
-		await this.vectorStore!.save();
-		this.indexLogger.info(`Startup complete: ${result.indexed} indexed, ${result.embedded} embedded, ${result.failed.length} failed`);
-		this.updateStatusBar();
-
-		// Process any events that queued during startup
-		await this.processQueue();
 	}
 
 	async loadSettings() {
@@ -2748,9 +2822,9 @@ class WitnessSettingTab extends PluginSettingTab {
 	 * Eagerly load the vector store from disk to get the index count,
 	 * without requiring Ollama to be running.
 	 */
-	private async loadIndexCount(): Promise<number> {
+	private async loadIndexFileCount(): Promise<number> {
 		if (this.plugin.vectorStore) {
-			return this.plugin.getIndexCount();
+			return this.plugin.vectorStore.getFileCount();
 		}
 		try {
 			if (!this.plugin.ollamaProvider) {
@@ -2770,7 +2844,7 @@ class WitnessSettingTab extends PluginSettingTab {
 			if (!this.plugin.vectorStore) {
 				this.plugin.vectorStore = vs;
 			}
-			return this.plugin.vectorStore.getCount();
+			return this.plugin.vectorStore.getFileCount();
 		} catch {
 			return 0;
 		}
@@ -2778,7 +2852,25 @@ class WitnessSettingTab extends PluginSettingTab {
 
 	// ===== SEMANTIC SEARCH TAB =====
 	private renderSearchTab(pane: HTMLElement): void {
-		new SettingGroup(pane)
+		const searchContent = pane.createDiv();
+
+		new Setting(pane)
+			.setName('Enable Semantic Search')
+			.setDesc('Enable local vector search via Ollama embeddings. Disable if you only need the MCP server without search.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableSemanticSearch)
+				.onChange(async (value) => {
+					this.plugin.settings.enableSemanticSearch = value;
+					await this.plugin.saveSettings();
+					searchContent.style.display = value ? '' : 'none';
+				}));
+
+		// Move all content into the collapsible container
+		pane.removeChild(searchContent);
+		pane.appendChild(searchContent);
+		searchContent.style.display = this.plugin.settings.enableSemanticSearch ? '' : 'none';
+
+		new SettingGroup(searchContent)
 			.setHeading('Ollama Connection')
 			.addSetting(s => s
 				.setName('Base URL')
@@ -2798,7 +2890,7 @@ class WitnessSettingTab extends PluginSettingTab {
 			f.appendText('Dropdown shows models pulled locally. To add more, run: ');
 			f.createEl('code', {text: 'ollama pull <model-name>'});
 		});
-		const modelSetting = new Setting(pane)
+		const modelSetting = new Setting(searchContent)
 			.setName('Embedding Model')
 			.setDesc(modelDesc);
 
@@ -2865,7 +2957,7 @@ class WitnessSettingTab extends PluginSettingTab {
 			(this.embeddingModelsCache ?? []).map(m => m.name)
 		);
 
-		const modelsGroup = new SettingGroup(pane).setHeading('Available Models');
+		const modelsGroup = new SettingGroup(searchContent).setHeading('Available Models');
 		for (const [name, desc] of AVAILABLE_MODELS) {
 			const isPulled = pulledNames.has(name) || pulledNames.has(name + ':latest');
 			modelsGroup.addSetting(s => {
@@ -2908,24 +3000,24 @@ class WitnessSettingTab extends PluginSettingTab {
 
 		// Index status
 		let indexStatusSetting: Setting;
-		new SettingGroup(pane)
+		new SettingGroup(searchContent)
 			.setHeading('Index')
 			.addSetting(s => {
 				indexStatusSetting = s;
 				s.setName('Index Status');
 
 				// Show cached count immediately, then try loading from disk
-				const count = this.plugin.getIndexCount();
-				if (count > 0) {
-					s.setDesc(`${count} documents indexed`);
+				const fileCount = this.plugin.vectorStore?.getFileCount() ?? 0;
+				if (fileCount > 0) {
+					s.setDesc(`${fileCount} files indexed`);
 				} else {
 					s.setDesc('Checking index...');
 					// Eagerly load index from disk to show accurate count
-					this.loadIndexCount().then(diskCount => {
+					this.loadIndexFileCount().then(diskCount => {
 						if (diskCount > 0) {
-							indexStatusSetting.setDesc(`${diskCount} documents indexed`);
+							indexStatusSetting.setDesc(`${diskCount} files indexed`);
 						} else {
-							indexStatusSetting.setDesc('No index — will be built on first semantic search');
+							indexStatusSetting.setDesc('No index — press Build Index to build it');
 						}
 					});
 				}
@@ -2962,7 +3054,7 @@ class WitnessSettingTab extends PluginSettingTab {
 							const mdFiles = this.plugin.getIndexableFiles();
 							const staleFiles = await vs.getStaleFiles(mdFiles);
 							if (staleFiles.length === 0) {
-								indexStatusSetting.setDesc(`${this.plugin.getIndexCount()} documents indexed — all up to date`);
+								indexStatusSetting.setDesc(`${vs.getFileCount()} files indexed — all up to date`);
 								return;
 							}
 							button.setDisabled(true);
@@ -2983,14 +3075,15 @@ class WitnessSettingTab extends PluginSettingTab {
 							await vs.save();
 							button.setDisabled(false);
 							button.setButtonText('Build Index');
+							this.plugin.updateStatusBar();
 							if (result.failed.length > 0) {
 								const failedPreview = result.failed.slice(0, 5).join('\n');
 								const moreText = result.failed.length > 5 ? `\n...and ${result.failed.length - 5} more (see logs)` : '';
 								indexStatusSetting.setDesc(
-									`${result.indexed} documents indexed (${result.embedded} with embeddings), ${result.failed.length} failed:\n${failedPreview}${moreText}`
+									`${result.indexed} files indexed (${result.embedded} with embeddings), ${result.failed.length} failed:\n${failedPreview}${moreText}`
 								);
 							} else {
-								indexStatusSetting.setDesc(`${this.plugin.getIndexCount()} documents indexed (${result.embedded} with embeddings)`);
+								indexStatusSetting.setDesc(`${vs.getFileCount()} files indexed (${result.embedded} with embeddings)`);
 							}
 						} catch (e) {
 							this.plugin.logger.error('Indexing failed', e);
@@ -3002,17 +3095,17 @@ class WitnessSettingTab extends PluginSettingTab {
 			})
 			.addSetting(s => {
 				s.setName('Clear Index')
-				 .setDesc('Clear the existing index and rebuild from scratch on next search');
+				 .setDesc('Clear the existing index');
 				s.addButton(button => button
 					.setButtonText('Clear Index')
 					.onClick(async () => {
 						await this.plugin.clearIndex();
-						indexStatusSetting.setDesc('Index cleared — will be rebuilt on next semantic search');
+						indexStatusSetting.setDesc('No index — press Build Index to build it');
 					}));
 			});
 
 		// Indexing filters
-		new SettingGroup(pane)
+		new SettingGroup(searchContent)
 			.setHeading('Indexing Filters')
 			.addSetting(s => s
 				.setName('Minimum content length')
@@ -3029,7 +3122,7 @@ class WitnessSettingTab extends PluginSettingTab {
 					})));
 
 		// Folder exclusions
-		const exclusionsGroup = new SettingGroup(pane)
+		const exclusionsGroup = new SettingGroup(searchContent)
 			.setHeading('Folder Exclusions');
 
 		for (const folder of this.plugin.settings.excludedFolders) {

@@ -1742,3 +1742,73 @@ The user's instinct to test features against the real 4,097-document vault via M
 ---
 
 *End of log entry*
+
+## 2026-02-10 - File Counts, Light Moves, and Periodic Reconciliation
+
+**Objective**: Improve background indexing accuracy — show correct file counts, handle renames efficiently, and add a safety net for missed events.
+
+### What We Built
+
+- **File count tracking**: Status bar and settings now show the number of unique files indexed (e.g. "1,874 files indexed") instead of the Orama chunk count, which was a misleading internal metric
+- **Light file moves**: File renames/moves update index metadata (path, title, folder, chunk IDs) without re-generating embeddings via Ollama — O(n chunks) remove+insert vs a full embedding round-trip
+- **Periodic reconciliation**: A bidirectional scan every 60 seconds that catches stale files (forward: vault → index) and orphaned entries (reverse: index → vault)
+- **Removed sync-settling**: The complex `waitForSync()`/`syncSettling`/`pendingSyncActions` mechanism was replaced entirely by reconciliation, which naturally handles Obsidian Sync drift
+
+### The Journey
+
+The session started with a seemingly simple request: show file count instead of chunk count in the status bar. This led to adding an `indexedFiles` Set to the vector store, persisted in the save envelope. Straightforward.
+
+Then came the question about moves — "do moves matter?" Yes, but more importantly, a rename shouldn't trigger a full re-index with embedding generation. So we added `moveFile()` to the vector store, which does O(1) lookups per chunk via `getByID()`, removes the old entry, and re-inserts with updated metadata. The embedding vector is preserved as-is. The `IndexQueue` gained a 'rename' action type with `oldPath` tracking, and `processQueue()` handles renames with a fallback to full indexing if the old path isn't found.
+
+After deploying to the main vault, problems emerged. The status bar was stuck on "Witness loading" for ages. Investigation of the indexing logs revealed Readwise was the culprit — re-indexing ~60 files every 30 minutes, 3,015 files total across 67 batches in a single day. The modify events were legitimate (Readwise touches file mtimes), but the re-embedding was wasteful.
+
+More critically, disabling the plugin, deleting files, and re-enabling left orphaned entries in the index. The event-driven system had no way to detect what happened while it was off.
+
+This led to the key architectural decision: add periodic reconciliation as a safety net. The debate was whether to replace event listeners entirely with polling. The answer: keep both. Event listeners provide instant responsiveness (3-second debounce), while reconciliation catches everything that slips through — sync drift, offline mutations, plugin restarts, Readwise storms.
+
+The implementation was clean:
+- `getOrphanedPaths()` on the vector store compares `indexedFiles` against vault paths
+- `reconcile()` does both directions in one pass, then saves
+- `startBackgroundIndexing()` replaces the complex `startupIndexing()` — init, clear queue, reconcile once, start 60-second timer
+- All sync-settling code removed (6 fields/methods eliminated)
+
+One subtle bug emerged after deployment: the status bar showed "516 files indexed" after reconciling 516 stale files, when the vault has 1,874 files. The issue: `getStaleFiles()` iterated all files but only tracked stale ones — files already up-to-date in the index were never added to `indexedFiles`. A two-line fix (adding `this.indexedFiles.add(file.path)` in the "not stale" branches) resolved it.
+
+### Technical Achievements
+
+- **`indexedFiles` Set**: Tracks unique file paths across all operations (index, remove, move, clear), persisted in the save envelope, and self-healing via `getStaleFiles()`
+- **Light moveFile**: Preserves embeddings during renames — zero Ollama calls for file moves
+- **Bidirectional reconciliation**: Forward scan (stale detection) + reverse scan (orphan detection) in a single pass
+- **Sync-settling elimination**: Removed ~80 lines of complex async sync-waiting logic, replaced by a simple 60-second timer
+
+### Key Learnings
+
+- **Tracking state across saves**: When adding a new tracking mechanism (like `indexedFiles`), the first deploy against an existing index won't have the new data in the envelope. The system must self-heal — `getStaleFiles()` now populates the Set as a side effect, so it converges after one reconciliation pass.
+- **Event-driven + polling is better than either alone**: Events for immediacy, polling for correctness. Neither is sufficient on its own when the system can be paused, restarted, or bypassed.
+- **Readwise storm diagnosis**: Log files were essential. Without the `indexing-YYYY-MM-DD.log`, the Readwise re-indexing pattern (every 30 minutes, ~60 files) would have been invisible. The user fixed it on the Readwise side, but the reconciliation architecture makes Witness resilient to similar future issues.
+- **Status bar as contract**: Users read the status bar as the source of truth. If it says "516 files indexed" when 1,874 exist, trust is broken. The fix was trivial but the principle matters — every public-facing number must reflect the full state, not just the last operation.
+
+### Statistics
+
+- **Files changed**: 5
+- **Lines**: +291 / -107
+- **Tests**: 37/37 passing (14 chunker + 23 vector-store)
+- **Deployed**: Both demo vault and main vault (1,874 files)
+- **Readwise storm eliminated**: From 3,015 redundant re-indexes/day to 0
+
+### Next Steps
+
+- Handle the context-length embedding failures (several files consistently fail — investigate chunker behaviour for long documents)
+- Consider adding a `semantic_search` toggle to settings UI (the `enableSemanticSearch` field exists but has no UI control yet)
+- Log viewer in settings tab (from the background-indexing spec — not yet implemented)
+- Monitor reconciliation performance on the main vault over the next few days
+
+### Reflections
+
+This session demonstrated the value of deploying to a real vault early. The Readwise storm, orphaned entries, and status bar count bug were all invisible in the demo vault and unit tests. The main vault — with 1,874 files, Obsidian Sync, Readwise integration, and actual daily use — is where the real edge cases live.
+
+The reconciliation pattern is satisfying in its simplicity. Instead of trying to handle every possible source of drift (sync, plugin restart, external tools), we just check periodically. The event listeners handle the 99% case instantly; reconciliation handles the 1% eventually. Both are necessary; neither is sufficient alone.
+
+---
+
+*End of log entry*
