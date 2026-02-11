@@ -206,6 +206,7 @@ export class OramaSearchEngine implements SearchEngine {
 			getFileTags?: (file: TFile) => string[];
 			onProgress?: (done: number, total: number) => void;
 			onLog?: (level: string, message: string, data?: any) => void;
+			isUserActive?: () => boolean;
 		},
 	): Promise<{ indexed: number; embedded: number; failed: string[] }> {
 		if (!this.db) throw new Error('OramaSearchEngine not initialized');
@@ -218,6 +219,11 @@ export class OramaSearchEngine implements SearchEngine {
 		const minContentLength = options?.minContentLength ?? 0;
 
 		for (const file of files) {
+			// Pause while the user is actively typing to avoid UI stutter
+			while (options?.isUserActive?.()) {
+				await new Promise(resolve => setTimeout(resolve, 500));
+			}
+
 			try {
 				const content = await this.app.vault.cachedRead(file);
 				const chunks = chunkMarkdown(content);
@@ -242,6 +248,8 @@ export class OramaSearchEngine implements SearchEngine {
 						folder,
 					};
 					await insert(this.db, doc);
+					// Yield after each insert so the UI thread can process events
+					await new Promise(resolve => setTimeout(resolve, 0));
 				}
 
 				indexed++;
@@ -270,6 +278,8 @@ export class OramaSearchEngine implements SearchEngine {
 								folder,
 								embedding: embeddings[i],
 							});
+							// Yield after each remove+insert so the UI thread can process events
+							await new Promise(resolve => setTimeout(resolve, 0));
 						}
 						embedded++;
 					} catch (e) {
@@ -283,6 +293,9 @@ export class OramaSearchEngine implements SearchEngine {
 			}
 
 			options?.onProgress?.(indexed + failed.length, total);
+
+			// Yield to the renderer so the UI can repaint and process input events
+			await new Promise(resolve => setTimeout(resolve, 0));
 		}
 
 		return { indexed, embedded, failed };
@@ -310,6 +323,8 @@ export class OramaSearchEngine implements SearchEngine {
 				const existing = getByID(this.db, id);
 				if (existing) {
 					await remove(this.db, id);
+					// Yield after each remove so the UI thread can process events
+					await new Promise(resolve => setTimeout(resolve, 0));
 				} else {
 					break; // No more chunks for this file
 				}

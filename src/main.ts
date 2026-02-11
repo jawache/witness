@@ -201,6 +201,11 @@ interface WitnessSettings {
 	serverInstructions: string;
 	// Orientation document
 	orientationPath: string;
+	// Vault folder paths (chaos → order lifecycle)
+	chaosFolder: string;
+	lifeFolder: string;
+	orderFolder: string;
+	deathFolder: string;
 	// Custom commands exposed as MCP tools
 	customCommands: CustomCommandConfig[];
 	// Core tool description overrides
@@ -258,6 +263,10 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	authToken: '',
 	serverInstructions: 'Before performing any operations, use get_vault_context to load the vault structure and organizational context. This helps understand the chaos/order system and current vault state.',
 	orientationPath: '',
+	chaosFolder: '1-chaos',
+	lifeFolder: '2-life',
+	orderFolder: '3-order',
+	deathFolder: '4-death',
 	customCommands: [],
 	coreToolDescriptions: {},
 	enableCommandFallback: false,
@@ -290,6 +299,7 @@ export default class WitnessPlugin extends Plugin {
 	private statusBarEl: HTMLElement | null = null;
 	private backgroundIndexing = false;
 	private reconcileTimer: number | null = null;
+	private lastEditorActivity = 0;
 
 	async onload() {
 		await this.loadSettings();
@@ -383,6 +393,11 @@ export default class WitnessPlugin extends Plugin {
 			if (file instanceof TFile && file.extension === 'md') {
 				this.indexQueue.add(file.path, 'create', oldPath);
 			}
+		}));
+
+		// Track editor activity to pause indexing while user is typing
+		this.registerEvent(this.app.workspace.on('editor-change', () => {
+			this.lastEditorActivity = Date.now();
 		}));
 
 		// Start MCP server if enabled
@@ -602,6 +617,7 @@ export default class WitnessPlugin extends Plugin {
 						this.updateStatusBar(`indexing ${done}/${total}...`);
 					},
 					onLog: (_level, msg) => this.indexLogger.info(msg),
+					isUserActive: () => Date.now() - this.lastEditorActivity < 2000,
 				});
 				this.indexLogger.info(`Indexed ${result.indexed} file${result.indexed > 1 ? 's' : ''} (${result.embedded} embedded)`);
 				changed = true;
@@ -654,6 +670,7 @@ export default class WitnessPlugin extends Plugin {
 		this.backgroundIndexing = true;
 
 		try {
+			const RECONCILE_BATCH_SIZE = 10;
 			const mdFiles = this.getIndexableFiles();
 			const vaultPaths = new Set(mdFiles.map(f => f.path));
 
@@ -661,7 +678,13 @@ export default class WitnessPlugin extends Plugin {
 			const orphanedPaths = this.vectorStore.getOrphanedPaths(vaultPaths);
 
 			// Forward: find files needing indexing (new/modified)
-			const staleFiles = await this.vectorStore.getStaleFiles(mdFiles);
+			const allStaleFiles = await this.vectorStore.getStaleFiles(mdFiles);
+
+			// Cap batch size to avoid long blocking — rest picked up next cycle
+			const staleFiles = allStaleFiles.slice(0, RECONCILE_BATCH_SIZE);
+			if (staleFiles.length < allStaleFiles.length) {
+				this.indexLogger.info(`Reconcile: processing ${staleFiles.length}/${allStaleFiles.length} stale files (rest next cycle)`);
+			}
 
 			if (staleFiles.length === 0 && orphanedPaths.length === 0) return;
 
@@ -680,6 +703,7 @@ export default class WitnessPlugin extends Plugin {
 					getFileTags: (f) => this.getFileTags(f),
 					onProgress: (done, total) => this.updateStatusBar(`indexing ${done}/${total}...`),
 					onLog: (_level, msg) => this.indexLogger.info(msg),
+					isUserActive: () => Date.now() - this.lastEditorActivity < 2000,
 				});
 			}
 
@@ -1538,6 +1562,15 @@ export default class WitnessPlugin extends Plugin {
 				// Always resolve Dataview blocks in the orientation document
 				content = await this.resolveDataviewBlocks(content);
 
+				// Append vault folder locations
+				const folders = [
+					`- **Chaos**: \`${this.settings.chaosFolder}\``,
+					`- **Life**: \`${this.settings.lifeFolder}\``,
+					`- **Order**: \`${this.settings.orderFolder}\``,
+					`- **Death**: \`${this.settings.deathFolder}\``,
+				].join('\n');
+				content += `\n\n---\n\n## Vault Folders\n\n${folders}\n`;
+
 				this.logger.mcp(`Successfully read file, length: ${content.length} chars`);
 
 				return {
@@ -1631,15 +1664,16 @@ export default class WitnessPlugin extends Plugin {
 			'Filters out items already triaged (processed, acknowledged, or deferred with a future date). ' +
 			'Includes deferred items whose defer date has passed.',
 			{
-				path: z.string().optional().describe('Limit to a subfolder (e.g., "1-chaos/external/readwise/articles"). Defaults to "1-chaos/".'),
+				path: z.string().optional().describe('Limit to a subfolder within the chaos folder. Defaults to the configured chaos folder path.'),
 				list: z.boolean().optional().describe('When true, return a list of all pending items with metadata instead of the next single item with full content.'),
 			},
 			{
 				readOnlyHint: true,
 			},
 			async ({ path: chaosPath, list }) => {
-				this.logger.mcp(`get_next_chaos called: path=${chaosPath || '1-chaos/'}, list=${!!list}`);
-				const basePath = chaosPath || '1-chaos/';
+				const defaultChaosPath = this.settings.chaosFolder ? `${this.settings.chaosFolder}/` : '1-chaos/';
+				this.logger.mcp(`get_next_chaos called: path=${chaosPath || defaultChaosPath}, list=${!!list}`);
+				const basePath = chaosPath || defaultChaosPath;
 				const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
 				// Get all markdown files under the chaos path
@@ -1683,7 +1717,7 @@ export default class WitnessPlugin extends Plugin {
 				});
 
 				// Count total untriaged across all chaos
-				const allChaosFiles = allFiles.filter(f => f.path.startsWith('1-chaos/'));
+				const allChaosFiles = allFiles.filter(f => f.path.startsWith(defaultChaosPath));
 				let totalPending = 0;
 				for (const file of allChaosFiles) {
 					const cache = this.app.metadataCache.getFileCache(file);
@@ -2694,6 +2728,34 @@ class WitnessSettingTab extends PluginSettingTab {
 					});
 				});
 			});
+
+		// Vault folder paths
+		const folderSettings: { key: keyof WitnessSettings; label: string; desc: string }[] = [
+			{ key: 'chaosFolder', label: 'Chaos Folder', desc: 'Unprocessed incoming information (articles, notes, clippings)' },
+			{ key: 'lifeFolder', label: 'Life Folder', desc: 'Living documents and active references' },
+			{ key: 'orderFolder', label: 'Order Folder', desc: 'Structured, processed knowledge' },
+			{ key: 'deathFolder', label: 'Death Folder', desc: 'Archived and retired content' },
+		];
+
+		const foldersGroup = new SettingGroup(pane)
+			.setHeading('Vault Folders');
+
+		for (const { key, label, desc } of folderSettings) {
+			foldersGroup.addSetting(s => {
+				s.setName(label)
+				 .setDesc(desc);
+				s.addButton(button => {
+					button.setButtonText((this.plugin.settings[key] as string) || 'Select folder');
+					button.onClick(() => {
+						new FolderSuggestModal(this.app, async (folder) => {
+							(this.plugin.settings[key] as string) = folder;
+							button.setButtonText(folder);
+							await this.plugin.saveSettings();
+						}).open();
+					});
+				});
+			});
+		}
 	}
 
 	// ===== CUSTOM COMMANDS TAB =====
