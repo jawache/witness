@@ -1812,3 +1812,81 @@ The reconciliation pattern is satisfying in its simplicity. Instead of trying to
 ---
 
 *End of log entry*
+
+## 2026-02-08 - Chaos Triage: Teaching the AI to Process Unread Items
+
+**Objective**: Implement MCP tools for triaging chaos items — the first step toward Witness actively helping manage the chaos→order pipeline — along with safety improvements to prevent AI tools from accidentally destroying files.
+
+### What We Built
+
+1. **`get_next_chaos` MCP tool** — Scans the chaos folder for untriaged items, filtering by triage status and deferred dates. Two modes: single (full content of next item) and list (compact path/title/date for up to 10 items). Includes queue counts showing total pending and in-path counts.
+
+2. **`mark_triage` MCP tool** — Records triage decisions using Obsidian's `processFrontMatter` API for safe YAML updates. Three actions: `processed` (stamps today's date), `deferred` (boomerang with target date), `acknowledged` (reviewed, no action needed).
+
+3. **`write_file` made create-only** — Previously silently overwrote existing files. Now errors with guidance toward `edit_file`. This prevents the AI's worst instinct: delete and recreate when confused.
+
+4. **`edit_file` error messages improved** — When text isn't found, the error now truncates the search string (max 80 chars), suggests re-reading the file, and warns against delete+recreate.
+
+5. **Link discovery feature spec** — Wrote up the full spec for future two-stage pipeline (embeddings for cheap candidate detection, local LLM for validation/anchor text, Grammarly-style review panel).
+
+6. **Chaos triage feature spec updated** — Renamed `triage_chaos` → `mark_triage`, added list mode, queue counts, and the edit_file guidance section.
+
+### The Journey
+
+The session started with writing up the link discovery feature spec, but quickly pivoted to the more pressing need: chaos triage. The user had been using Witness daily and noticed two friction points that needed addressing before triage tools would work reliably.
+
+**The Delete+Recreate Problem**
+
+The most interesting finding was around AI behaviour. When the AI encounters a frontmatter editing challenge — YAML is fiddly, indentation matters, and metadata cache can lag — it often falls back to deleting the file and recreating it from scratch. This "works" in the sense that the content is correct, but destroys file metadata (creation date, mtime) and any Obsidian-internal state (backlinks cache, etc.). The fix was twofold:
+
+1. Make `write_file` refuse to overwrite existing files, with an error message that guides toward `edit_file`
+2. Make `edit_file` errors explain what probably went wrong and warn against the delete+recreate pattern
+
+Both changes are essentially "AI guardrails" — the tools now teach the AI how to recover from mistakes instead of letting it fall into destructive patterns.
+
+**The `processFrontMatter` Discovery**
+
+For `mark_triage`, the key insight was using Obsidian's `processFrontMatter` API instead of having the AI manually edit YAML. This API accepts a callback that receives the parsed frontmatter object — set a property, done. No YAML parsing, no indentation issues, no race conditions with the metadata cache. This is exactly the kind of specialised tool that prevents the fumbling.
+
+**List Mode Context Budget**
+
+The first implementation of list mode returned full frontmatter for all pending items. The user immediately reported it killed their context window — a 4,000-file vault produces a lot of metadata. Slimmed it to just `{path, title, date}` with a max of 10 items. The lesson: always think about what the AI actually needs to make a decision, not what might be useful.
+
+### Technical Achievements
+
+- **16 MCP tools** now registered (up from 14)
+- **Triage frontmatter convention**: `triage: YYYY-MM-DD` (processed), `triage: deferred YYYY-MM-DD` (boomerang), `triage: acknowledged` (reviewed)
+- **Deferred date comparison**: String comparison `deferDate <= today` works for YYYY-MM-DD format — no Date parsing needed
+- **Queue counts**: Every response includes `{total, in_path}` so the AI knows how much work remains
+- **47 integration tests** passing (up from 37), including 11 new triage tests
+- **37 unit tests** passing
+
+### Key Learnings
+
+- **AI guardrails in error messages work**: The `write_file` and `edit_file` error messages now teach the AI the correct workflow. This is more effective than documentation — the AI reads errors in real-time.
+- **`processFrontMatter` is the right abstraction**: Obsidian's API for safe frontmatter updates eliminates an entire class of YAML-fumbling bugs. Always look for platform APIs before rolling your own.
+- **Context window budget matters for list endpoints**: Returning "everything" from a list endpoint can blow the AI's context window. Design list responses with the minimum fields needed for the next decision.
+- **Deferred dates as string comparison**: YYYY-MM-DD format is lexicographically ordered, so `"2026-02-01" <= "2026-02-08"` just works. No need for Date objects.
+
+### Statistics
+
+- **Files changed**: 6 (+ 7 new test fixtures, + 1 new feature spec)
+- **Lines**: +445 / -54
+- **Integration tests**: 47 passing (was 37)
+- **Unit tests**: 37 passing
+- **MCP tools**: 16 registered (was 14)
+- **Deployed**: Test vault, demo vault, and main vault
+
+### Next Steps
+
+- Fix background indexing stutter (typing lag every 30 seconds when reconciliation runs)
+- Re-ranking feature (Ollama-based re-ranking for higher precision results)
+- Link discovery implementation
+
+### Reflections
+
+This session was about making the AI a better collaborator. The triage tools themselves are straightforward — scan, filter, sort, update frontmatter. What's more interesting is the defensive design: error messages that teach, tools that refuse destructive shortcuts, and response formats tuned to context window budgets. Every tool is a conversation with the AI, and the error paths are where the real teaching happens.
+
+---
+
+*End of log entry*

@@ -218,6 +218,8 @@ interface WitnessSettings {
 		copy_file?: string;
 		execute_command?: string;
 		semantic_search?: string;
+		get_next_chaos?: string;
+		mark_triage?: string;
 	};
 	// Command fallback system (opt-in)
 	enableCommandFallback: boolean;
@@ -887,10 +889,10 @@ export default class WitnessPlugin extends Plugin {
 			}
 		);
 
-		// Register write_file tool (DESTRUCTIVE)
+		// Register write_file tool (creates new files only)
 		this.mcpServer.tool(
 			'write_file',
-			this.getToolDescription('write_file', 'Write content to a file in the vault (creates or overwrites)'),
+			this.getToolDescription('write_file', 'Write content to a file in the vault (creates new files only — use edit_file to modify existing files)'),
 			{
 				path: z.string().describe('Path to the file relative to vault root'),
 				content: z.string().describe('Content to write to the file'),
@@ -901,15 +903,18 @@ export default class WitnessPlugin extends Plugin {
 			async ({ path, content }) => {
 				const existing = this.app.vault.getAbstractFileByPath(path);
 				if (existing) {
-					await this.app.vault.modify(existing as any, content);
-				} else {
-					await this.app.vault.create(path, content);
+					throw new Error(
+						`File already exists: ${path}. ` +
+						`Use edit_file for targeted changes, or re-read the file with read_file and use edit_file to replace the content. ` +
+						`Do NOT delete and recreate the file — this loses file metadata and timestamps.`
+					);
 				}
+				await this.app.vault.create(path, content);
 				return {
 					content: [
 						{
 							type: 'text',
-							text: `Successfully wrote to ${path}`,
+							text: `Successfully created ${path}`,
 						},
 					],
 					isError: false,
@@ -971,7 +976,12 @@ export default class WitnessPlugin extends Plugin {
 
 				// Check if find text exists
 				if (!content.includes(find)) {
-					throw new Error(`Text not found in file: "${find}"`);
+					throw new Error(
+						`Text not found in file: "${find.slice(0, 80)}${find.length > 80 ? '...' : ''}". ` +
+						`The file may have changed since you last read it. ` +
+						`Re-read the file with read_file first, then retry edit_file with the current content. ` +
+						`Do NOT delete and recreate the file — this loses file metadata and timestamps.`
+					);
 				}
 
 				// Replace all occurrences
@@ -1611,6 +1621,175 @@ export default class WitnessPlugin extends Plugin {
 						isError: true,
 					};
 				}
+			}
+		);
+
+		// Register get_next_chaos tool (READ-ONLY)
+		this.mcpServer.tool(
+			'get_next_chaos',
+			'Get the next unprocessed chaos item for triage review. Returns full file content by default, or a list of pending items with metadata. ' +
+			'Filters out items already triaged (processed, acknowledged, or deferred with a future date). ' +
+			'Includes deferred items whose defer date has passed.',
+			{
+				path: z.string().optional().describe('Limit to a subfolder (e.g., "1-chaos/external/readwise/articles"). Defaults to "1-chaos/".'),
+				list: z.boolean().optional().describe('When true, return a list of all pending items with metadata instead of the next single item with full content.'),
+			},
+			{
+				readOnlyHint: true,
+			},
+			async ({ path: chaosPath, list }) => {
+				this.logger.mcp(`get_next_chaos called: path=${chaosPath || '1-chaos/'}, list=${!!list}`);
+				const basePath = chaosPath || '1-chaos/';
+				const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+				// Get all markdown files under the chaos path
+				const allFiles = this.app.vault.getMarkdownFiles();
+				const chaosFiles = allFiles.filter(f => f.path.startsWith(basePath));
+
+				if (chaosFiles.length === 0) {
+					return {
+						content: [{ type: 'text', text: JSON.stringify({ items: [], queue: { total: 0, in_path: 0 }, message: `No markdown files found in ${basePath}` }) }],
+						isError: false,
+					};
+				}
+
+				// Filter to untriaged items
+				const pending: { file: TFile; date: string | null; frontmatter: Record<string, any> }[] = [];
+				for (const file of chaosFiles) {
+					const cache = this.app.metadataCache.getFileCache(file);
+					const fm = cache?.frontmatter;
+					const triageValue = fm?.triage;
+
+					if (triageValue === undefined || triageValue === null || triageValue === '') {
+						// No triage field — untriaged
+						const dateStr = fm?.created || fm?.date || null;
+						pending.push({ file, date: dateStr ? String(dateStr) : null, frontmatter: fm ? { ...fm } : {} });
+					} else if (typeof triageValue === 'string' && triageValue.startsWith('deferred ')) {
+						// Deferred — check if defer date has passed
+						const deferDate = triageValue.replace('deferred ', '').trim();
+						if (deferDate <= today) {
+							const dateStr = fm?.created || fm?.date || null;
+							pending.push({ file, date: dateStr ? String(dateStr) : null, frontmatter: fm ? { ...fm } : {} });
+						}
+					}
+					// Otherwise: processed (date), acknowledged — skip
+				}
+
+				// Sort by date descending (newest first), falling back to mtime
+				pending.sort((a, b) => {
+					const dateA = a.date || new Date(a.file.stat.mtime).toISOString().slice(0, 10);
+					const dateB = b.date || new Date(b.file.stat.mtime).toISOString().slice(0, 10);
+					return dateB.localeCompare(dateA);
+				});
+
+				// Count total untriaged across all chaos
+				const allChaosFiles = allFiles.filter(f => f.path.startsWith('1-chaos/'));
+				let totalPending = 0;
+				for (const file of allChaosFiles) {
+					const cache = this.app.metadataCache.getFileCache(file);
+					const triageValue = cache?.frontmatter?.triage;
+					if (triageValue === undefined || triageValue === null || triageValue === '') {
+						totalPending++;
+					} else if (typeof triageValue === 'string' && triageValue.startsWith('deferred ') && triageValue.replace('deferred ', '').trim() <= today) {
+						totalPending++;
+					}
+				}
+
+				const queue = { total: totalPending, in_path: pending.length };
+
+				if (pending.length === 0) {
+					return {
+						content: [{ type: 'text', text: JSON.stringify({ items: [], queue, message: `No untriaged items in ${basePath}` }) }],
+						isError: false,
+					};
+				}
+
+				if (list) {
+					// List mode — compact: path, title, date only, max 10 items
+					const items = pending.slice(0, 10).map(p => ({
+						path: p.file.path,
+						title: p.frontmatter.title || p.file.basename,
+						date: p.date,
+					}));
+					return {
+						content: [{ type: 'text', text: JSON.stringify({ items, queue }) }],
+						isError: false,
+					};
+				} else {
+					// Single mode — return full content of next item
+					const next = pending[0];
+					const fileContent = await this.app.vault.read(next.file);
+					const { position, ...fm } = next.frontmatter;
+					return {
+						content: [{
+							type: 'text',
+							text: JSON.stringify({
+								path: next.file.path,
+								content: fileContent,
+								frontmatter: Object.keys(fm).length > 0 ? fm : undefined,
+								queue,
+							}, null, 2),
+						}],
+						isError: false,
+					};
+				}
+			}
+		);
+
+		// Register mark_triage tool (DESTRUCTIVE)
+		this.mcpServer.tool(
+			'mark_triage',
+			'Record a triage decision for a chaos item. Sets the triage frontmatter field — no need to manually parse or edit YAML. ' +
+			'Actions: "processed" (knowledge extracted, marks with today\'s date), "deferred" (come back later, requires defer_until date), ' +
+			'"acknowledged" (reviewed, no action needed).',
+			{
+				path: z.string().describe('Path to the chaos file to triage'),
+				action: z.enum(['processed', 'deferred', 'acknowledged']).describe('Triage action: processed, deferred, or acknowledged'),
+				defer_until: z.string().optional().describe('Required for "deferred" action. Date string YYYY-MM-DD for when to resurface the item.'),
+			},
+			{
+				destructiveHint: true,
+			},
+			async ({ path: filePath, action, defer_until }) => {
+				this.logger.mcp(`mark_triage called: path=${filePath}, action=${action}, defer_until=${defer_until || 'n/a'}`);
+
+				if (action === 'deferred' && !defer_until) {
+					throw new Error('defer_until date is required when action is "deferred". Provide a YYYY-MM-DD date.');
+				}
+
+				const file = this.app.vault.getAbstractFileByPath(filePath);
+				if (!file || !(file instanceof TFile)) {
+					throw new Error(`File not found: ${filePath}`);
+				}
+
+				// Determine triage value
+				let triageValue: string;
+				if (action === 'processed') {
+					triageValue = new Date().toISOString().slice(0, 10); // Today's date
+				} else if (action === 'deferred') {
+					triageValue = `deferred ${defer_until}`;
+				} else {
+					triageValue = 'acknowledged';
+				}
+
+				// Use Obsidian's processFrontMatter for safe frontmatter updates
+				await this.app.fileManager.processFrontMatter(file, (fm) => {
+					fm.triage = triageValue;
+				});
+
+				this.logger.mcp(`mark_triage: set triage=${triageValue} on ${filePath}`);
+
+				return {
+					content: [{
+						type: 'text',
+						text: JSON.stringify({
+							path: filePath,
+							action,
+							triage: triageValue,
+						}),
+					}],
+					isError: false,
+				};
 			}
 		);
 

@@ -104,7 +104,7 @@ All Core MCP Tools Implemented:
 
 - ✅ Claude Desktop successfully connected to Witness MCP server
 - ✅ `read_file` - Read file contents from vault
-- ✅ `write_file` - Create and modify files in vault
+- ✅ `write_file` - Create new files in vault (create-only, errors on existing files)
 - ✅ `list_files` - List directory contents
 - ✅ `edit_file` - Find/replace for surgical file updates
 - ✅ `search` - Full-text search across vault
@@ -117,7 +117,7 @@ All Core MCP Tools Implemented:
 - ✅ Files created via MCP visible in Obsidian UI
 - ✅ Session management and SSE streams working correctly
 - ✅ File-based logging to `.obsidian/plugins/witness/logs/`
-- ✅ Integration test suite (23 tests)
+- ✅ Integration test suite (47 tests)
 
 Total: 9 MCP tools registered and available
 
@@ -179,7 +179,32 @@ Semantic Search via Ollama + Orama:
 - ✅ `indexedFiles` Set for accurate file count tracking
 - ✅ Status bar with file count and indexing progress
 
-Total: 15 MCP tools registered and available
+Total: 16 MCP tools registered and available
+
+### Chaos Triage Tools
+
+Two tools for processing unread chaos items:
+
+- **`get_next_chaos`** — Scans `1-chaos/` for untriaged items. Filters out processed, acknowledged, and future-deferred items. Two modes:
+  - Single mode (default): Returns full file content of the next item
+  - List mode (`list: true`): Returns compact `{path, title, date}` for up to 10 items
+  - Every response includes `queue: {total, in_path}` counts
+
+- **`mark_triage`** — Records triage decisions via `processFrontMatter` API. Three actions:
+  - `processed`: Sets `triage: YYYY-MM-DD` (today's date)
+  - `deferred`: Sets `triage: deferred YYYY-MM-DD` (requires `defer_until` param)
+  - `acknowledged`: Sets `triage: acknowledged`
+
+**Triage frontmatter convention:**
+- `triage: 2026-02-08` → Processed on that date
+- `triage: deferred 2026-03-01` → Resurfaces when date passes
+- `triage: acknowledged` → Reviewed, no action needed
+- No `triage` field → Untriaged, appears in queue
+
+**AI Safety Guardrails:**
+- `write_file` is create-only — errors on existing files with guidance toward `edit_file`
+- `edit_file` error messages truncate search text, suggest re-reading, warn against delete+recreate
+- `mark_triage` uses `processFrontMatter` to avoid AI fumbling with YAML
 
 ### Markdown Chunking
 
@@ -238,7 +263,7 @@ See `docs/features/unified-search.md` for full spec. Key decisions:
 
 **Dataview API Access:** `(this.app as any).plugins.plugins.dataview?.api` — returns the DV API or undefined.
 
-Total: 14 MCP tools registered and available
+Total: 16 MCP tools registered and available
 
 ## MCP Implementation Details
 

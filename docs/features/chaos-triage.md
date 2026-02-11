@@ -2,15 +2,21 @@
 
 **Status:** Planned
 **Created:** 2026-02-07
-**Last Updated:** 2026-02-07
+**Last Updated:** 2026-02-11
 
 ## Overview
 
-A system for processing chaos items one at a time — surfacing the most recent unprocessed item, presenting it for review, and recording the triage decision. Two MCP tools provide the plumbing; a triage prompt drives the conversation.
+A system for processing chaos items — surfacing unprocessed items for review and recording triage decisions. Two MCP tools handle the mechanics: `get_next_chaos` fetches items with full content, `mark_triage` records the decision by writing frontmatter. This removes the AI's need to manually query files, parse frontmatter, or figure out what fields to set.
 
 ## Problem Statement
 
 Nearly 1,000 items sit in `1-chaos/` across readwise highlights, inbox captures, transcripts, old evernote imports, and notes. There's no mechanism to systematically work through them, no way to distinguish items that have been reviewed from those that haven't, and no structured workflow for deciding what to do with each one.
+
+Two additional problems surfaced from real usage:
+
+1. **AI fumbles frontmatter:** When asked to triage, the AI guesses at field names, formats, and values. It tries to read files, parse YAML, set fields via `edit_file`, and frequently gets it wrong. Dedicated tools eliminate this — the AI calls `mark_triage` with an action, and the tool handles the frontmatter correctly every time.
+
+2. **Redundant round-trips:** The AI calls `get_next_chaos` to get a path, then calls `read_file` to read the content. By returning the full file content in `get_next_chaos`, we save a tool call and make the workflow snappier.
 
 The goal isn't to process everything — it's to keep on top of new incoming items by working most-recent-first, making a conscious decision about each one, and recording that decision so items don't resurface.
 
@@ -54,23 +60,51 @@ triage: acknowledged
 
 #### `get_next_chaos`
 
-Returns the next unprocessed chaos item for review.
+Returns unprocessed chaos items for review — either the next single item (default) or a list.
 
 **Parameters:**
-- `path` (optional) — Limit to a specific subfolder, e.g. `1-chaos/internal/inbox` or `1-chaos/external/readwise/articles`. Defaults to all of `1-chaos/`.
+- `path` (optional) — Limit to a specific subfolder, e.g. `1-chaos/internal/inbox` or `1-chaos/external/readwise/articles`. Defaults to `1-chaos/`.
+- `list` (optional, boolean) — When `true`, return a list of all pending items with metadata (not full content). Defaults to `false` (returns the next single item with full content).
 
 **Behaviour:**
-1. Scan the target path for markdown files
-2. Filter out files where `triage` is set (processed, acknowledged, or deferred with a future date)
+1. Scan the target path recursively for markdown files
+2. Filter out files where `triage` is set to a date (processed), `acknowledged`, or `deferred` with a future date
 3. Include files where `triage` is `deferred` and the deferred date has passed (boomerang)
 4. Order by frontmatter `created` or `date` field descending, falling back to file modification time
-5. Return the first result: file path, full content, and metadata (source folder, frontmatter)
+5. **Single mode** (default): Return the first result with full file content, path, frontmatter, and queue count
+6. **List mode** (`list: true`): Return all pending items with path, frontmatter summary (title, description, date, source/author if present), and queue count — but not full content
 
-**Returns:** The file content, path, and metadata — or a message indicating the queue is empty for that path.
+**Returns (single mode):**
+```json
+{
+  "path": "1-chaos/external/readwise/articles/some-article.md",
+  "content": "---\ntitle: Some Article\nauthor: ...\n---\n\nFull file content here...",
+  "frontmatter": { "title": "Some Article", "author": "...", "date": "2026-02-01" },
+  "queue": { "total": 847, "in_path": 312 }
+}
+```
 
-#### `triage_chaos`
+**Returns (list mode):**
+```json
+{
+  "items": [
+    {
+      "path": "1-chaos/external/readwise/articles/some-article.md",
+      "title": "Some Article",
+      "description": "First 100 chars or frontmatter description...",
+      "date": "2026-02-01",
+      "source": "readwise"
+    }
+  ],
+  "queue": { "total": 847, "in_path": 312 }
+}
+```
 
-Records a triage decision for a chaos item.
+**Returns (empty):** A message indicating the queue is empty for that path, with queue counts showing zero.
+
+#### `mark_triage`
+
+Records a triage decision for a chaos item. Handles all frontmatter manipulation — the AI never needs to parse or write YAML directly.
 
 **Parameters:**
 - `path` (required) — Path to the chaos file
@@ -79,11 +113,23 @@ Records a triage decision for a chaos item.
 
 **Behaviour:**
 1. Read the file
-2. Add or update the `triage` frontmatter field:
+2. Parse existing frontmatter (or create it if absent)
+3. Add or update the `triage` frontmatter field:
    - `processed` → set `triage: YYYY-MM-DD` (today's date)
    - `deferred` → set `triage: deferred YYYY-MM-DD` (the defer_until date)
    - `acknowledged` → set `triage: acknowledged`
-3. Write the file back
+4. Preserve all existing frontmatter fields
+5. Write the file back
+6. Return confirmation with the action taken
+
+**Returns:**
+```json
+{
+  "path": "1-chaos/external/readwise/articles/some-article.md",
+  "action": "processed",
+  "triage": "2026-02-11"
+}
+```
 
 ### Triage Prompt
 
@@ -103,19 +149,36 @@ A prompt (living in `2-life/prompts/` in the main vault, or as a Witness skill) 
 
 The prompt should evolve over time as patterns emerge from repeated triage sessions. Eventually, it could suggest likely actions based on the source type and content.
 
+### Ancillary Fix: `edit_file` Error Guidance
+
+When `edit_file` fails because the find text isn't found, the error message should guide the AI toward the right tool:
+
+```
+Text not found in file: "...". The file may have changed since you last read it.
+To replace the entire file contents, use write_file instead.
+To make targeted edits, re-read the file first with read_file, then retry edit_file with the current content.
+Do NOT delete and recreate the file — this loses file metadata and timestamps.
+```
+
+This prevents the delete+recreate antipattern that loses file timestamps and metadata.
+
 ## Implementation Plan
 
 ### Phase 1: MCP Tools
 1. Implement `get_next_chaos` tool in `src/main.ts`
    - Scan chaos directory recursively for `.md` files
-   - Parse frontmatter to check `triage` field
+   - Parse frontmatter to check `triage` field (using Obsidian's `metadataCache`)
+   - Handle deferred date comparison (parse `deferred YYYY-MM-DD`, compare with today)
    - Sort by date (frontmatter `created`/`date` field, then file mtime as fallback)
-   - Return next unprocessed item with content and metadata
-2. Implement `triage_chaos` tool in `src/main.ts`
+   - Single mode: return next unprocessed item with full content and queue count
+   - List mode: return all pending items with frontmatter summary and queue count
+2. Implement `mark_triage` tool in `src/main.ts`
    - Accept path, action, and optional defer_until
-   - Update frontmatter `triage` field accordingly
-   - Preserve existing frontmatter fields
-3. Add integration tests for both tools
+   - Parse existing frontmatter robustly (handle absent frontmatter, malformed YAML)
+   - Update `triage` field accordingly
+   - Preserve all existing frontmatter fields
+3. Improve `edit_file` error message to guide toward `write_file` and away from delete+recreate
+4. Add integration tests for both triage tools
 
 ### Phase 2: Triage Prompt
 1. Write the triage prompt for `2-life/prompts/chaos-triage.md` in the main vault
@@ -133,5 +196,4 @@ The prompt should evolve over time as patterns emerge from repeated triage sessi
 
 - **Timestamp normalisation:** Readwise bulk-synced files all share the same mtime. Need to ensure frontmatter `date`/`created` fields are reliable for ordering. May need a one-off script to normalise dates from Readwise metadata.
 - **Triage field format:** The single-field approach (`triage: deferred 2026-02-14`) is compact but unconventional. If it proves awkward to query in Dataview, consider splitting into `triage-status` and `triage-date`.
-- **Queue depth visibility:** Should `get_next_chaos` also return a count of remaining items? Useful for motivation/progress tracking.
 - **Re-processing:** A processed item might become relevant again when processing a related item later. The current design doesn't prevent re-visiting, but there's no explicit "re-open" action. May not be needed — the triage prompt can always read any file regardless of its triage status.

@@ -42,6 +42,8 @@ describe('MCP Server Integration Tests', () => {
       expect(toolNames).toContain('move_file');
       expect(toolNames).toContain('execute_command');
       expect(toolNames).toContain('get_orientation');
+      expect(toolNames).toContain('get_next_chaos');
+      expect(toolNames).toContain('mark_triage');
     });
   });
 
@@ -82,26 +84,29 @@ describe('MCP Server Integration Tests', () => {
   });
 
   describe('write_file', () => {
-    const testFileName = 'test-write-temp.md';
+    const testFileName = 'test-write-new-temp.md';
     const testContent = '# Temporary Test File\n\nCreated by integration test.';
 
     afterAll(async () => {
-      // Cleanup: try to delete the test file
+      // Cleanup: delete the temp file
       try {
-        // We don't have delete, so we'll just leave it
-        // The test vault can be reset via git
+        await client.callTool('delete', { path: testFileName });
       } catch {
         // Ignore cleanup errors
       }
     });
 
     it('should create a new file', async () => {
+      // Ensure file doesn't exist
+      await client.callTool('delete', { path: testFileName }).catch(() => {});
+
       const result = await client.callTool('write_file', {
         path: testFileName,
         content: testContent,
       });
 
       expect(result.isError).not.toBe(true);
+      expect(getTextContent(result)).toContain('Successfully created');
 
       // Verify by reading it back
       const readResult = await client.callTool('read_file', { path: testFileName });
@@ -109,20 +114,16 @@ describe('MCP Server Integration Tests', () => {
       expect(content).toBe(testContent);
     });
 
-    it('should overwrite existing file', async () => {
-      const newContent = '# Updated Content\n\nThis was overwritten.';
-
+    it('should error when file already exists', async () => {
+      // File was created in previous test — writing again should fail
       const result = await client.callTool('write_file', {
         path: testFileName,
-        content: newContent,
+        content: '# Should fail',
       });
 
-      expect(result.isError).not.toBe(true);
-
-      // Verify
-      const readResult = await client.callTool('read_file', { path: testFileName });
-      const content = getTextContent(readResult);
-      expect(content).toBe(newContent);
+      expect(result.isError).toBe(true);
+      expect(getTextContent(result)).toContain('already exists');
+      expect(getTextContent(result)).toContain('edit_file');
     });
   });
 
@@ -130,7 +131,8 @@ describe('MCP Server Integration Tests', () => {
     const editTestFile = 'test-edit-temp.md';
 
     beforeAll(async () => {
-      // Create a file to edit
+      // Reset the edit test file content (delete + create)
+      await client.callTool('delete', { path: editTestFile }).catch(() => {});
       await client.callTool('write_file', {
         path: editTestFile,
         content: 'Line one\nLine two\nLine three',
@@ -203,16 +205,14 @@ describe('MCP Server Integration Tests', () => {
     const moveDestInFolder = 'subfolder/moved-file.md';
 
     beforeAll(async () => {
-      // Create a file to move
+      // Clean up any leftover files from previous runs, then create fresh
+      await client.callTool('delete', { path: moveTestFile }).catch(() => {});
+      await client.callTool('delete', { path: moveDestFile }).catch(() => {});
+      await client.callTool('delete', { path: moveDestInFolder }).catch(() => {});
       await client.callTool('write_file', {
         path: moveTestFile,
         content: '# File to move\n\nThis will be moved.',
       });
-    });
-
-    afterAll(async () => {
-      // Cleanup: try to remove test files (they may not exist)
-      // We can't delete, so just leave them - test vault can be reset via git
     });
 
     it('should move/rename a file', async () => {
@@ -257,7 +257,9 @@ describe('MCP Server Integration Tests', () => {
     });
 
     it('should return error if destination exists', async () => {
-      // Create two files
+      // Ensure both files exist (delete + create fresh)
+      await client.callTool('delete', { path: 'move-conflict-source.md' }).catch(() => {});
+      await client.callTool('delete', { path: 'move-conflict-dest.md' }).catch(() => {});
       await client.callTool('write_file', {
         path: 'move-conflict-source.md',
         content: 'Source',
@@ -496,6 +498,157 @@ describe('MCP Server Integration Tests', () => {
       const content = getTextContent(result);
       const parsed = JSON.parse(content);
       expect(parsed.length).toBeLessThanOrEqual(2);
+    });
+  });
+
+  describe('get_next_chaos', () => {
+    it('should be listed as an available tool', async () => {
+      const tools = await client.listTools();
+      const toolNames = tools.map((t: any) => t.name);
+      expect(toolNames).toContain('get_next_chaos');
+      expect(toolNames).toContain('mark_triage');
+    });
+
+    it('should return the next untriaged item with content', async () => {
+      const result = await client.callTool('get_next_chaos', { path: '1-chaos/' });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.path).toBeDefined();
+      expect(data.content).toBeDefined();
+      expect(data.queue).toBeDefined();
+      expect(data.queue.total).toBeGreaterThan(0);
+
+      // Should not return processed or acknowledged items
+      expect(data.path).not.toContain('already-processed');
+      expect(data.path).not.toContain('acknowledged-item');
+      expect(data.path).not.toContain('deferred-future');
+    });
+
+    it('should include deferred items past their date', async () => {
+      const result = await client.callTool('get_next_chaos', { path: '1-chaos/', list: true });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      const paths = data.items.map((i: any) => i.path);
+
+      // deferred-past.md has triage: deferred 2026-02-01 — should be in queue
+      expect(paths).toContain('1-chaos/deferred-past.md');
+
+      // deferred-future.md has triage: deferred 2099-12-31 — should NOT be in queue
+      expect(paths).not.toContain('1-chaos/deferred-future.md');
+    });
+
+    it('should return list of items in list mode', async () => {
+      const result = await client.callTool('get_next_chaos', { path: '1-chaos/', list: true });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.items).toBeDefined();
+      expect(Array.isArray(data.items)).toBe(true);
+      expect(data.items.length).toBeGreaterThan(0);
+
+      // Each item should have metadata but NOT full content
+      const item = data.items[0];
+      expect(item.path).toBeDefined();
+      expect(item.title).toBeDefined();
+      expect(item).not.toHaveProperty('content');
+    });
+
+    it('should sort by date descending (newest first)', async () => {
+      const result = await client.callTool('get_next_chaos', { path: '1-chaos/', list: true });
+      const data = JSON.parse(getTextContent(result));
+
+      // Items with dates should be sorted newest first
+      const datedItems = data.items.filter((i: any) => i.date);
+      for (let idx = 1; idx < datedItems.length; idx++) {
+        expect(datedItems[idx - 1].date >= datedItems[idx].date).toBe(true);
+      }
+    });
+
+    it('should return empty for a path with no chaos items', async () => {
+      const result = await client.callTool('get_next_chaos', { path: '1-chaos/nonexistent/' });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.items).toBeDefined();
+      expect(data.items.length).toBe(0);
+    });
+  });
+
+  describe('mark_triage', () => {
+    const triageFile = '1-chaos/triage-target.md';
+
+    beforeAll(async () => {
+      // Reset the triage target file (remove triage field if set from previous run)
+      await client.callTool('delete', { path: triageFile }).catch(() => {});
+      await client.callTool('write_file', {
+        path: triageFile,
+        content: '---\ntitle: Item to Triage\ndate: 2026-02-08\n---\n\n# Item to Triage\n\nThis file will be used to test the mark_triage tool.\n',
+      });
+    });
+
+    it('should mark an item as processed', async () => {
+      const result = await client.callTool('mark_triage', {
+        path: triageFile,
+        action: 'processed',
+      });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.action).toBe('processed');
+      expect(data.triage).toMatch(/^\d{4}-\d{2}-\d{2}$/); // YYYY-MM-DD
+
+      // Verify: file should now have triage in frontmatter
+      const readResult = await client.callTool('read_file', { path: triageFile });
+      expect(getTextContent(readResult)).toContain('triage:');
+    });
+
+    it('should mark an item as deferred', async () => {
+      const result = await client.callTool('mark_triage', {
+        path: triageFile,
+        action: 'deferred',
+        defer_until: '2099-12-31',
+      });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.action).toBe('deferred');
+      expect(data.triage).toBe('deferred 2099-12-31');
+
+      // Verify in file
+      const readResult = await client.callTool('read_file', { path: triageFile });
+      expect(getTextContent(readResult)).toContain('deferred 2099-12-31');
+    });
+
+    it('should mark an item as acknowledged', async () => {
+      const result = await client.callTool('mark_triage', {
+        path: triageFile,
+        action: 'acknowledged',
+      });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.action).toBe('acknowledged');
+      expect(data.triage).toBe('acknowledged');
+    });
+
+    it('should error when deferred without defer_until', async () => {
+      const result = await client.callTool('mark_triage', {
+        path: triageFile,
+        action: 'deferred',
+      });
+      expect(result.isError).toBe(true);
+      expect(getTextContent(result)).toContain('defer_until');
+    });
+
+    it('should error for non-existent file', async () => {
+      const result = await client.callTool('mark_triage', {
+        path: '1-chaos/does-not-exist.md',
+        action: 'processed',
+      });
+      expect(result.isError).toBe(true);
+      expect(getTextContent(result)).toContain('not found');
     });
   });
 

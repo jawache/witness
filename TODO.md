@@ -3,10 +3,8 @@
 ## High Priority
 
 ## Next Up
-
-- [ ] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with status bar indicator and log viewer.
-- [ ] [Chaos triage](docs/features/chaos-triage.md) — MCP tools and prompt for processing chaos items one at a time (get_next_chaos, triage_chaos)
 - [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
+- [ ] [Link discovery](docs/features/link-discovery.md) — Discover connections between notes using embeddings + local LLM, Grammarly-style review panel
 
 ## Completed
 
@@ -31,3 +29,5 @@
 - [x] [Phrase search boosting](docs/features/phrase-search-boosting.md) — Stop word stripping, phrase boost via partition, shared search method for MCP + sidebar
 - [x] [Find tool sorting](docs/features/find-sorting.md) — sortBy parameter with date auto-detection, nulls-to-end
 - [x] [Search panel filters](docs/features/search-panel-filters.md) — Path and tag filtering in sidebar with AbstractInputSuggest autocomplete
+- [x] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with periodic reconciliation, status bar indicator, and log viewer
+- [x] [Chaos triage](docs/features/chaos-triage.md) — MCP tools for processing chaos items (get_next_chaos, mark_triage), AI guardrails for safe file operations

@@ -29,12 +29,13 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Named Tunnel Support**: Use your own domain with Cloudflare Named Tunnels for a permanent, stable URL
 - **Primary Machine**: Designate which machine runs the tunnel when syncing across multiple devices
 - **Token Authentication**: Protect your remote endpoint with a simple token
+- **Chaos Triage**: AI-assisted processing of unread chaos items with queue management and safe frontmatter updates
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
-**14 MCP Tools Available**:
+**16 MCP Tools Available**:
 
 - `read_file` - Read file contents (with optional Dataview rendering)
-- `write_file` - Create/modify files
+- `write_file` - Create new files (create-only, errors on existing)
 - `list_files` - Browse directories
 - `edit_file` - Find and replace text
 - `search` - Unified content search: hybrid (keyword + semantic), vector, or fulltext modes with tag/path filtering
@@ -46,6 +47,8 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - `execute_command` - Run Obsidian commands
 - `get_vault_context` - Load your vault's context document (auto-renders Dataview)
 - `dataview_query` - Execute Dataview queries, get structured vault data (requires Dataview plugin)
+- `get_next_chaos` - Get next unprocessed chaos item for triage (single or list mode)
+- `mark_triage` - Record triage decision (processed, deferred, acknowledged)
 - `copy-obsidian-url` - Copy the internal Obsidian URL for the current file
 
 ### Coming Soon
@@ -382,7 +385,7 @@ npm run test:install-plugin
 # Start Obsidian with test vault
 npm run test:start-obsidian
 
-# Run integration tests (31 tests)
+# Run integration tests (47 tests)
 npm test
 
 # Check server status
@@ -468,7 +471,7 @@ This is different from other Obsidian MCP servers that run externally and connec
 - [x] Command execution
 - [x] Orientation document system
 - [x] File-based logging
-- [x] Integration test suite (31 tests)
+- [x] Integration test suite (47 tests)
 
 ### Phase 2: Remote Access ✅
 - [x] Cloudflare Quick Tunnel integration
@@ -497,6 +500,13 @@ This is different from other Obsidian MCP servers that run externally and connec
 - [x] `read_file` render parameter for resolving Dataview codeblocks
 - [x] `get_vault_context` auto-renders Dataview queries
 - [x] 8 integration tests
+
+### Chaos Triage ✅
+
+- [x] `get_next_chaos` tool (single + list mode, queue counts)
+- [x] `mark_triage` tool (processed, deferred, acknowledged)
+- [x] Safe frontmatter updates via `processFrontMatter` API
+- [x] AI guardrails: create-only `write_file`, improved `edit_file` errors
 
 ### Phase 4: Intelligence
 

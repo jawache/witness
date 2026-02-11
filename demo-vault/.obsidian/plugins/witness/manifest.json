@@ -1,7 +1,7 @@
 {
   "id": "witness",
   "name": "Witness",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "minAppVersion": "1.11.4",
   "description": "AI companion for managing your vault - turns chaos into order via MCP protocol",
   "author": "Asim Hussain",
