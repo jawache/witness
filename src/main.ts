@@ -246,6 +246,9 @@ interface WitnessSettings {
 	ollamaModel: string;
 	excludedFolders: string[];
 	minContentLength: number;
+	// Re-ranking
+	enableReranking: boolean;
+	rerankModel: string;
 }
 
 // Helper function to generate random credentials
@@ -285,6 +288,8 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	ollamaModel: 'nomic-embed-text',
 	excludedFolders: [],
 	minContentLength: 50,
+	enableReranking: false,
+	rerankModel: '',
 }
 
 export default class WitnessPlugin extends Plugin {
@@ -1227,11 +1232,12 @@ export default class WitnessPlugin extends Plugin {
 				tag: z.string().optional().describe('Only files with this tag (e.g., "#recipe", "#topic")'),
 				limit: z.number().optional().default(10).describe('Maximum number of results to return'),
 				minScore: z.number().optional().default(0.3).describe('Minimum similarity score (0-1, applies to hybrid and vector modes)'),
+				rerank: z.boolean().optional().default(false).describe('Re-rank results using an LLM for higher precision. Adds ~1-3s but significantly improves result ordering for complex queries.'),
 			},
 			{
 				readOnlyHint: true,
 			},
-			async ({ query, mode, path, tag, limit, minScore }) => {
+			async ({ query, mode, path, tag, limit, minScore, rerank }) => {
 				try {
 					// Initialize search engine on first use
 					await this.ensureSearchEngine();
@@ -1259,13 +1265,14 @@ export default class WitnessPlugin extends Plugin {
 						};
 					}
 
-					// Use the shared search method (handles phrases, stop words, boosting)
+					// Use the shared search method (handles phrases, stop words, boosting, reranking)
 					const results = await this.search(query, {
 						mode: mode ?? 'hybrid',
 						limit,
 						minScore,
 						paths: path ? [path] : undefined,
 						tags: tag ? [tag] : undefined,
+						rerank,
 					});
 
 					// Return structured JSON
@@ -2179,23 +2186,33 @@ export default class WitnessPlugin extends Plugin {
 		minScore?: number;
 		paths?: string[];
 		tags?: string[];
+		rerank?: boolean;
 	} = {}): Promise<SearchResult[]> {
 		if (!this.vectorStore) {
 			throw new Error('Search index not available');
 		}
 
-		const { mode = 'hybrid', limit = 10, minScore, paths, tags } = options;
+		const { mode = 'hybrid', limit = 10, minScore, paths, tags, rerank = false } = options;
 
 		// Parse quoted phrases for post-boost
 		const { cleanQuery, phrases } = this.parseQuotedPhrases(query);
 
-		// Over-fetch when phrases present — boosting may reorder significantly
-		const effectiveLimit = phrases.length > 0 ? Math.max(limit * 3, 30) : limit;
+		// Determine how many candidates to fetch from stage 1
+		const shouldRerank = rerank && this.settings.enableReranking && this.settings.rerankModel && this.ollamaProvider;
+		const rerankCandidateLimit = 30;
+		let effectiveLimit: number;
+		if (shouldRerank) {
+			effectiveLimit = rerankCandidateLimit;
+		} else if (phrases.length > 0) {
+			effectiveLimit = Math.max(limit * 3, 30);
+		} else {
+			effectiveLimit = limit;
+		}
 
 		// Strip stop words to improve QPS scoring
 		const oramaQuery = this.stripStopWords(cleanQuery || query) || cleanQuery || query;
 
-		this.logger.info(`Search (${mode}) for: "${query}" → orama: "${oramaQuery}"${phrases.length > 0 ? ` [phrases: ${phrases.join(', ')}]` : ''}`);
+		this.logger.info(`Search (${mode}${shouldRerank ? '+rerank' : ''}) for: "${query}" → orama: "${oramaQuery}"${phrases.length > 0 ? ` [phrases: ${phrases.join(', ')}]` : ''}`);
 
 		let results = await this.vectorStore.search(oramaQuery, {
 			mode,
@@ -2208,6 +2225,42 @@ export default class WitnessPlugin extends Plugin {
 		// Boost results containing exact phrase matches to the top
 		if (phrases.length > 0 && results.length > 0) {
 			results = this.boostByPhrases(results, phrases);
+		}
+
+		// Stage 2: Re-rank with LLM if enabled
+		if (shouldRerank && results.length > 1) {
+			try {
+				const candidates = results.map((r, i) => ({
+					index: i,
+					content: r.content || r.snippet || '',
+				}));
+
+				const reranked = await this.ollamaProvider!.rerank(
+					this.settings.rerankModel,
+					query,
+					candidates,
+					limit,
+				);
+
+				// Map re-ranked scores back onto results
+				const rerankedResults: SearchResult[] = [];
+				for (const { index, score } of reranked) {
+					if (index >= 0 && index < results.length) {
+						rerankedResults.push({
+							...results[index],
+							score: score / 10, // normalise 0-10 to 0-1
+						});
+					}
+				}
+
+				if (rerankedResults.length > 0) {
+					this.logger.info(`Reranked ${results.length} → ${rerankedResults.length} results`);
+					return rerankedResults;
+				}
+				// Fall through to normal results if reranking produced nothing
+			} catch (err) {
+				this.logger.error('Reranking failed, using original results', err);
+			}
 		}
 
 		return results.slice(0, limit);
@@ -2788,6 +2841,7 @@ class WitnessSettingTab extends PluginSettingTab {
 	plugin: WitnessPlugin;
 	private activeTab: WitnessTab = 'server';
 	private embeddingModelsCache: EmbeddingModelInfo[] | null = null;
+	private chatModelsCache: Array<{ name: string; parameterSize: string; family: string }> | null = null;
 
 	constructor(app: App, plugin: WitnessPlugin) {
 		super(app, plugin);
@@ -3292,68 +3346,70 @@ class WitnessSettingTab extends PluginSettingTab {
 		pane.appendChild(searchContent);
 		searchContent.style.display = this.plugin.settings.enableSemanticSearch ? '' : 'none';
 
-		new SettingGroup(searchContent)
-			.setHeading('Ollama Connection')
-			.addSetting(s => s
-				.setName('Base URL')
-				.setDesc('The URL where Ollama is running')
-				.addText(text => text
-					.setPlaceholder('http://localhost:11434')
-					.setValue(this.plugin.settings.ollamaBaseUrl)
-					.onChange(async (value) => {
-						this.plugin.settings.ollamaBaseUrl = value;
-						await this.plugin.saveSettings();
-						this.plugin.resetSemanticSearch();
-						this.embeddingModelsCache = null;
-					})));
+		const ollamaGroup = new SettingGroup(searchContent)
+			.setHeading('Ollama Connection');
+
+		ollamaGroup.addSetting(s => s
+			.setName('Base URL')
+			.setDesc('The URL where Ollama is running')
+			.addText(text => text
+				.setPlaceholder('http://localhost:11434')
+				.setValue(this.plugin.settings.ollamaBaseUrl)
+				.onChange(async (value) => {
+					this.plugin.settings.ollamaBaseUrl = value;
+					await this.plugin.saveSettings();
+					this.plugin.resetSemanticSearch();
+					this.embeddingModelsCache = null;
+				})));
 
 		// Model selector
 		const modelDesc = createFragment(f => {
 			f.appendText('Dropdown shows models pulled locally. To add more, run: ');
 			f.createEl('code', {text: 'ollama pull <model-name>'});
 		});
-		const modelSetting = new Setting(searchContent)
-			.setName('Embedding Model')
-			.setDesc(modelDesc);
+		ollamaGroup.addSetting(s => {
+			s.setName('Embedding Model')
+				.setDesc(modelDesc);
 
-		if (this.embeddingModelsCache && this.embeddingModelsCache.length > 0) {
-			modelSetting.addDropdown(dropdown => {
-				for (const model of this.embeddingModelsCache!) {
-					const dims = model.dimensions ? `, ${model.dimensions}d` : '';
-					const label = `${model.name} (${model.parameterSize}, ${model.family}${dims})`;
-					dropdown.addOption(model.name, label);
-				}
-				const currentModel = this.plugin.settings.ollamaModel;
-				if (!this.embeddingModelsCache!.some(m => m.name === currentModel)) {
-					dropdown.addOption(currentModel, currentModel);
-				}
-				dropdown.setValue(currentModel);
-				dropdown.onChange(async (value) => {
-					this.plugin.settings.ollamaModel = value;
-					await this.plugin.saveSettings();
-					this.plugin.resetSemanticSearch();
+			if (this.embeddingModelsCache && this.embeddingModelsCache.length > 0) {
+				s.addDropdown(dropdown => {
+					for (const model of this.embeddingModelsCache!) {
+						const dims = model.dimensions ? `, ${model.dimensions}d` : '';
+						const label = `${model.name} (${model.parameterSize}, ${model.family}${dims})`;
+						dropdown.addOption(model.name, label);
+					}
+					const currentModel = this.plugin.settings.ollamaModel;
+					if (!this.embeddingModelsCache!.some(m => m.name === currentModel)) {
+						dropdown.addOption(currentModel, currentModel);
+					}
+					dropdown.setValue(currentModel);
+					dropdown.onChange(async (value) => {
+						this.plugin.settings.ollamaModel = value;
+						await this.plugin.saveSettings();
+						this.plugin.resetSemanticSearch();
+					});
 				});
-			});
-		} else {
-			modelSetting.addText(text => text
-				.setPlaceholder('nomic-embed-text')
-				.setValue(this.plugin.settings.ollamaModel)
-				.onChange(async (value) => {
-					this.plugin.settings.ollamaModel = value;
-					await this.plugin.saveSettings();
-					this.plugin.resetSemanticSearch();
-				}));
+			} else {
+				s.addText(text => text
+					.setPlaceholder('nomic-embed-text')
+					.setValue(this.plugin.settings.ollamaModel)
+					.onChange(async (value) => {
+						this.plugin.settings.ollamaModel = value;
+						await this.plugin.saveSettings();
+						this.plugin.resetSemanticSearch();
+					}));
 
-			const provider = new OllamaProvider({
-				baseUrl: this.plugin.settings.ollamaBaseUrl,
-			});
-			provider.listEmbeddingModels().then(models => {
-				if (models.length > 0) {
-					this.embeddingModelsCache = models;
-					this.display();
-				}
-			}).catch(() => {});
-		}
+				const provider = new OllamaProvider({
+					baseUrl: this.plugin.settings.ollamaBaseUrl,
+				});
+				provider.listEmbeddingModels().then(models => {
+					if (models.length > 0) {
+						this.embeddingModelsCache = models;
+						this.display();
+					}
+				}).catch(() => {});
+			}
+		});
 
 		// Available embedding models with pull buttons
 		// Models with multiple sizes list each variant separately
@@ -3576,5 +3632,117 @@ class WitnessSettingTab extends PluginSettingTab {
 					}).open();
 				}));
 		});
+
+		// Re-ranking settings
+		const rerankGroup = new SettingGroup(searchContent)
+			.setHeading('Re-ranking');
+
+		rerankGroup.addSetting(s => s
+			.setName('Enable re-ranking')
+			.setDesc('Use a small chat model to re-score search results for higher precision. Adds ~1-3 seconds per search.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableReranking)
+				.onChange(async (value) => {
+					this.plugin.settings.enableReranking = value;
+					await this.plugin.saveSettings();
+					rerankContent.style.display = value ? '' : 'none';
+				})));
+
+		rerankGroup.addSetting(s => {
+			s.setName('Re-ranking Model')
+				.setDesc('A small chat model for re-ranking (e.g. llama3.2:1b, qwen2.5:1.5b)');
+
+			if (this.chatModelsCache && this.chatModelsCache.length > 0) {
+				s.addDropdown(dropdown => {
+					dropdown.addOption('', '(none)');
+					for (const model of this.chatModelsCache!) {
+						const label = `${model.name} (${model.parameterSize}, ${model.family})`;
+						dropdown.addOption(model.name, label);
+					}
+					const currentModel = this.plugin.settings.rerankModel;
+					if (currentModel && !this.chatModelsCache!.some(m => m.name === currentModel)) {
+						dropdown.addOption(currentModel, currentModel);
+					}
+					dropdown.setValue(currentModel);
+					dropdown.onChange(async (value) => {
+						this.plugin.settings.rerankModel = value;
+						await this.plugin.saveSettings();
+					});
+				});
+			} else {
+				s.addText(text => text
+					.setPlaceholder('llama3.2:1b')
+					.setValue(this.plugin.settings.rerankModel)
+					.onChange(async (value) => {
+						this.plugin.settings.rerankModel = value;
+						await this.plugin.saveSettings();
+					}));
+
+				// Try to load chat models for dropdown
+				const provider = new OllamaProvider({
+					baseUrl: this.plugin.settings.ollamaBaseUrl,
+				});
+				provider.listChatModels().then(models => {
+					if (models.length > 0) {
+						this.chatModelsCache = models;
+						this.display();
+					}
+				}).catch(() => {});
+			}
+		});
+
+		// Container for conditional re-ranking settings (shown when enabled)
+		const rerankContent = searchContent.createDiv();
+		rerankContent.style.display = this.plugin.settings.enableReranking ? '' : 'none';
+		rerankContent.style.marginTop = '12px';
+
+		// Suggested re-ranking models with pull buttons
+		const RERANK_MODELS: [string, string][] = [
+			['llama3.2:1b', '1.3GB — fast, good quality (recommended)'],
+			['qwen2.5:1.5b', '986MB — multilingual, compact'],
+			['phi3:mini', '2.3GB — Microsoft, strong reasoning'],
+			['gemma2:2b', '1.6GB — Google, balanced'],
+		];
+
+		const rerankPullGroup = new SettingGroup(rerankContent)
+			.setHeading('Available Re-ranking Models');
+
+		for (const [modelName, desc] of RERANK_MODELS) {
+			rerankPullGroup.addSetting(s => {
+				const isPulled = this.chatModelsCache?.some(m => m.name === modelName || m.name.startsWith(modelName.split(':')[0]));
+				s.setName(modelName);
+				s.setDesc(isPulled ? `Installed — ${desc}` : desc);
+				s.addButton(button => {
+					button.setButtonText(isPulled ? 'Use' : 'Pull');
+					button.onClick(async () => {
+						if (isPulled) {
+							this.plugin.settings.rerankModel = modelName;
+							await this.plugin.saveSettings();
+							this.display();
+							return;
+						}
+						button.setDisabled(true);
+						button.setButtonText('Pulling...');
+						try {
+							const provider = new OllamaProvider({
+								baseUrl: this.plugin.settings.ollamaBaseUrl,
+							});
+							await provider.pullModel(modelName, (status, percent) => {
+								const pct = percent != null ? ` ${percent}%` : '';
+								button.setButtonText(`${status}${pct}`);
+							});
+							button.setButtonText('Done!');
+							this.plugin.settings.rerankModel = modelName;
+							await this.plugin.saveSettings();
+							this.chatModelsCache = null;
+							this.display();
+						} catch (e) {
+							button.setButtonText('Failed');
+							button.setDisabled(false);
+						}
+					});
+				});
+			});
+		}
 	}
 }

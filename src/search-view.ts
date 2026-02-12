@@ -156,6 +156,10 @@ export class WitnessSearchView extends ItemView {
 	private selectedPaths: string[] = [];
 	private selectedTags: string[] = [];
 	private chipContainer: HTMLElement;
+	private rerankEnabled = false;
+	private rerankToggleContainer: HTMLElement;
+	private searchSeq = 0;
+	private dotsInterval: number | null = null;
 
 	constructor(leaf: WorkspaceLeaf, plugin: WitnessPlugin) {
 		super(leaf);
@@ -179,15 +183,17 @@ export class WitnessSearchView extends ItemView {
 		container.empty();
 		container.addClass('witness-search-container');
 		this.buildUI(container);
+		this.updateRerankVisibility();
 	}
 
 	async onClose(): Promise<void> {
-		// Cleanup
+		this.stopDotsAnimation();
 	}
 
 	private buildUI(container: HTMLElement): void {
 		this.buildSearchInput(container);
 		this.buildModeSelector(container);
+		this.buildRerankToggle(container);
 		this.buildFilters(container);
 		this.resultsContainer = container.createDiv({ cls: 'witness-search-results' });
 
@@ -206,6 +212,8 @@ export class WitnessSearchView extends ItemView {
 
 		this.inputEl.addEventListener('input', () => {
 			window.clearTimeout(debounceTimer);
+			// Skip debounce when re-ranking — too expensive to fire on every keystroke
+			if (this.rerankEnabled) return;
 			debounceTimer = window.setTimeout(() => {
 				this.executeSearch(this.inputEl.value);
 			}, 300);
@@ -240,6 +248,33 @@ export class WitnessSearchView extends ItemView {
 				this.executeSearch(this.currentQuery);
 			}
 		});
+	}
+
+	private buildRerankToggle(container: HTMLElement): void {
+		this.rerankToggleContainer = container.createDiv({ cls: 'witness-rerank-toggle' });
+
+		const label = this.rerankToggleContainer.createEl('label', { cls: 'witness-rerank-label' });
+		const checkbox = label.createEl('input', { type: 'checkbox' });
+		label.createSpan({ text: 'Re-rank with LLM' });
+
+		checkbox.addEventListener('change', () => {
+			this.rerankEnabled = checkbox.checked;
+			this.inputEl.placeholder = checkbox.checked ? 'Search vault (press Enter)...' : 'Search vault...';
+			if (this.currentQuery) {
+				this.executeSearch(this.currentQuery);
+			}
+		});
+
+		// Only show when reranking is configured
+		this.updateRerankVisibility();
+	}
+
+	private updateRerankVisibility(): void {
+		const available = this.plugin.settings.enableReranking && !!this.plugin.settings.rerankModel;
+		this.rerankToggleContainer.style.display = available ? '' : 'none';
+		if (!available) {
+			this.rerankEnabled = false;
+		}
 	}
 
 	private buildFilters(container: HTMLElement): void {
@@ -323,6 +358,7 @@ export class WitnessSearchView extends ItemView {
 		}
 
 		this.currentQuery = query;
+		const seq = ++this.searchSeq;
 
 		// Ensure search engine is initialised
 		try {
@@ -348,24 +384,38 @@ export class WitnessSearchView extends ItemView {
 
 		this.showLoading();
 		const startTime = performance.now();
+		const searchOpts = {
+			mode: this.currentMode,
+			limit: 20,
+			paths: this.selectedPaths.length > 0 ? this.selectedPaths : undefined,
+			tags: this.selectedTags.length > 0 ? this.selectedTags : undefined,
+		};
 
 		try {
-			// Use shared search method (handles phrases, stop words, boosting)
-			const results = await this.plugin.search(query, {
-				mode: this.currentMode,
-				limit: 20,
-				paths: this.selectedPaths.length > 0 ? this.selectedPaths : undefined,
-				tags: this.selectedTags.length > 0 ? this.selectedTags : undefined,
-			});
+			if (this.rerankEnabled) {
+				// Phase 1: show fast results immediately
+				const initialResults = await this.plugin.search(query, { ...searchOpts, rerank: false });
+				if (seq !== this.searchSeq) return;
+				const phase1Ms = Math.round(performance.now() - startTime);
+				this.renderResults(initialResults, phase1Ms, { text: 'Re-ranking with LLM', loading: true });
 
-			const elapsed = Math.round(performance.now() - startTime);
-			this.renderResults(results, elapsed);
+				// Phase 2: re-rank and update
+				const rerankedResults = await this.plugin.search(query, { ...searchOpts, rerank: true });
+				if (seq !== this.searchSeq) return;
+				const totalMs = Math.round(performance.now() - startTime);
+				this.renderResults(rerankedResults, totalMs, { text: `Re-ranked in ${totalMs - phase1Ms}ms`, loading: false });
+			} else {
+				const results = await this.plugin.search(query, searchOpts);
+				if (seq !== this.searchSeq) return;
+				const elapsed = Math.round(performance.now() - startTime);
+				this.renderResults(results, elapsed);
+			}
 		} catch (err) {
 			this.showError(err instanceof Error ? err.message : 'Search failed');
 		}
 	}
 
-	private renderResults(results: SearchResult[], elapsedMs: number): void {
+	private renderResults(results: SearchResult[], elapsedMs: number, rerankStatus?: { text: string; loading: boolean }): void {
 		this.resultsContainer.empty();
 
 		if (results.length === 0) {
@@ -381,6 +431,21 @@ export class WitnessSearchView extends ItemView {
 			text: `${results.length} results (${elapsedMs}ms)`,
 			cls: 'witness-search-summary',
 		});
+
+		// Re-rank status banner
+		if (rerankStatus) {
+			const banner = this.resultsContainer.createEl('div', {
+				cls: 'witness-search-rerank-status',
+			});
+			if (rerankStatus.loading) {
+				banner.setText(rerankStatus.text);
+				this.startDotsAnimation(banner, rerankStatus.text);
+			} else {
+				banner.setText(rerankStatus.text);
+				banner.addClass('is-done');
+				this.stopDotsAnimation();
+			}
+		}
 
 		for (const result of results) {
 			const isChunk = !!result.headingPath;
@@ -438,10 +503,26 @@ export class WitnessSearchView extends ItemView {
 		}
 	}
 
+	private startDotsAnimation(el: HTMLElement, baseText: string): void {
+		this.stopDotsAnimation();
+		let dotCount = 0;
+		this.dotsInterval = window.setInterval(() => {
+			dotCount = (dotCount % 3) + 1;
+			el.setText(baseText + '.'.repeat(dotCount));
+		}, 400);
+	}
+
+	private stopDotsAnimation(): void {
+		if (this.dotsInterval !== null) {
+			window.clearInterval(this.dotsInterval);
+			this.dotsInterval = null;
+		}
+	}
+
 	private showLoading(): void {
 		this.resultsContainer.empty();
 		this.resultsContainer.createEl('div', {
-			text: 'Searching...',
+			text: this.rerankEnabled ? 'Searching + re-ranking...' : 'Searching...',
 			cls: 'witness-search-loading',
 		});
 	}

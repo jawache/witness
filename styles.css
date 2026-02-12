@@ -215,6 +215,43 @@
 	opacity: 1;
 }
 
+/* ===== Re-rank Toggle ===== */
+
+.witness-rerank-toggle {
+	margin-bottom: 8px;
+}
+
+.witness-rerank-label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	cursor: pointer;
+}
+
+.witness-rerank-label input[type="checkbox"] {
+	margin: 0;
+}
+
+/* ===== Re-rank Status Banner ===== */
+
+.witness-search-rerank-status {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-on-accent);
+	background: var(--interactive-accent);
+	border-radius: 4px;
+	padding: 6px 10px;
+	margin-bottom: 10px;
+	font-weight: 500;
+}
+
+.witness-search-rerank-status.is-done {
+	background: var(--background-secondary);
+	color: var(--text-muted);
+	border: 1px solid var(--background-modifier-border);
+}
+
 .witness-search-loading {
 	text-align: center;
 	padding: 20px;

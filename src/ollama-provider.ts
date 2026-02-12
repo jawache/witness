@@ -316,4 +316,158 @@ export class OllamaProvider {
 		}
 	}
 
+	/**
+	 * Call Ollama's /api/generate endpoint (non-streaming).
+	 */
+	async generate(model: string, prompt: string, options?: { temperature?: number; format?: string }): Promise<string> {
+		const body: Record<string, unknown> = {
+			model,
+			prompt,
+			stream: false,
+			options: { temperature: options?.temperature ?? 0 },
+		};
+		if (options?.format) {
+			body.format = options.format;
+		}
+
+		const res = await fetch(`${this.baseUrl}/api/generate`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		});
+
+		if (!res.ok) {
+			const text = await res.text();
+			throw new Error(`Ollama generate failed (${res.status}): ${text}`);
+		}
+
+		const data = await res.json();
+		return data.response;
+	}
+
+	/**
+	 * List all locally available models that have the "completion" capability
+	 * (i.e. chat/generate models, not embedding-only).
+	 */
+	async listChatModels(): Promise<Array<{ name: string; parameterSize: string; family: string }>> {
+		const res = await fetch(`${this.baseUrl}/api/tags`);
+		if (!res.ok) throw new Error(`Ollama tags failed (${res.status})`);
+		const data = (await res.json()) as OllamaTagsResponse;
+
+		const chatModels: Array<{ name: string; parameterSize: string; family: string }> = [];
+
+		for (const model of data.models) {
+			try {
+				const showRes = await fetch(`${this.baseUrl}/api/show`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ model: model.name }),
+				});
+				if (!showRes.ok) continue;
+				const showData = (await showRes.json()) as OllamaShowResponse;
+
+				if (showData.capabilities?.includes('completion')) {
+					chatModels.push({
+						name: model.name,
+						parameterSize: showData.details?.parameter_size ?? 'unknown',
+						family: showData.details?.family ?? 'unknown',
+					});
+				}
+			} catch {
+				continue;
+			}
+		}
+
+		return chatModels;
+	}
+
+	/**
+	 * Re-rank search candidates using an LLM as a relevance judge.
+	 * Sends all candidates in a single prompt for batch scoring.
+	 * Returns candidates sorted by relevance score (descending), limited to topK.
+	 * Falls back to original ordering if parsing fails.
+	 */
+	async rerank(
+		model: string,
+		query: string,
+		candidates: Array<{ index: number; content: string }>,
+		topK: number,
+	): Promise<Array<{ index: number; score: number }>> {
+		if (candidates.length === 0) return [];
+
+		const CONTENT_LIMIT = 500;
+		const candidateList = candidates.map(c =>
+			`[${c.index}] ${c.content.length > CONTENT_LIMIT ? c.content.slice(0, CONTENT_LIMIT) + '...' : c.content}`
+		).join('\n\n');
+
+		const prompt = `You are a search relevance judge. Given a query and numbered document excerpts, rate each document's relevance to the query on a scale of 0-10 (10 = perfectly relevant, 0 = completely irrelevant).
+
+Query: "${query}"
+
+Documents:
+${candidateList}
+
+Return a JSON object with a "scores" array. Each element should be [index, score]. Example: {"scores": [[0, 8], [1, 3], [2, 9]]}
+Include every document index. Output only the JSON object, nothing else.`;
+
+		try {
+			const response = await this.generate(model, prompt, { temperature: 0, format: 'json' });
+			const parsed = this.parseRerankResponse(response, candidates.length);
+
+			if (parsed.length === 0) {
+				this.log('warn', `Rerank: failed to parse any scores, returning original order`);
+				return candidates.map((c, i) => ({ index: c.index, score: candidates.length - i }));
+			}
+
+			// Sort by score descending, limit to topK
+			parsed.sort((a, b) => b.score - a.score);
+			return parsed.slice(0, topK);
+		} catch (err) {
+			this.log('error', `Rerank failed: ${(err as Error).message}`);
+			// Graceful degradation: return original order
+			return candidates.map((c, i) => ({ index: c.index, score: candidates.length - i }));
+		}
+	}
+
+	/**
+	 * Parse the LLM's re-ranking response. Tries JSON first, then regex fallback.
+	 */
+	private parseRerankResponse(response: string, expectedCount: number): Array<{ index: number; score: number }> {
+		// Try JSON parsing first
+		try {
+			const data = JSON.parse(response);
+			const scores: Array<{ index: number; score: number }> = [];
+
+			// Handle {"scores": [[0, 8], [1, 3], ...]}
+			const arr = data.scores ?? data.results ?? data;
+			if (Array.isArray(arr)) {
+				for (const item of arr) {
+					if (Array.isArray(item) && item.length >= 2) {
+						const idx = Number(item[0]);
+						const score = Number(item[1]);
+						if (!isNaN(idx) && !isNaN(score)) {
+							scores.push({ index: idx, score });
+						}
+					} else if (item && typeof item === 'object' && 'index' in item && 'score' in item) {
+						scores.push({ index: Number(item.index), score: Number(item.score) });
+					}
+				}
+			}
+
+			if (scores.length > 0) return scores;
+		} catch {
+			// JSON parsing failed, try regex
+		}
+
+		// Regex fallback: match patterns like "0: 8" or "0:8" or "[0] 8"
+		const scores: Array<{ index: number; score: number }> = [];
+		const regex = /\[?(\d+)\]?\s*[:\-=]\s*(\d+(?:\.\d+)?)/g;
+		let match;
+		while ((match = regex.exec(response)) !== null) {
+			scores.push({ index: Number(match[1]), score: Number(match[2]) });
+		}
+
+		return scores;
+	}
+
 }
