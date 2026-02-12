@@ -246,6 +246,7 @@ interface WitnessSettings {
 	ollamaModel: string;
 	excludedFolders: string[];
 	minContentLength: number;
+	idleThresholdMinutes: number;
 	// Re-ranking
 	enableReranking: boolean;
 	rerankModel: string;
@@ -288,6 +289,7 @@ const DEFAULT_SETTINGS: WitnessSettings = {
 	ollamaModel: 'nomic-embed-text',
 	excludedFolders: [],
 	minContentLength: 50,
+	idleThresholdMinutes: 2,
 	enableReranking: false,
 	rerankModel: '',
 }
@@ -314,7 +316,9 @@ export default class WitnessPlugin extends Plugin {
 	private saveTimer: number | null = null;
 	private countdownTimer: number | null = null;
 	private waitingForIdle = false;
-	private static readonly IDLE_THRESHOLD_MS = 120_000; // 2 minutes of no activity
+	private get IDLE_THRESHOLD_MS(): number {
+		return (this.settings.idleThresholdMinutes ?? 2) * 60_000;
+	}
 	private static readonly SAVE_INTERVAL_MS = 30_000; // debounce saves to every 30s
 
 	async onload() {
@@ -610,7 +614,7 @@ export default class WitnessPlugin extends Plugin {
 		}
 
 		const elapsed = Date.now() - this.lastAppActivity;
-		const remaining = Math.max(0, WitnessPlugin.IDLE_THRESHOLD_MS - elapsed);
+		const remaining = Math.max(0, this.IDLE_THRESHOLD_MS - elapsed);
 
 		if (remaining === 0) {
 			if (this.countdownTimer) {
@@ -655,7 +659,7 @@ export default class WitnessPlugin extends Plugin {
 	 * for at least IDLE_THRESHOLD_MS.
 	 */
 	private isAppIdle(): boolean {
-		return Date.now() - this.lastAppActivity >= WitnessPlugin.IDLE_THRESHOLD_MS;
+		return Date.now() - this.lastAppActivity >= this.IDLE_THRESHOLD_MS;
 	}
 
 	/**
@@ -3595,6 +3599,19 @@ class WitnessSettingTab extends PluginSettingTab {
 						const num = parseInt(value, 10);
 						if (!isNaN(num) && num >= 0) {
 							this.plugin.settings.minContentLength = num;
+							await this.plugin.saveSettings();
+						}
+					})))
+			.addSetting(s => s
+				.setName('Idle threshold (minutes)')
+				.setDesc('Wait this long after the last mouse/keyboard activity before indexing. Prevents indexing while you\'re working.')
+				.addText(text => text
+					.setValue(String(this.plugin.settings.idleThresholdMinutes ?? 2))
+					.setPlaceholder('2')
+					.onChange(async (value) => {
+						const num = parseFloat(value);
+						if (!isNaN(num) && num > 0) {
+							this.plugin.settings.idleThresholdMinutes = num;
 							await this.plugin.saveSettings();
 						}
 					})));
