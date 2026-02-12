@@ -223,22 +223,33 @@ Documents are split into chunks by markdown headings before embedding. Each chun
 
 The index stays up-to-date through two mechanisms working together:
 
-**Event-driven indexing** (instant): Vault event listeners (create/modify/delete/rename) feed an `IndexQueue` with a 3-second per-file debounce. `processQueue()` handles deletes, renames (light metadata update via `moveFile()`), and indexes (full embedding). This handles the 99% case — user edits a file, it's re-indexed within seconds.
+**Idle-gated execution**: All indexing work (both event-driven and reconciliation) waits until the app has been idle for 2 minutes (`IDLE_THRESHOLD_MS = 120_000`). Idle is defined as no mousemove, keydown, click, or scroll events on `document`. This eliminates UI stutter entirely — indexing only runs when the user isn't interacting with Obsidian.
+
+**Event-driven indexing**: Vault event listeners (create/modify/delete/rename) feed an `IndexQueue` with a 3-second per-file debounce. `processQueue()` calls `waitForIdle()` first, then handles deletes, renames (light metadata update via `moveFile()`), and indexes (full embedding).
 
 **Periodic reconciliation** (safety net): Every 60 seconds, `reconcile()` runs a bidirectional scan:
 
 - **Forward**: `getStaleFiles()` compares vault file mtimes against indexed mtimes → finds new/modified files
 - **Reverse**: `getOrphanedPaths()` compares `indexedFiles` Set against vault paths → finds deleted files
 
-This catches everything events miss: files changed while the plugin was off, Obsidian Sync drift, external tools touching files, plugin restarts.
+This catches everything events miss: files changed while the plugin was off, Obsidian Sync drift, external tools touching files, plugin restarts. Reconciliation also calls `waitForIdle()` (except on initial startup where `skipIdleWait=true`).
+
+**Debounced saves**: Index saves are batched via `scheduleSave()` — a dirty flag + 30-second timer (`SAVE_INTERVAL_MS`). Avoids serialising the full 279 MB+ index after every small change. `flushSave()` is called on plugin unload to ensure nothing is lost.
+
+**Active file deferral**: Both `processQueue()` and `reconcile()` check `app.workspace.getActiveFile()` and skip it, re-queuing for later. This avoids re-indexing a file that's about to change again while the user edits it.
+
+**Status bar countdown**: When `waitForIdle()` is blocking, a 5-second interval timer updates the status bar with "N pending, indexing in M:SS". Resets on every user interaction. The `waitingForIdle` flag tracks whether any code path is currently blocked.
 
 **Key implementation details:**
 
 - `backgroundIndexing` flag acts as a mutex — prevents concurrent indexing from events and reconciliation
 - `indexedFiles` Set tracks all indexed file paths, persisted in the save envelope, and self-heals via `getStaleFiles()` (adds up-to-date files it encounters)
 - `moveFile()` does O(n chunks) remove+insert with `getByID()` — preserves the embedding vector, only updates sourcePath/title/folder/id
-- `startBackgroundIndexing()` runs after a 5-second startup delay: init search engine → clear queued events → reconcile once → start 60-second timer
-- The sync-settling mechanism (`waitForSync`/`syncSettling`/`pendingSyncActions`) was removed — reconciliation handles sync naturally
+- `startBackgroundIndexing()` runs after a 5-second startup delay: init search engine → clear queued events → update status bar → `reconcile(true)` → start 60-second timer
+- DOM activity listeners are registered with `{ passive: true }` to avoid performance impact
+- The `isUserActive` callback passed to `indexFiles()` uses `!isAppIdle()` as a safety net pause within long-running indexing loops
+
+**Architectural note (Web Worker rejection):** A web worker approach was prototyped and rejected. Even with Orama running off-thread, the main thread still blocks on: vault file reads (Obsidian API is main-thread-only), postMessage structured clone of the 279 MB index, and JSON.stringify for persistence. Idle detection is simpler and more effective — it doesn't make the work faster, it makes the work invisible.
 
 ### Unified Search Architecture (Planned)
 

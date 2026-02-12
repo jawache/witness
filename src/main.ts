@@ -177,6 +177,10 @@ class IndexQueue {
 		return items;
 	}
 
+	get size(): number {
+		return this.pending.size;
+	}
+
 	clear() {
 		for (const { timer } of this.pending.values()) {
 			window.clearTimeout(timer);
@@ -299,7 +303,14 @@ export default class WitnessPlugin extends Plugin {
 	private statusBarEl: HTMLElement | null = null;
 	private backgroundIndexing = false;
 	private reconcileTimer: number | null = null;
-	private lastEditorActivity = 0;
+	private lastAppActivity = 0;
+	private idleCheckTimer: number | null = null;
+	private saveDirty = false;
+	private saveTimer: number | null = null;
+	private countdownTimer: number | null = null;
+	private waitingForIdle = false;
+	private static readonly IDLE_THRESHOLD_MS = 120_000; // 2 minutes of no activity
+	private static readonly SAVE_INTERVAL_MS = 30_000; // debounce saves to every 30s
 
 	async onload() {
 		await this.loadSettings();
@@ -395,10 +406,22 @@ export default class WitnessPlugin extends Plugin {
 			}
 		}));
 
-		// Track editor activity to pause indexing while user is typing
-		this.registerEvent(this.app.workspace.on('editor-change', () => {
-			this.lastEditorActivity = Date.now();
-		}));
+		// Track all app activity to defer indexing until the user is idle
+		this.lastAppActivity = Date.now();
+		const onActivity = () => {
+			this.lastAppActivity = Date.now();
+			this.manageCountdownTimer();
+		};
+		document.addEventListener('mousemove', onActivity, { passive: true });
+		document.addEventListener('keydown', onActivity, { passive: true });
+		document.addEventListener('click', onActivity, { passive: true });
+		document.addEventListener('scroll', onActivity, { capture: true, passive: true });
+		this.register(() => {
+			document.removeEventListener('mousemove', onActivity);
+			document.removeEventListener('keydown', onActivity);
+			document.removeEventListener('click', onActivity);
+			document.removeEventListener('scroll', onActivity, { capture: true } as EventListenerOptions);
+		});
 
 		// Start MCP server if enabled
 		if (this.settings.mcpEnabled) {
@@ -422,11 +445,24 @@ export default class WitnessPlugin extends Plugin {
 			window.clearInterval(this.reconcileTimer);
 			this.reconcileTimer = null;
 		}
+		if (this.idleCheckTimer) {
+			window.clearTimeout(this.idleCheckTimer);
+			this.idleCheckTimer = null;
+		}
+		if (this.saveTimer) {
+			window.clearTimeout(this.saveTimer);
+			this.saveTimer = null;
+		}
+		if (this.countdownTimer) {
+			window.clearInterval(this.countdownTimer);
+			this.countdownTimer = null;
+		}
 		this.indexQueue?.clear();
 		this.stopTunnel();
 		this.stopMCPServer();
 		if (this.vectorStore) {
-			await this.vectorStore.save();
+			// Flush any pending dirty save before destroying
+			await this.flushSave();
 			this.vectorStore.destroy();
 			this.vectorStore = null;
 		}
@@ -533,6 +569,59 @@ export default class WitnessPlugin extends Plugin {
 			const fileCount = this.vectorStore?.getFileCount() ?? 0;
 			this.statusBarEl.setText(fileCount > 0 ? `Witness: ${fileCount.toLocaleString()} files indexed` : 'Witness');
 		}
+		// Manage countdown timer: start when idle with pending work, stop otherwise
+		this.manageCountdownTimer();
+	}
+
+	/**
+	 * Start or stop the countdown timer based on whether there's pending work
+	 * waiting for idle. Shows "indexing in M:SS" in the status bar.
+	 */
+	private manageCountdownTimer(): void {
+		const needsCountdown = this.waitingForIdle && !this.backgroundIndexing && !this.isAppIdle();
+
+		if (needsCountdown && !this.countdownTimer) {
+			// Start ticking every 5 seconds
+			this.countdownTimer = window.setInterval(() => this.updateCountdown(), 5_000);
+			// Immediately show the first countdown
+			this.updateCountdown();
+		} else if (!needsCountdown && this.countdownTimer) {
+			window.clearInterval(this.countdownTimer);
+			this.countdownTimer = null;
+		}
+	}
+
+	/**
+	 * Update the status bar with the idle countdown.
+	 */
+	private updateCountdown(): void {
+		if (!this.statusBarEl) return;
+		if (this.backgroundIndexing || !this.waitingForIdle) {
+			if (this.countdownTimer) {
+				window.clearInterval(this.countdownTimer);
+				this.countdownTimer = null;
+			}
+			return;
+		}
+
+		const elapsed = Date.now() - this.lastAppActivity;
+		const remaining = Math.max(0, WitnessPlugin.IDLE_THRESHOLD_MS - elapsed);
+
+		if (remaining === 0) {
+			if (this.countdownTimer) {
+				window.clearInterval(this.countdownTimer);
+				this.countdownTimer = null;
+			}
+			return;
+		}
+
+		const secs = Math.ceil(remaining / 1000);
+		const mins = Math.floor(secs / 60);
+		const remSecs = secs % 60;
+		const timeStr = `${mins}:${remSecs.toString().padStart(2, '0')}`;
+		const queueCount = this.indexQueue?.size ?? 0;
+		const pendingText = queueCount > 0 ? `${queueCount} pending, ` : '';
+		this.statusBarEl.setText(`Witness: ${pendingText}indexing in ${timeStr}`);
 	}
 
 	/**
@@ -557,13 +646,76 @@ export default class WitnessPlugin extends Plugin {
 	}
 
 	/**
+	 * Whether the app has been idle (no mouse, keyboard, click, scroll)
+	 * for at least IDLE_THRESHOLD_MS.
+	 */
+	private isAppIdle(): boolean {
+		return Date.now() - this.lastAppActivity >= WitnessPlugin.IDLE_THRESHOLD_MS;
+	}
+
+	/**
+	 * Wait until the app is idle, checking every 10 seconds.
+	 * Returns immediately if already idle.
+	 */
+	private waitForIdle(): Promise<void> {
+		if (this.isAppIdle()) return Promise.resolve();
+		this.waitingForIdle = true;
+		this.manageCountdownTimer();
+		return new Promise(resolve => {
+			const check = () => {
+				if (this.isAppIdle()) {
+					this.waitingForIdle = false;
+					resolve();
+				} else {
+					this.idleCheckTimer = window.setTimeout(check, 10_000);
+				}
+			};
+			this.idleCheckTimer = window.setTimeout(check, 10_000);
+		});
+	}
+
+	/**
+	 * Mark the index as dirty and schedule a save after SAVE_INTERVAL_MS.
+	 * Avoids serialising the full 279 MB+ index after every small change.
+	 */
+	private scheduleSave(): void {
+		this.saveDirty = true;
+		if (this.saveTimer) return; // already scheduled
+		this.saveTimer = window.setTimeout(async () => {
+			this.saveTimer = null;
+			await this.flushSave();
+		}, WitnessPlugin.SAVE_INTERVAL_MS);
+	}
+
+	/**
+	 * Persist the index to disk immediately if dirty.
+	 * Called by the debounce timer and on plugin unload.
+	 */
+	private async flushSave(): Promise<void> {
+		if (!this.saveDirty || !this.vectorStore) return;
+		this.saveDirty = false;
+		try {
+			await this.vectorStore.save();
+			this.indexLogger.info('Index saved to disk');
+		} catch (err) {
+			this.indexLogger.error('Failed to save index', err);
+		}
+	}
+
+	/**
 	 * Process the background indexing queue.
-	 * Called when a debounce timer fires after vault events.
+	 * Waits for app idleness before starting any work.
 	 */
 	private async processQueue(): Promise<void> {
 		if (!this.settings.enableSemanticSearch) return;
 		if (this.backgroundIndexing) return;
 		if (!this.vectorStore) return;
+
+		// Wait until the user has been idle before doing any work
+		await this.waitForIdle();
+
+		// Re-check after waiting — state may have changed
+		if (this.backgroundIndexing || !this.vectorStore) return;
 		this.backgroundIndexing = true;
 
 		try {
@@ -600,12 +752,24 @@ export default class WitnessPlugin extends Plugin {
 			}
 
 			// Process indexes (including rename fallbacks)
-			const filesToIndex = [
+			const allFilesToIndex = [
 				...toIndex
 					.map(i => this.app.vault.getAbstractFileByPath(i.path))
 					.filter((f): f is TFile => f instanceof TFile),
 				...renameFallbacks,
 			];
+
+			// Defer the active file — it will change again soon while the user is editing
+			const activeFile = this.app.workspace.getActiveFile();
+			const filesToIndex: TFile[] = [];
+			for (const file of allFilesToIndex) {
+				if (activeFile && file.path === activeFile.path) {
+					this.indexQueue.add(file.path, 'modify');
+					this.indexLogger.info(`Deferred active file: ${file.path}`);
+				} else {
+					filesToIndex.push(file);
+				}
+			}
 
 			if (filesToIndex.length > 0) {
 				this.updateStatusBar(`indexing ${filesToIndex.length} file${filesToIndex.length > 1 ? 's' : ''}...`);
@@ -617,14 +781,14 @@ export default class WitnessPlugin extends Plugin {
 						this.updateStatusBar(`indexing ${done}/${total}...`);
 					},
 					onLog: (_level, msg) => this.indexLogger.info(msg),
-					isUserActive: () => Date.now() - this.lastEditorActivity < 2000,
+					isUserActive: () => !this.isAppIdle(),
 				});
 				this.indexLogger.info(`Indexed ${result.indexed} file${result.indexed > 1 ? 's' : ''} (${result.embedded} embedded)`);
 				changed = true;
 			}
 
 			if (changed) {
-				await this.vectorStore!.save();
+				this.scheduleSave();
 			}
 		} catch (err) {
 			this.indexLogger.error('Background indexing failed', err);
@@ -651,8 +815,11 @@ export default class WitnessPlugin extends Plugin {
 		// Discard any events queued during the startup delay — reconcile catches everything
 		this.indexQueue.clear();
 
-		// Run initial reconciliation immediately
-		await this.reconcile();
+		// Search engine is loaded — update status bar so user knows it's ready
+		this.updateStatusBar();
+
+		// Run initial reconciliation immediately (skip idle wait — startup is expected to do work)
+		await this.reconcile(true);
 
 		// Start periodic reconciliation (every 60 seconds)
 		this.reconcileTimer = window.setInterval(() => this.reconcile(), 60_000);
@@ -663,10 +830,18 @@ export default class WitnessPlugin extends Plugin {
 	 * Forward: find stale files (new/modified since last index).
 	 * Reverse: find orphaned index entries (files deleted while plugin was off).
 	 */
-	private async reconcile(): Promise<void> {
+	private async reconcile(skipIdleWait = false): Promise<void> {
 		if (!this.settings.enableSemanticSearch) return;
 		if (this.backgroundIndexing) return;
 		if (!this.vectorStore) return;
+
+		// Wait until the user has been idle before doing any work (skip on initial startup)
+		if (!skipIdleWait) {
+			await this.waitForIdle();
+		}
+
+		// Re-check after waiting
+		if (this.backgroundIndexing || !this.vectorStore) return;
 		this.backgroundIndexing = true;
 
 		try {
@@ -680,10 +855,16 @@ export default class WitnessPlugin extends Plugin {
 			// Forward: find files needing indexing (new/modified)
 			const allStaleFiles = await this.vectorStore.getStaleFiles(mdFiles);
 
+			// Defer the active file — will be picked up when the user switches away
+			const activeFile = this.app.workspace.getActiveFile();
+			const nonActiveStale = activeFile
+				? allStaleFiles.filter(f => f.path !== activeFile.path)
+				: allStaleFiles;
+
 			// Cap batch size to avoid long blocking — rest picked up next cycle
-			const staleFiles = allStaleFiles.slice(0, RECONCILE_BATCH_SIZE);
-			if (staleFiles.length < allStaleFiles.length) {
-				this.indexLogger.info(`Reconcile: processing ${staleFiles.length}/${allStaleFiles.length} stale files (rest next cycle)`);
+			const staleFiles = nonActiveStale.slice(0, RECONCILE_BATCH_SIZE);
+			if (staleFiles.length < nonActiveStale.length) {
+				this.indexLogger.info(`Reconcile: processing ${staleFiles.length}/${nonActiveStale.length} stale files (rest next cycle)`);
 			}
 
 			if (staleFiles.length === 0 && orphanedPaths.length === 0) return;
@@ -703,12 +884,12 @@ export default class WitnessPlugin extends Plugin {
 					getFileTags: (f) => this.getFileTags(f),
 					onProgress: (done, total) => this.updateStatusBar(`indexing ${done}/${total}...`),
 					onLog: (_level, msg) => this.indexLogger.info(msg),
-					isUserActive: () => Date.now() - this.lastEditorActivity < 2000,
+					isUserActive: () => !this.isAppIdle(),
 				});
 			}
 
 			if (staleFiles.length > 0 || orphanedPaths.length > 0) {
-				await this.vectorStore.save();
+				this.scheduleSave();
 				this.indexLogger.info(`Reconcile: ${staleFiles.length} indexed, ${orphanedPaths.length} orphans removed`);
 			}
 		} catch (err) {

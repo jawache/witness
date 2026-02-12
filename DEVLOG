@@ -1890,3 +1890,82 @@ This session was about making the AI a better collaborator. The triage tools the
 ---
 
 *End of log entry*
+
+## 2026-02-08 - Idle-Gated Indexing & Status Bar Countdown
+
+**Objective**: Eliminate UI stutter during background indexing by replacing the web worker approach with app-wide idle detection, and add a visible countdown timer so the user can see when indexing will run.
+
+### What We Built
+
+- App-wide idle detection: indexing only runs after 2 minutes of complete inactivity (no mouse, keyboard, clicks, or scrolling)
+- Debounced index saves: instead of serialising 279 MB after every change, saves are batched on a 30-second timer
+- Active file deferral: the file currently being edited is skipped and re-queued for later
+- Status bar countdown timer: shows "3 pending, indexing in 1:45" when work is waiting
+- Removed the web worker (orama-worker.ts, orama-worker-client.ts) — simpler architecture, same result
+- Removed setTimeout(0) yields from vector-store.ts — no longer needed with idle gating
+
+### The Journey
+
+This session started as a web worker implementation session. The previous conversation had built the full worker infrastructure: orama-worker.ts (IIFE worker), orama-worker-client.ts (Promise-based postMessage wrapper), esbuild worker build, and a rewritten vector-store.ts that proxied all Orama operations through the worker.
+
+But testing revealed a fundamental problem: even with Orama running off-thread, the main thread still did significant work — reading files from the vault, chunking markdown, calling Ollama for embeddings, and crucially, transferring the 279 MB serialised index back via postMessage's structured clone algorithm. The structured clone of a 279 MB object is itself a blocking operation.
+
+The user asked the right question: "why isn't all of this in the worker?" The answer was that Obsidian's vault APIs (cachedRead, metadataCache, workspace) are main-thread-only — they can't be called from a worker. So the architecture was fundamentally split: worker owns the DB, main thread owns the I/O. And the bridge between them (postMessage) was the bottleneck.
+
+Several alternatives were explored:
+- **IndexedDB in the worker**: Would avoid the main-thread save entirely, but the user rejected this because it's hidden and hard to debug. A JSON file you can inspect, delete, and share is more practical.
+- **Embeddings-only persistence**: Only save the expensive-to-regenerate embeddings, rebuild everything else from vault files on startup. Interesting idea but adds startup latency.
+- **Idle detection**: The user's insight — "the stutter is only a problem if I'm working on Obsidian" — cut through all the complexity. If you simply don't do any indexing work while the user is active, the stutter disappears regardless of how much main-thread work is involved.
+
+This led to the architectural pivot: remove the web worker entirely and replace it with app-wide idle detection. The implementation is dramatically simpler:
+
+1. **DOM event listeners** on `document` (mousemove, keydown, click, scroll) track `lastAppActivity`
+2. **`waitForIdle()`** polls every 10 seconds, resolves when 2 minutes of silence have passed
+3. Both `processQueue()` and `reconcile()` call `waitForIdle()` before doing any work
+4. Initial startup skips the idle wait (`reconcile(true)`) so search is immediately available
+
+On top of that, three optimisations were added back:
+- **Debounced save**: A dirty flag + 30-second timer replaces the per-operation save. Flushed on plugin unload.
+- **Active file deferral**: The file the user is editing is filtered out and re-queued, avoiding re-indexing a file that's about to change again.
+- **`isUserActive` safety net**: The existing 500ms pause loop inside `indexFiles()` was kept as a belt-and-suspenders check, now using `!isAppIdle()` instead of the old editor-only activity check.
+
+A bug emerged immediately: the initial reconciliation hung forever in `waitForIdle()` because the user was actively working in Obsidian. Fixed by adding a `skipIdleWait` parameter that's `true` only for the startup call.
+
+The final feature — the status bar countdown — gives the user visibility into the idle gating behaviour. When work is waiting and the user is active, the status bar shows something like "Witness: 3 pending, indexing in 1:45". The countdown resets on every interaction and ticks every 5 seconds. A `waitingForIdle` flag tracks whether any code path is currently blocked in `waitForIdle()`, which covers both queue-triggered and reconcile-triggered waits.
+
+### Technical Achievements
+
+- **Zero-stutter indexing** — main thread is never blocked by indexing because indexing only runs when the user isn't there
+- **279 MB save debouncing** — instead of serialising the full index after every file change, saves are batched to at most once per 30 seconds
+- **Visible idle countdown** — users can see exactly when indexing will run and adjust the threshold if needed
+- **Removed ~400 lines of worker code** — simpler architecture with the same user experience
+- **37 unit tests passing** — all existing tests continue to pass
+
+### Key Learnings
+
+1. **UX solutions can beat technical solutions**: Moving Orama to a worker was technically correct but didn't solve the root problem (structured clone of 279 MB). Idle detection is simpler, more robust, and actually eliminates the perceived issue.
+2. **The user doesn't care about thread scheduling**: They care about stutter. If work only happens when they're not looking, the stutter doesn't exist. This is a profoundly different framing than "make the work faster".
+3. **Visibility builds trust**: The countdown timer transforms the idle gate from an invisible heuristic into a visible feature. Users can see exactly what's happening and why indexing hasn't run yet.
+4. **postMessage is not free**: Structured cloning large objects across worker boundaries is itself a blocking main-thread operation. Workers help with CPU-bound work, not data-transfer-bound work.
+5. **DOM events are better than editor events**: The old `editor-change` listener only tracked typing. App-wide DOM events (mousemove, keydown, click, scroll) catch all forms of interaction — scrolling through notes, clicking links, navigating the file tree.
+
+### Statistics
+
+- 2 files changed: src/main.ts (+199, -26), src/vector-store.ts (-8)
+- 2 files deleted: src/orama-worker.ts, src/orama-worker-client.ts
+- 37 unit tests passing
+- Net complexity reduction: ~400 lines of worker code removed, ~175 lines of idle detection added
+
+### Next Steps
+
+- Re-ranking feature (Ollama-based re-ranking for higher precision results)
+- Link discovery implementation
+- Consider making the idle threshold configurable in settings
+
+### Reflections
+
+This session is a case study in the value of stepping back from a technical approach. The web worker was the "obvious" engineering solution — move heavy work off the main thread. But the real insight was that indexing doesn't need to be fast, it just needs to be invisible. A 2-minute idle threshold is practically free in terms of user experience, and it eliminates an entire class of complexity (worker lifecycle, message passing, structured cloning, split architecture). Sometimes the best optimisation is not doing the work at all.
+
+---
+
+*End of log entry*

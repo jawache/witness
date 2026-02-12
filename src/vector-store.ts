@@ -248,8 +248,6 @@ export class OramaSearchEngine implements SearchEngine {
 						folder,
 					};
 					await insert(this.db, doc);
-					// Yield after each insert so the UI thread can process events
-					await new Promise(resolve => setTimeout(resolve, 0));
 				}
 
 				indexed++;
@@ -278,8 +276,6 @@ export class OramaSearchEngine implements SearchEngine {
 								folder,
 								embedding: embeddings[i],
 							});
-							// Yield after each remove+insert so the UI thread can process events
-							await new Promise(resolve => setTimeout(resolve, 0));
 						}
 						embedded++;
 					} catch (e) {
@@ -294,8 +290,6 @@ export class OramaSearchEngine implements SearchEngine {
 
 			options?.onProgress?.(indexed + failed.length, total);
 
-			// Yield to the renderer so the UI can repaint and process input events
-			await new Promise(resolve => setTimeout(resolve, 0));
 		}
 
 		return { indexed, embedded, failed };
@@ -323,8 +317,6 @@ export class OramaSearchEngine implements SearchEngine {
 				const existing = getByID(this.db, id);
 				if (existing) {
 					await remove(this.db, id);
-					// Yield after each remove so the UI thread can process events
-					await new Promise(resolve => setTimeout(resolve, 0));
 				} else {
 					break; // No more chunks for this file
 				}

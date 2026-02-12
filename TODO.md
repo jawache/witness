@@ -3,9 +3,9 @@
 ## High Priority
 
 ## Next Up
-- [ ] [Web Worker for Orama indexing](docs/features/web-worker-indexing.md) — Move Orama DB operations to a Web Worker so indexing never blocks the UI thread. Current quick fix yields between operations but a proper off-thread solution would eliminate stutter entirely.
 - [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
 - [ ] [Link discovery](docs/features/link-discovery.md) — Discover connections between notes using embeddings + local LLM, Grammarly-style review panel
+- [ ] Make idle threshold configurable in settings (currently hardcoded at 2 minutes)
 
 ## Completed
 
@@ -32,3 +32,4 @@
 - [x] [Search panel filters](docs/features/search-panel-filters.md) — Path and tag filtering in sidebar with AbstractInputSuggest autocomplete
 - [x] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with periodic reconciliation, status bar indicator, and log viewer
 - [x] [Chaos triage](docs/features/chaos-triage.md) — MCP tools for processing chaos items (get_next_chaos, mark_triage), AI guardrails for safe file operations
+- [x] Idle-gated indexing — App-wide idle detection (2 min threshold) replaces web worker approach; debounced saves, active file deferral, status bar countdown timer
