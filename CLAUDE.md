@@ -276,6 +276,26 @@ See `docs/features/unified-search.md` for full spec. Key decisions:
 
 Total: 16 MCP tools registered and available
 
+### LLM Re-ranking
+
+- ✅ `search` tool gains `rerank: true` parameter for two-stage search
+- ✅ `generate()` method on OllamaProvider for `/api/generate` endpoint
+- ✅ `listChatModels()` filters models by `completion` capability
+- ✅ `rerank()` batch-scores candidates with JSON output + regex fallback
+- ✅ Settings UI with model dropdown, suggested models, and pull buttons
+- ✅ Search panel toggle with two-phase UX and animated status banner
+- ✅ Enter-only search when re-rank enabled (no debounce)
+
+**Architecture:** Stage 1 (hybrid search, top-30 candidates) → Stage 2 (LLM relevance scoring, top-K). Re-ranking is orchestrated in `main.ts`'s `search()` method, not in `vector-store.ts`.
+
+**Quality Limitation:** Small chat models (1-4B) as relevance judges have poor discrimination — they tend to score everything similarly. Dedicated cross-encoder models (bge-reranker, jina-reranker) are purpose-built for this but Ollama doesn't yet expose a native rerank endpoint. The infrastructure is in place for when better options emerge.
+
+**Graceful Degradation:** JSON parse → regex fallback (`\[?(\d+)\]?\s*[:\-=]\s*(\d+)`) → original ordering. If the LLM call fails entirely, results are returned in their stage 1 order.
+
+### Configurable Idle Threshold
+
+The idle detection threshold for background indexing is configurable in Settings → Search → Indexing Filters. Default is 2 minutes. The hardcoded `static readonly IDLE_THRESHOLD_MS` was replaced with a settings-backed getter: `get IDLE_THRESHOLD_MS() { return (this.settings.idleThresholdMinutes ?? 2) * 60_000; }`.
+
 ## MCP Implementation Details
 
 ### StreamableHTTP Protocol & Session Management

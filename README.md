@@ -30,6 +30,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Primary Machine**: Designate which machine runs the tunnel when syncing across multiple devices
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Chaos Triage**: AI-assisted processing of unread chaos items with queue management and safe frontmatter updates
+- **LLM Re-ranking**: Optional two-stage search — fast hybrid results shown instantly, then re-ranked by a local LLM for higher precision
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
 **16 MCP Tools Available**:

@@ -1969,3 +1969,79 @@ This session is a case study in the value of stepping back from a technical appr
 ---
 
 *End of log entry*
+
+## 2026-02-08 — LLM Re-ranking & UX Polish
+
+**Objective**: Implement Ollama-based LLM re-ranking for search results, making search precision optionally higher for complex queries.
+
+### What We Built
+
+- **LLM Re-ranking Pipeline**: Two-stage search — fast hybrid search (stage 1, top-30) followed by LLM relevance scoring (stage 2, top-K)
+- **OllamaProvider Extensions**: `generate()`, `listChatModels()`, `rerank()`, and `parseRerankResponse()` methods
+- **MCP Integration**: `search` tool gains `rerank: true` parameter for AI clients
+- **Settings UI**: Re-ranking section with enable toggle, model dropdown, and suggested model pull buttons (llama3.2:1b, qwen2.5:1.5b, phi3:mini, gemma2:2b)
+- **Search Panel Toggle**: Checkbox in sidebar, hidden when re-ranking isn't configured
+- **Two-Phase Search UX**: When re-ranking is enabled, stage 1 results appear instantly with an animated "Re-ranking with LLM..." banner, then re-ranked results replace them
+- **Animated Status Banner**: Accent-coloured banner with cycling dots animation during re-ranking, transitions to muted "Re-ranked in Xms" when done
+- **Enter-Only Mode**: Debounce disabled when re-rank is on (too expensive per keystroke), placeholder updates to hint "press Enter"
+- **Race Condition Guard**: Sequence counter prevents stale search results from overwriting newer ones
+- **Configurable Idle Threshold**: Moved hardcoded 2-minute idle detection threshold to settings (Indexing Filters section)
+
+### The Journey
+
+The session started with a clear plan from a previous planning phase — the architecture was already designed with the two-stage pipeline, batch prompt approach, and graceful degradation strategy. Implementation went smoothly through the seven planned steps: OllamaProvider methods, settings, search pipeline, MCP tool, settings UI, sidebar toggle, and build/test.
+
+The interesting part was the UX iteration. After the initial deployment, the user noticed several issues:
+
+1. **Settings grouping**: The "Enable re-ranking" and "Re-ranking model" settings were rendered as standalone `new Setting()` calls instead of using `SettingGroup.addSetting()`. Same issue existed for the Ollama Connection section (Base URL + Embedding Model). Fixed both to use consistent grouping.
+
+2. **Debounce + re-ranking clash**: The 300ms debounce was firing LLM calls on every typing pause — wasteful and jarring. Switched to Enter-only when re-rank is enabled, with the placeholder text updating as a hint.
+
+3. **No feedback during re-ranking**: The LLM call takes 1-5+ seconds with no indication of progress. The first attempt was a simple "Searching + re-ranking..." loading state, but the user wanted more — they wanted to know what was happening, not just that something was happening.
+
+The breakthrough was the two-phase UX: show stage 1 results immediately (the user can start reading), then update when re-ranking completes. The animated dots banner ("Re-ranking with LLM.") cycling through one, two, three dots gives a clear sense of activity, and the accent colour makes it unmissable. When done, it transitions to a muted "Re-ranked in 2341ms" showing actual timing.
+
+1. **Quality concerns**: The user tested with multiple models and found re-ranking results "not great." Small chat models (1-4B) doing batch relevance scoring is the weakest form of re-ranking — they tend to give everything similar scores. Dedicated cross-encoder models (bge-reranker, jina-reranker) are purpose-built for this but Ollama doesn't expose a native rerank endpoint yet. Documented this honestly rather than over-promising fixes.
+
+2. **Minor polish**: Added padding between the "Available Re-ranking Models" heading and the settings above it (12px margin-top on rerankContent div).
+
+The idle threshold was a quick bonus — replaced the hardcoded `static readonly IDLE_THRESHOLD_MS = 120_000` with a settings-backed getter, using `parseFloat` to support fractional minutes.
+
+### Technical Achievements
+
+- **535 lines added** across 5 files with clean build and all 37 unit tests passing
+- Graceful degradation at every level: JSON parse → regex fallback → original order
+- Two-phase search UX with no architectural changes to the search pipeline (just calls `search()` twice in the view layer)
+- CSS-only styling with Obsidian theme variables (works in light and dark mode)
+- JS-based dots animation (CSS `content` in `@keyframes` doesn't work in most browsers — caught this before deploying)
+
+### Key Learnings
+
+- **Small LLMs as relevance judges have real limitations**: The LLM-as-judge pattern works well with large models (GPT-4, Claude) but 1-4B local models lack the nuance for fine-grained relevance scoring. Cross-encoder reranking models are purpose-built for this.
+- **Two-phase UX > loading spinners**: Showing real results immediately while the slow operation runs in the background is strictly better than a spinner. Users can start working while waiting.
+- **SettingGroup consistency matters**: Standalone `new Setting()` calls look visually disconnected from their group heading. Always use `group.addSetting()` for settings that belong together.
+- **Debounce assumptions break with expensive operations**: A 300ms debounce is fine for <100ms searches but terrible for 3+ second LLM calls. The UX should adapt to the expected latency of the operation.
+- **CSS `content` animation is unreliable**: The `@keyframes` approach for animating `content` (cycling dots) doesn't work in most browsers. Use JS `setInterval` instead.
+
+### Statistics
+
+- 3 commits on `feature/reranking` branch
+- 5 files changed, 535 insertions, 78 deletions
+- 4 source files modified: main.ts (+311/-68), ollama-provider.ts (+154), search-view.ts (+107/-16), styles.css (+37)
+- All 37 unit tests passing
+
+### Next Steps
+
+- Link discovery — the next major feature on the TODO
+- Monitor Ollama for native rerank endpoint support (would dramatically improve re-ranking quality)
+- Consider whether re-ranking should be kept as-is or removed given quality limitations
+
+### Reflections
+
+This session was a masterclass in UX-driven iteration. The initial implementation was technically complete but the user experience wasn't right — the debounce was wrong, the feedback was missing, the settings looked inconsistent. Each piece of feedback led to a targeted improvement. The two-phase search UX was the biggest win: it's such a natural pattern (show what you have, refine in the background) but it wouldn't have emerged without the user flagging the lack of feedback. Sometimes the feature isn't done when the code works — it's done when it feels right.
+
+The quality discussion was also important. Being honest about the limitations of small-model re-ranking (rather than endlessly tweaking prompts) is the right call. The infrastructure is there for when better reranking options emerge.
+
+---
+
+*End of log entry*
