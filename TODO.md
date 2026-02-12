@@ -3,9 +3,7 @@
 ## High Priority
 
 ## Next Up
-- [ ] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based re-ranking for higher precision results.
 - [ ] [Link discovery](docs/features/link-discovery.md) — Discover connections between notes using embeddings + local LLM, Grammarly-style review panel
-- [ ] Make idle threshold configurable in settings (currently hardcoded at 2 minutes)
 
 ## Completed
 
@@ -33,3 +31,5 @@
 - [x] [Background indexing](docs/features/background-indexing.md) — Automatic incremental indexing with periodic reconciliation, status bar indicator, and log viewer
 - [x] [Chaos triage](docs/features/chaos-triage.md) — MCP tools for processing chaos items (get_next_chaos, mark_triage), AI guardrails for safe file operations
 - [x] Idle-gated indexing — App-wide idle detection (2 min threshold) replaces web worker approach; debounced saves, active file deferral, status bar countdown timer
+- [x] [Re-ranking](docs/features/reranking.md) — Optional Ollama-based LLM re-ranking with two-phase search UX, animated status banner, configurable model
+- [x] Configurable idle threshold — Settings UI for idle detection threshold (was hardcoded at 2 minutes)
