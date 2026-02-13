@@ -2242,92 +2242,126 @@ export default class WitnessPlugin extends Plugin {
 
 		this.logger.info(`Link discovery: ${file.path} — ${chunks.length} chunks`);
 
-		// Find candidates via vector search for each chunk
-		type Candidate = {
-			sourceSnippet: string;
-			sourceHeading: string;
-			targetFile: string;
-			targetTitle: string;
-			targetHeading?: string;
-			targetSnippet: string;
-			similarity: number;
+		const MIN_SIMILARITY = 0.65;
+		const MAX_CANDIDATES_PER_CHUNK = 5;
+
+		// Skip chunks that are just sources/footnotes/references
+		const SKIP_HEADINGS = /^(##\s*)?(sources|references|footnotes|bibliography|citations)/i;
+
+		// For each chunk, find candidates and group them
+		type ChunkCandidates = {
+			chunkHeading: string;
+			chunkContent: string;
+			candidates: {
+				targetTitle: string;
+				targetHeading?: string;
+				targetSnippet: string;
+				similarity: number;
+			}[];
 		};
 
-		const candidatesByTarget = new Map<string, Candidate>();
-		const MIN_SIMILARITY = 0.65;
+		const sections: ChunkCandidates[] = [];
+		let candidateNum = 0;
+		// Track targets globally to avoid suggesting the same note in multiple sections
+		const globalSeenTargets = new Set<string>();
 
 		for (const chunk of chunks) {
 			if (chunk.content.trim().length < 20) continue;
 
+			// Skip source/footnote sections
+			if (SKIP_HEADINGS.test(chunk.headingPath)) {
+				this.logger.info(`Link discovery: skipping chunk "${chunk.headingPath}" (sources/references)`);
+				continue;
+			}
+
 			try {
 				const results = await this.search(chunk.content, {
 					mode: 'vector',
-					limit: 8,
+					limit: MAX_CANDIDATES_PER_CHUNK + 10,
 					minScore: MIN_SIMILARITY,
 				});
 
+				// Filter: same file, already seen globally, and source/reference chunks in targets
+				const candidates: ChunkCandidates['candidates'] = [];
+
 				for (const result of results) {
 					if (result.path === file.path) continue;
+					if (globalSeenTargets.has(result.path)) continue;
 
-					const existing = candidatesByTarget.get(result.path);
-					if (!existing || result.score > existing.similarity) {
-						candidatesByTarget.set(result.path, {
-							sourceSnippet: chunk.content.slice(0, 500),
-							sourceHeading: chunk.headingPath || '(preamble)',
-							targetFile: result.path,
-							targetTitle: result.title,
-							targetHeading: result.headingPath?.replace(/^#+\s*/g, '').replace(/ > #+\s*/g, ' > '),
-							targetSnippet: (result.content || result.snippet || '').slice(0, 500),
-							similarity: result.score,
-						});
-					}
+					// Skip target chunks that are just sources/references
+					if (result.headingPath && SKIP_HEADINGS.test(result.headingPath)) continue;
+
+					// Skip targets that are mostly frontmatter (raw Readwise imports etc.)
+					const snippet = (result.content || result.snippet || '');
+					if (snippet.startsWith('---\n')) continue;
+
+					globalSeenTargets.add(result.path);
+
+					candidates.push({
+						targetTitle: result.title,
+						targetHeading: result.headingPath?.replace(/^#+\s*/g, '').replace(/ > #+\s*/g, ' > '),
+						targetSnippet: snippet.slice(0, 500),
+						similarity: result.score,
+					});
+
+					if (candidates.length >= MAX_CANDIDATES_PER_CHUNK) break;
+				}
+
+				if (candidates.length > 0) {
+					candidateNum += candidates.length;
+					sections.push({
+						chunkHeading: chunk.headingPath || '(preamble)',
+						chunkContent: chunk.content,
+						candidates,
+					});
 				}
 			} catch (err) {
 				this.logger.error(`Link discovery: search failed for chunk ${chunk.index}`, err);
 			}
 		}
 
-		const candidates = [...candidatesByTarget.values()]
-			.sort((a, b) => b.similarity - a.similarity)
-			.slice(0, 10);
+		this.logger.info(`Link discovery: ${sections.length} sections with ${candidateNum} total candidates`);
 
-		this.logger.info(`Link discovery: ${candidates.length} candidates after dedup`);
-
-		if (candidates.length === 0) {
+		if (sections.length === 0) {
 			return `No similar documents found for "${file.basename}". Try lowering the similarity threshold or ensuring the index is built.`;
 		}
 
-		// Build the prompt
-		let prompt = `You are a knowledge-linking assistant for a personal knowledge vault. I'm going to show you the source note and several candidate notes that are semantically similar. For each candidate, decide if there's a meaningful connection that deserves a [[wiki-link]] from the source to the candidate.
+		// Build the prompt — strip frontmatter from source chunks
+		const stripFm = (text: string) => text.replace(/^---\n[\s\S]*?\n---\n*/, '');
+
+		let prompt = `You are a knowledge-linking assistant for a personal knowledge vault. I'm going to show you sections from a source note, each followed by candidate notes that are semantically similar to that section. For each candidate, decide if there's a meaningful connection that deserves a [[wiki-link]] from the source section to the candidate.
 
 Rules:
 - Only suggest links where the connection is genuinely useful — not just vaguely related
-- Pick a specific word or short phrase (2-5 words) in the SOURCE text that should become the link anchor
-- The anchor text should read naturally in the original sentence
+- The ANCHOR must be an exact word or phrase (2-5 words) that appears verbatim in the SOURCE SECTION text
+- The anchor text should read naturally as a link in the original sentence
 - If a candidate has no meaningful connection, say NONE for that candidate
 - Most candidates should be NONE — be selective
 
 Source note: "${file.basename}"
 `;
 
-		// Add source content (truncated)
-		const sourceContent = content.replace(/^---\n[\s\S]*?\n---\n*/, '').slice(0, 2000);
-		prompt += `\n--- SOURCE CONTENT ---\n${sourceContent}\n--- END SOURCE ---\n`;
+		let globalIdx = 1;
+		for (const section of sections) {
+			prompt += `\n========================================`;
+			prompt += `\nSOURCE SECTION: ${section.chunkHeading}`;
+			prompt += `\n========================================\n`;
+			prompt += stripFm(section.chunkContent);
+			prompt += `\n\nCandidates for this section:\n`;
 
-		// Add candidates
-		prompt += `\nCandidates:\n`;
-
-		for (let i = 0; i < candidates.length; i++) {
-			const c = candidates[i];
-			const heading = c.targetHeading ? ` > ${c.targetHeading}` : '';
-			prompt += `\n[${i + 1}] "${c.targetTitle}"${heading} (similarity: ${Math.round(c.similarity * 100)}%):\n${c.targetSnippet}\n`;
+			for (const c of section.candidates) {
+				const heading = c.targetHeading ? ` > ${c.targetHeading}` : '';
+				prompt += `\n[${globalIdx}] "${c.targetTitle}"${heading} (${Math.round(c.similarity * 100)}%):\n${c.targetSnippet}\n`;
+				globalIdx++;
+			}
 		}
 
-		prompt += `\nFor each candidate, respond in this format:
+		prompt += `\n========================================\n`;
+		prompt += `\nFor each numbered candidate, respond in this format:
 
-[1] ANCHOR: [word or phrase from the source] → REASON: [one sentence]
+[1] ANCHOR: [exact phrase from the source section] → REASON: [one sentence]
 [2] NONE
-[3] ANCHOR: [word or phrase from the source] → REASON: [one sentence]
+[3] ANCHOR: [exact phrase from the source section] → REASON: [one sentence]
 ...etc`;
 
 		return prompt;

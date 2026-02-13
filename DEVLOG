@@ -2124,4 +2124,73 @@ The metadata cache race condition was satisfying to diagnose. The symptoms (same
 
 ---
 
+## 2026-02-13 - Link Discovery Spike: Prompt Engineering for LLM Validation
+
+**Objective**: Spike the link discovery feature to evaluate whether local LLMs can produce useful link suggestions between vault notes, using a manual prompt-copy approach.
+
+### What We Built
+
+- **Link discovery command** ("Witness: Discover links") — analyses the current file's chunks via vector search and builds a structured prompt for manual LLM evaluation
+- **`LinkDiscoveryPromptModal`** — modal with copy-to-clipboard button showing the generated prompt
+- **`buildLinkDiscoveryPrompt()`** — per-chunk candidate discovery with quality filtering:
+  - Sources/footnotes/references sections filtered out (both as source and target chunks)
+  - Global target deduplication across all sections
+  - Frontmatter stripping from source content and raw-frontmatter targets skipped
+  - Strengthened anchor instructions requiring exact verbatim phrases
+- **Feature spec** at `docs/features/link-discovery-spike.md`
+- **Deployment path** documented in CLAUDE.md for future sessions
+
+### The Journey
+
+Started by reviewing the full link discovery spec (`docs/features/link-discovery.md`) — a two-stage pipeline with vector candidates, LLM validation, review panel, persistence, and automation. Identified key risks: LLM quality with small models, anchor text insertion fragility, scale with thousands of files, bidirectional noise. Agreed with the user to start with a throwaway spike — on-demand only, no persistence, no automation.
+
+**First implementation** was fully automated — chunked the file, ran vector search per chunk, called Ollama for each candidate, displayed results. The user's feedback shifted the approach fundamentally: they wanted to receive one giant prompt they could paste into Ollama themselves, not have the plugin make automatic LLM calls. This was smarter — it let the user iterate on prompt quality and test different models without rebuilding the plugin.
+
+**Second iteration** built the single-prompt approach with a copy modal. But initial testing revealed only one chunk's candidates were showing — fixed the grouping to show candidates per source section.
+
+**Third iteration** came after the user actually tested the prompt with Ollama and shared the full prompt+response for analysis. The LLM output revealed several quality issues:
+- Sources/footnotes sections produced high-similarity but meaningless matches
+- Same target appearing in multiple sections (redundant)
+- LLM confusing which candidate it was responding about
+- Generic single-word anchors instead of specific phrases
+
+Each issue had a clear fix: skip source/footnote chunks, track targets globally, strip frontmatter noise, and strengthen the anchor instruction to require exact verbatim phrases from the source text.
+
+**Final decision**: The user's vault is currently too small and sparse to meaningfully evaluate link discovery quality. Rather than force testing with insufficient data, we bookmarked the feature for when the vault has grown enough to have dense overlapping topics.
+
+### Technical Achievements
+
+- Clean prompt engineering workflow: build prompt → user tests manually → analyse output → refine → repeat
+- Per-section structure with global deduplication prevents noise without losing coverage
+- Regex-based heading filters cleanly skip reference material (`/^(##\s*)?(sources|references|footnotes|bibliography|citations)/i`)
+- Frontmatter detection catches raw Readwise imports that pollute candidate quality
+
+### Key Learnings
+
+- **Manual-first LLM testing is faster than automation**: Letting the user paste into Ollama directly and iterate on the prompt was far more productive than building automated LLM calling infrastructure. The feedback loop is tighter when the human controls both sides.
+- **Prompt quality depends on input quality**: Filtering noise before it reaches the prompt (source sections, frontmatter, duplicate targets) matters more than prompt instructions. The LLM can't be selective if the candidates are all noise.
+- **Know when to bookmark**: A feature that needs a dense vault to evaluate shouldn't be forced on a sparse one. The spike infrastructure is ready; the data will come with time.
+- **Deploy path matters**: Losing time searching for the vault path is friction that compounds over sessions. Documenting it in CLAUDE.md eliminates a recurring annoyance.
+
+### Statistics
+
+- 1 commit on `spike/link-discovery` branch (+ uncommitted improvements)
+- 4 files changed: `src/main.ts`, `src/link-discovery-modal.ts` (new), `CLAUDE.md`, `TODO.md`
+- ~170 lines of new code for link discovery (prompt builder + modal + command)
+- Feature spec: `docs/features/link-discovery-spike.md` (127 lines)
+
+### Next Steps
+
+- Link discovery returns when the vault has grown (bookmarked in TODO.md backlog)
+- Monitor Ollama for native rerank endpoint support
+- Explore other features that benefit from the current vault size
+
+### Reflections
+
+This was a session about knowing when to stop. The link discovery spike was well-designed and the infrastructure works, but evaluating LLM quality for knowledge linking requires a sufficiently rich corpus. Pushing forward would have produced misleading results — either false confidence from a few lucky matches, or false discouragement from a vault that simply doesn't have enough overlapping content yet.
+
+The prompt engineering approach — user copies the prompt, tests manually, shares results for analysis — was the right call. It kept the feedback loop fast and the investment low. When the vault is ready, the spike branch and spec are waiting.
+
+---
+
 *End of log entry*

@@ -3,7 +3,11 @@
 ## High Priority
 
 ## Next Up
+
+## Backlog
 - [ ] [Link discovery](docs/features/link-discovery.md) — Discover connections between notes using embeddings + local LLM, Grammarly-style review panel
+  - [Spike branch](../../tree/spike/link-discovery) exists with prompt-only mode for manual LLM testing
+  - Needs a larger, denser vault to meaningfully evaluate LLM quality
 
 ## Completed
 

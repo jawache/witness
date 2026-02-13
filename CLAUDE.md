@@ -6,6 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Witness is an Obsidian plugin that acts as an AI companion for managing a personal knowledge vault based on the **Chaos → Order** philosophy. The plugin itself IS an MCP (Model Context Protocol) server running inside Obsidian, enabling AI assistants to interact with the vault through file operations.
 
+## Deployment
+
+**Main vault path:** `/Users/jawache/Documents/Obsidian/main/`
+**Plugin deploy target:** `/Users/jawache/Documents/Obsidian/main/.obsidian/plugins/witness/`
+
+After `npm run build`, copy built files to the main vault:
+```bash
+cp main.js manifest.json styles.css /Users/jawache/Documents/Obsidian/main/.obsidian/plugins/witness/
+```
+
 ## Core Architecture
 
 **Key Technical Decision:** The plugin runs an HTTP/WebSocket server inside Obsidian's Electron process and implements the MCP protocol directly. This is different from existing Obsidian MCP servers which run as external Node.js processes and connect via the Local REST API plugin.
