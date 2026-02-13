@@ -292,6 +292,27 @@ Total: 16 MCP tools registered and available
 
 **Graceful Degradation:** JSON parse → regex fallback (`\[?(\d+)\]?\s*[:\-=]\s*(\d+)`) → original ordering. If the LLM call fails entirely, results are returned in their stage 1 order.
 
+### Contextual Search
+
+- ✅ Toggle on search panel that auto-searches based on editor context
+- ✅ Three event sources: `active-leaf-change` (500ms), `editor-change` (1500ms), `document.selectionchange` (800ms)
+- ✅ Context extraction: selection priority (>= 2 chars), then paragraph around cursor
+- ✅ Frontmatter excluded via `findBodyStart()` boundary
+- ✅ Hash deduplication (DJB2) prevents redundant embedding calls
+- ✅ Forces vector-only mode, disables mode selector and rerank
+- ✅ Current file filtered from results
+- ✅ Command palette: `Toggle contextual search`
+- ✅ Clicks outside editor keep existing results (no clearing)
+- ✅ Page Preview integration: Cmd+hover on search result cards triggers Obsidian's built-in Page Preview
+
+**Architecture:** Contextual mode is a state toggle on `WitnessSearchView`. When enabled, it registers workspace and DOM event listeners that feed into `scheduleContextualSearch()` with per-source debounce timings. `extractContext()` reads from the active `MarkdownView` editor — selection first, then paragraph around cursor. The extracted text is hashed and compared to `lastContextHash` to skip redundant searches. Results are filtered to exclude the file being viewed.
+
+**Page Preview:** Uses `app.workspace.trigger('hover-link', { event, source, hoverParent, targetEl, linktext, sourcePath })` to invoke Obsidian's Page Preview core plugin. Two listeners needed: `mouseover` for entering while holding Cmd, and a document-level `keydown` (registered on `mouseenter`, cleaned up on `mouseleave`) for pressing Cmd while already hovering.
+
+**Key gotcha — `selectionchange`:** Obsidian's `editor-change` only fires on text edits, not cursor movement or text selection. The DOM-level `selectionchange` event is needed to detect clicks, arrow keys, and drag-select. But it fires on *any* click (including in the search panel), so `extractContext()` must gracefully handle the case where no `MarkdownView` is active — return null and keep existing results.
+
+**Key gotcha — metadata cache race:** `processFrontMatter` writes to the file but `metadataCache.getFileCache()` updates asynchronously. In `mark_triage`, we wait for `metadataCache.on('changed')` before returning, so an immediate `get_next_chaos` call sees fresh frontmatter.
+
 ### Configurable Idle Threshold
 
 The idle detection threshold for background indexing is configurable in Settings → Search → Indexing Filters. Default is 2 minutes. The hardcoded `static readonly IDLE_THRESHOLD_MS` was replaced with a settings-backed getter: `get IDLE_THRESHOLD_MS() { return (this.settings.idleThresholdMinutes ?? 2) * 60_000; }`.

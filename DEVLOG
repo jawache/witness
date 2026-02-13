@@ -2045,3 +2045,83 @@ The quality discussion was also important. Being honest about the limitations of
 ---
 
 *End of log entry*
+
+## 2026-02-13 - Contextual Search & Page Preview
+
+**Objective**: Build a passive contextual search mode for the search panel — a sidebar that automatically shows related vault content based on what the user is currently looking at, typing, or selecting.
+
+### What We Built
+
+- Contextual search toggle on the search panel (checkbox + command palette)
+- Page Preview integration on search result cards (Cmd+hover)
+- Fixed chaos triage metadata cache race condition
+- Merged `feature/reranking` into `main` and created clean `feature/contextual-search` branch
+
+### The Journey
+
+The session started with some branch housekeeping. The re-ranking feature was fully committed on `feature/reranking` but never merged to `main`. We merged it (fast-forward), pushed, then created `feature/contextual-search` as a clean branch.
+
+**Contextual search** was the main build. The idea: toggle a mode where instead of typing queries, the search panel watches your editor — cursor position, text selection, file navigation — and automatically shows semantically related notes. It forces vector-only mode (semantic similarity, not keyword matching) since the input is a paragraph, not a search query.
+
+The implementation listens to three event sources: `active-leaf-change` (file navigation, 500ms debounce), `editor-change` (typing, 1500ms debounce), and `document.selectionchange` (cursor moves and text selection, 800ms debounce). Each feeds into a debounced `executeContextualSearch()` that extracts context, hashes it to avoid redundant embeddings, and runs a vector search with the current file filtered out.
+
+**Context extraction** follows a priority chain: if the user has selected text (>= 2 chars), use that. Otherwise, find the paragraph around the cursor — walk backward and forward from the cursor line to find contiguous non-blank lines. Frontmatter is always excluded: `findBodyStart()` locates the first content line after YAML frontmatter, and the paragraph walk never crosses above that boundary.
+
+**Bug fixing was iterative.** The user tested and reported issues in waves:
+
+1. **Selection/click not triggering search**: Only `editor-change` and `active-leaf-change` were registered initially. Neither fires on cursor moves or text selection. Fixed by adding `document.selectionchange` listener.
+
+2. **Frontmatter contamination**: The extracted context was including YAML frontmatter. Refactored to use `findBodyStart()` as a floor for paragraph extraction.
+
+3. **Headings not working**: The original 20-character minimum content threshold filtered out short headings like `## Overview` (12 chars). The 10-character selection threshold also rejected short selections like acronyms. User rightfully questioned why these limits existed — dropped both to 2 characters.
+
+4. **Clicking in search panel cleared results**: The `selectionchange` event fires on *any* click, including in the search panel. When focus left the editor, `getActiveViewOfType(MarkdownView)` returned null, triggering `showEmpty()`. Fixed by ignoring clicks within the panel container, then generalised: if `extractContext()` returns null, just keep existing results instead of clearing them.
+
+5. **Tooltip attempt (abandoned)**: Tried to add a hover tooltip on the search input showing the full context text. Native `title` attribute didn't work in Electron. Custom tooltip with `position: absolute` got clipped by the sidebar's overflow. Switched to `position: fixed` on `document.body` — still didn't render properly. User said to drop it.
+
+**The chaos triage bug** was a nice detective story. The user reported that `mark_triage` with action `acknowledged` wasn't sticking — `get_next_chaos` kept returning the same article. The string values matched perfectly (`'acknowledged'` in both tools), and inspecting the actual file showed `triage: acknowledged` was correctly written. The bug was a **metadata cache race condition**: `processFrontMatter` writes the file, but `metadataCache.getFileCache()` updates asynchronously. An immediate `get_next_chaos` call reads stale cache. Fixed by waiting for the `metadataCache.on('changed')` event after writing, with a 2-second timeout safety net.
+
+**Page Preview** was the final feature — integrating Obsidian's built-in Page Preview core plugin into search result cards. Cmd+hover triggers `workspace.trigger('hover-link', ...)` which the Page Preview plugin picks up and shows a popup. The first implementation only worked when Cmd was held *before* hovering. Fixed by adding a document-level `keydown` listener that's registered on `mouseenter` and cleaned up on `mouseleave`, so pressing Cmd while already hovering also triggers the preview.
+
+### Technical Achievements
+
+- ~330 lines of new code across 3 files with clean builds throughout
+- Three separate event sources (workspace events + DOM events) coordinated with per-source debounce timings
+- Hash-based deduplication prevents redundant embedding calls when context hasn't changed
+- Page Preview integration using Obsidian's internal `hover-link` event — works with both whole-file and chunk (heading-level) results
+- Metadata cache race condition identified and fixed with event-driven synchronisation
+
+### Key Learnings
+
+- **`pointer-events: none` blocks all mouse events**: Including hover. If you need hover on a visually disabled element, put the listener on a wrapper instead.
+- **`selectionchange` is the DOM event for cursor moves**: Obsidian's `editor-change` only fires on text edits, not cursor movement or text selection. The DOM-level `selectionchange` catches everything.
+- **Metadata cache is eventually consistent**: `processFrontMatter` writes to the file, but `metadataCache.getFileCache()` updates asynchronously. For write-then-read patterns, wait for the `changed` event.
+- **Obsidian's `hover-link` event**: Trigger `app.workspace.trigger('hover-link', { event, source, hoverParent, targetEl, linktext, sourcePath })` to invoke the Page Preview core plugin. Works from any view.
+- **`mouseover` vs pressing a modifier key**: `mouseover` only fires on cursor entry, not on key presses. For Cmd+hover, you need both a `mouseover` listener (for entering while holding Cmd) and a `keydown` listener (for pressing Cmd while already hovering).
+- **Tooltips in Electron are unreliable**: Native `title` attributes may not show. Custom tooltips need `position: fixed` to escape sidebar overflow, but even that can have rendering issues in Obsidian's Electron environment.
+- **Keep content thresholds low**: Arbitrary minimums (10 chars for selection, 20 chars for paragraph) felt reasonable but broke real use cases — headings, acronyms, short selections. Users know what they're searching for; let them.
+
+### Statistics
+
+- 2 commits on `feature/contextual-search` branch (after this wrap-up)
+- 3 files changed: `src/search-view.ts` (+309), `src/main.ts` (+37), `styles.css` (+25)
+- 1 branch merged: `feature/reranking` → `main`
+- All 37 unit tests passing
+
+### Next Steps
+
+- Consider adding contextual search as a setting (default on/off)
+- Link discovery feature (the more ambitious version of contextual search from `docs/features/link-discovery.md`)
+- Monitor Ollama for native rerank endpoint support
+
+### Reflections
+
+This session was a study in iterative UX refinement. The core contextual search was straightforward — the complexity was in all the edge cases that emerge when real users interact with real interfaces. Headings are short. Clicks happen everywhere. Selections come in all sizes. Each bug report from the user was a lesson about assumptions baked into the code.
+
+The tooltip detour was a good reminder that sometimes the simplest-sounding feature (show text on hover) can be surprisingly difficult in constrained environments. Knowing when to drop a feature and move on is as important as knowing how to build one.
+
+The metadata cache race condition was satisfying to diagnose. The symptoms (same article returning repeatedly) pointed to a string mismatch, but the actual bug was a timing issue invisible at the code level. The fix — waiting for the cache event — is the kind of thing that only emerges from understanding the platform's async model.
+
+---
+
+*End of log entry*

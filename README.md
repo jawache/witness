@@ -31,6 +31,8 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Chaos Triage**: AI-assisted processing of unread chaos items with queue management and safe frontmatter updates
 - **LLM Re-ranking**: Optional two-stage search — fast hybrid results shown instantly, then re-ranked by a local LLM for higher precision
+- **Contextual Search**: Toggle a mode where the search panel automatically shows related notes based on your cursor position, selection, or current paragraph — no typing needed
+- **Page Preview**: Cmd+hover on any search result to preview the note without leaving the panel
 - **Privacy First**: Everything runs locally, your tunnel, your data
 
 **16 MCP Tools Available**:

@@ -503,6 +503,46 @@ export class WitnessSearchView extends ItemView {
 				});
 			}
 
+			// Cmd+hover: trigger Page Preview popup
+			const triggerPreview = (event: MouseEvent | KeyboardEvent) => {
+				let linktext = result.path;
+				if (isChunk) {
+					const parts = result.headingPath!.split(' > ');
+					const last = parts[parts.length - 1].replace(/^#+\s*/, '');
+					linktext = `${result.path}#${last}`;
+				}
+				this.app.workspace.trigger('hover-link', {
+					event,
+					source: VIEW_TYPE_SEARCH,
+					hoverParent: this,
+					targetEl: item,
+					linktext,
+					sourcePath: '',
+				});
+			};
+
+			item.addEventListener('mouseover', (event: MouseEvent) => {
+				if (!event.metaKey && !event.ctrlKey) return;
+				triggerPreview(event);
+			});
+
+			// Also trigger when Cmd is pressed while already hovering
+			let keyHandler: ((e: KeyboardEvent) => void) | null = null;
+			item.addEventListener('mouseenter', () => {
+				keyHandler = (e: KeyboardEvent) => {
+					if (e.key === 'Meta' || e.key === 'Control') {
+						triggerPreview(e);
+					}
+				};
+				document.addEventListener('keydown', keyHandler);
+			});
+			item.addEventListener('mouseleave', () => {
+				if (keyHandler) {
+					document.removeEventListener('keydown', keyHandler);
+					keyHandler = null;
+				}
+			});
+
 			// Click: chunk → navigate to heading, whole doc → just open file
 			item.addEventListener('click', () => {
 				if (isChunk) {
