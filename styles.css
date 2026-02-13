@@ -295,3 +295,25 @@
 	color: var(--text-faint);
 	font-size: var(--font-ui-small);
 }
+
+/* ===== Link Discovery Modal ===== */
+
+.witness-link-discovery-modal {
+	max-width: 800px;
+}
+
+.witness-ld-copy-btn {
+	margin-bottom: 12px;
+}
+
+.witness-ld-prompt {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	padding: 12px;
+	max-height: 500px;
+	overflow-y: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-size: var(--font-ui-smaller);
+}

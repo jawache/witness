@@ -375,6 +375,43 @@ export default class WitnessPlugin extends Plugin {
 			},
 		});
 
+		// Add link discovery spike command
+		this.addCommand({
+			id: 'discover-links',
+			name: 'Discover links',
+			callback: async () => {
+				const activeFile = this.app.workspace.getActiveFile();
+				if (!activeFile) {
+					new Notice('No active file');
+					return;
+				}
+
+				try {
+					await this.ensureSearchEngine();
+				} catch {
+					new Notice('Search engine not available. Check Ollama is running.');
+					return;
+				}
+
+				if (!this.vectorStore || this.vectorStore.getCount() === 0) {
+					new Notice('No documents indexed. Build the index first.');
+					return;
+				}
+
+				new Notice(`Finding candidates for "${activeFile.basename}"...`);
+
+				try {
+					const prompt = await this.buildLinkDiscoveryPrompt(activeFile);
+
+					const { LinkDiscoveryPromptModal } = await import('./link-discovery-modal');
+					new LinkDiscoveryPromptModal(this.app, activeFile.basename, prompt).open();
+				} catch (err) {
+					this.logger.error('Link discovery failed', err);
+					new Notice(`Link discovery failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+				}
+			},
+		});
+
 		// Add reindex vault command
 		this.addCommand({
 			id: 'reindex-vault',
@@ -2190,6 +2227,110 @@ export default class WitnessPlugin extends Plugin {
 			.filter(w => !WitnessPlugin.STOP_WORDS.has(w.toLowerCase()))
 			.join(' ')
 			.trim();
+	}
+
+	/**
+	 * Build a single LLM prompt for link discovery.
+	 * Finds vector-similar chunks from other files, then assembles
+	 * a prompt the user can paste into Ollama to evaluate.
+	 */
+	private async buildLinkDiscoveryPrompt(file: TFile): Promise<string> {
+		const { chunkMarkdown } = await import('./chunker');
+
+		const content = await this.app.vault.read(file);
+		const chunks = chunkMarkdown(content);
+
+		this.logger.info(`Link discovery: ${file.path} — ${chunks.length} chunks`);
+
+		// Find candidates via vector search for each chunk
+		type Candidate = {
+			sourceSnippet: string;
+			sourceHeading: string;
+			targetFile: string;
+			targetTitle: string;
+			targetHeading?: string;
+			targetSnippet: string;
+			similarity: number;
+		};
+
+		const candidatesByTarget = new Map<string, Candidate>();
+		const MIN_SIMILARITY = 0.65;
+
+		for (const chunk of chunks) {
+			if (chunk.content.trim().length < 20) continue;
+
+			try {
+				const results = await this.search(chunk.content, {
+					mode: 'vector',
+					limit: 8,
+					minScore: MIN_SIMILARITY,
+				});
+
+				for (const result of results) {
+					if (result.path === file.path) continue;
+
+					const existing = candidatesByTarget.get(result.path);
+					if (!existing || result.score > existing.similarity) {
+						candidatesByTarget.set(result.path, {
+							sourceSnippet: chunk.content.slice(0, 500),
+							sourceHeading: chunk.headingPath || '(preamble)',
+							targetFile: result.path,
+							targetTitle: result.title,
+							targetHeading: result.headingPath?.replace(/^#+\s*/g, '').replace(/ > #+\s*/g, ' > '),
+							targetSnippet: (result.content || result.snippet || '').slice(0, 500),
+							similarity: result.score,
+						});
+					}
+				}
+			} catch (err) {
+				this.logger.error(`Link discovery: search failed for chunk ${chunk.index}`, err);
+			}
+		}
+
+		const candidates = [...candidatesByTarget.values()]
+			.sort((a, b) => b.similarity - a.similarity)
+			.slice(0, 10);
+
+		this.logger.info(`Link discovery: ${candidates.length} candidates after dedup`);
+
+		if (candidates.length === 0) {
+			return `No similar documents found for "${file.basename}". Try lowering the similarity threshold or ensuring the index is built.`;
+		}
+
+		// Build the prompt
+		let prompt = `You are a knowledge-linking assistant for a personal knowledge vault. I'm going to show you the source note and several candidate notes that are semantically similar. For each candidate, decide if there's a meaningful connection that deserves a [[wiki-link]] from the source to the candidate.
+
+Rules:
+- Only suggest links where the connection is genuinely useful — not just vaguely related
+- Pick a specific word or short phrase (2-5 words) in the SOURCE text that should become the link anchor
+- The anchor text should read naturally in the original sentence
+- If a candidate has no meaningful connection, say NONE for that candidate
+- Most candidates should be NONE — be selective
+
+Source note: "${file.basename}"
+`;
+
+		// Add source content (truncated)
+		const sourceContent = content.replace(/^---\n[\s\S]*?\n---\n*/, '').slice(0, 2000);
+		prompt += `\n--- SOURCE CONTENT ---\n${sourceContent}\n--- END SOURCE ---\n`;
+
+		// Add candidates
+		prompt += `\nCandidates:\n`;
+
+		for (let i = 0; i < candidates.length; i++) {
+			const c = candidates[i];
+			const heading = c.targetHeading ? ` > ${c.targetHeading}` : '';
+			prompt += `\n[${i + 1}] "${c.targetTitle}"${heading} (similarity: ${Math.round(c.similarity * 100)}%):\n${c.targetSnippet}\n`;
+		}
+
+		prompt += `\nFor each candidate, respond in this format:
+
+[1] ANCHOR: [word or phrase from the source] → REASON: [one sentence]
+[2] NONE
+[3] ANCHOR: [word or phrase from the source] → REASON: [one sentence]
+...etc`;
+
+		return prompt;
 	}
 
 	/**
