@@ -215,6 +215,31 @@
 	opacity: 1;
 }
 
+/* ===== Contextual Mode Toggle ===== */
+
+.witness-contextual-toggle {
+	margin-bottom: 8px;
+}
+
+.witness-contextual-label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	cursor: pointer;
+}
+
+.witness-contextual-label input[type="checkbox"] {
+	margin: 0;
+}
+
+.witness-search-input.is-contextual {
+	opacity: 0.6;
+	pointer-events: none;
+	font-style: italic;
+}
+
 /* ===== Re-rank Toggle ===== */
 
 .witness-rerank-toggle {

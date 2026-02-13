@@ -4,8 +4,8 @@
  * Includes path and tag filtering with autocomplete.
  */
 
-import { ItemView, WorkspaceLeaf, AbstractInputSuggest, prepareFuzzySearch, renderResults, getAllTags } from 'obsidian';
-import type { SearchResult as ObsidianSearchResult } from 'obsidian';
+import { ItemView, WorkspaceLeaf, AbstractInputSuggest, prepareFuzzySearch, renderResults, getAllTags, MarkdownView } from 'obsidian';
+import type { SearchResult as ObsidianSearchResult, EventRef } from 'obsidian';
 import type WitnessPlugin from './main';
 import type { SearchResult } from './search-engine';
 
@@ -160,6 +160,16 @@ export class WitnessSearchView extends ItemView {
 	private rerankToggleContainer: HTMLElement;
 	private searchSeq = 0;
 	private dotsInterval: number | null = null;
+	private contextualMode = false;
+	private contextualTimer: number | null = null;
+	private lastContextHash: string | null = null;
+	private contextualEventRefs: EventRef[] = [];
+	private contextualToggleContainer: HTMLElement;
+	private modeSelectEl: HTMLSelectElement;
+	private contextualSelectionHandler: (() => void) | null = null;
+	private readonly CONTEXTUAL_DEBOUNCE_EDIT = 1500;
+	private readonly CONTEXTUAL_DEBOUNCE_NAV = 500;
+	private readonly CONTEXTUAL_DEBOUNCE_CURSOR = 800;
 
 	constructor(leaf: WorkspaceLeaf, plugin: WitnessPlugin) {
 		super(leaf);
@@ -188,11 +198,13 @@ export class WitnessSearchView extends ItemView {
 
 	async onClose(): Promise<void> {
 		this.stopDotsAnimation();
+		this.stopContextualListening();
 	}
 
 	private buildUI(container: HTMLElement): void {
 		this.buildSearchInput(container);
 		this.buildModeSelector(container);
+		this.buildContextualToggle(container);
 		this.buildRerankToggle(container);
 		this.buildFilters(container);
 		this.resultsContainer = container.createDiv({ cls: 'witness-search-results' });
@@ -228,9 +240,10 @@ export class WitnessSearchView extends ItemView {
 	}
 
 	private buildModeSelector(container: HTMLElement): void {
-		const select = container.createEl('select', {
+		this.modeSelectEl = container.createEl('select', {
 			cls: 'witness-search-mode',
 		});
+		const select = this.modeSelectEl;
 
 		const modes = [
 			{ value: 'hybrid', label: 'Hybrid (keyword + semantic)' },
@@ -519,6 +532,253 @@ export class WitnessSearchView extends ItemView {
 		}
 	}
 
+	// ===== Contextual Mode =====
+
+	private buildContextualToggle(container: HTMLElement): void {
+		this.contextualToggleContainer = container.createDiv({ cls: 'witness-contextual-toggle' });
+
+		const label = this.contextualToggleContainer.createEl('label', { cls: 'witness-contextual-label' });
+		const checkbox = label.createEl('input', { type: 'checkbox' });
+		label.createSpan({ text: 'Contextual (auto-search)' });
+
+		checkbox.addEventListener('change', () => {
+			this.contextualMode = checkbox.checked;
+			this.onContextualModeChanged();
+		});
+	}
+
+	toggleContextualMode(): void {
+		this.contextualMode = !this.contextualMode;
+		// Sync the checkbox if it exists
+		const checkbox = this.contextualToggleContainer?.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+		if (checkbox) checkbox.checked = this.contextualMode;
+		this.onContextualModeChanged();
+	}
+
+	private onContextualModeChanged(): void {
+		if (this.contextualMode) {
+			// Dim the search input
+			this.inputEl.addClass('is-contextual');
+			this.inputEl.readOnly = true;
+			// Hide rerank toggle (not compatible)
+			this.rerankToggleContainer.style.display = 'none';
+			this.rerankEnabled = false;
+			// Force vector mode and disable selector
+			this.modeSelectEl.value = 'vector';
+			this.currentMode = 'vector';
+			this.modeSelectEl.disabled = true;
+			// Start listening
+			this.startContextualListening();
+			// Fire immediately for current editor state
+			this.scheduleContextualSearch(100);
+		} else {
+			// Restore the search input
+			this.inputEl.removeClass('is-contextual');
+			this.inputEl.readOnly = false;
+			this.inputEl.value = '';
+			this.inputEl.placeholder = 'Search vault...';
+			// Restore mode selector
+			this.modeSelectEl.disabled = false;
+			// Re-show rerank toggle if configured
+			this.updateRerankVisibility();
+			// Stop listening
+			this.stopContextualListening();
+			this.showEmpty();
+		}
+	}
+
+	private startContextualListening(): void {
+		this.contextualEventRefs.push(
+			this.app.workspace.on('active-leaf-change', () => {
+				this.scheduleContextualSearch(this.CONTEXTUAL_DEBOUNCE_NAV);
+			})
+		);
+
+		this.contextualEventRefs.push(
+			this.app.workspace.on('editor-change', () => {
+				this.scheduleContextualSearch(this.CONTEXTUAL_DEBOUNCE_EDIT);
+			})
+		);
+
+		// Detect cursor moves and text selection changes (clicks, keyboard nav, drag-select)
+		this.contextualSelectionHandler = () => {
+			// Ignore clicks within the search panel itself
+			const activeEl = document.activeElement;
+			if (activeEl && this.containerEl.contains(activeEl)) return;
+			this.scheduleContextualSearch(this.CONTEXTUAL_DEBOUNCE_CURSOR);
+		};
+		document.addEventListener('selectionchange', this.contextualSelectionHandler);
+	}
+
+	private stopContextualListening(): void {
+		for (const ref of this.contextualEventRefs) {
+			this.app.workspace.offref(ref);
+		}
+		this.contextualEventRefs = [];
+		if (this.contextualSelectionHandler) {
+			document.removeEventListener('selectionchange', this.contextualSelectionHandler);
+			this.contextualSelectionHandler = null;
+		}
+		if (this.contextualTimer !== null) {
+			window.clearTimeout(this.contextualTimer);
+			this.contextualTimer = null;
+		}
+		this.lastContextHash = null;
+	}
+
+	private scheduleContextualSearch(debounceMs: number): void {
+		if (this.contextualTimer !== null) {
+			window.clearTimeout(this.contextualTimer);
+		}
+		this.contextualTimer = window.setTimeout(() => {
+			this.contextualTimer = null;
+			this.executeContextualSearch();
+		}, debounceMs);
+	}
+
+	private async executeContextualSearch(): Promise<void> {
+		if (!this.contextualMode) return;
+
+		const context = this.extractContext();
+		if (!context) {
+			// No editor context (clicked outside an editor) — keep existing results
+			return;
+		}
+
+		// Skip if context hasn't changed
+		const hash = this.simpleHash(context.text);
+		if (hash === this.lastContextHash) return;
+		this.lastContextHash = hash;
+
+		// Show preview of what we're searching for
+		const preview = context.text.slice(0, 80).replace(/\n/g, ' ');
+		this.inputEl.value = preview + (context.text.length > 80 ? '...' : '');
+
+		const seq = ++this.searchSeq;
+
+		try {
+			await this.plugin.ensureSearchEngine();
+		} catch {
+			this.showError('Could not initialise search engine. Check that Ollama is running.');
+			return;
+		}
+
+		if (this.plugin.vectorStore!.getCount() === 0) {
+			this.showError('No documents indexed. Build the index in Settings \u2192 Witness \u2192 Semantic Search.');
+			return;
+		}
+
+		if (this.plugin.ollamaProvider) {
+			const available = await this.plugin.ollamaProvider.isAvailable();
+			if (!available) {
+				this.showError('Ollama is not available. Start Ollama to use contextual search.');
+				return;
+			}
+		}
+
+		this.showLoading();
+		const startTime = performance.now();
+
+		try {
+			const results = await this.plugin.search(context.text, {
+				mode: 'vector',
+				limit: 10,
+				paths: this.selectedPaths.length > 0 ? this.selectedPaths : undefined,
+				tags: this.selectedTags.length > 0 ? this.selectedTags : undefined,
+				rerank: false,
+			});
+
+			if (seq !== this.searchSeq) return;
+
+			// Filter out the current file
+			const filtered = results.filter(r => r.path !== context.filePath);
+			const elapsed = Math.round(performance.now() - startTime);
+			this.renderResults(filtered, elapsed);
+		} catch (err) {
+			if (seq !== this.searchSeq) return;
+			this.showError(err instanceof Error ? err.message : 'Contextual search failed');
+		}
+	}
+
+	private extractContext(): { text: string; filePath: string } | null {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view?.file) return null;
+
+		const editor = view.editor;
+		const filePath = view.file.path;
+
+		// Find the body start (after frontmatter)
+		const bodyStart = this.findBodyStart(editor);
+
+		// Priority 1: selection (strip any frontmatter from selection)
+		const selection = editor.getSelection();
+		if (selection && selection.trim().length >= 2) {
+			const cleaned = this.stripFrontmatter(selection.trim());
+			if (cleaned.length >= 2) {
+				return { text: cleaned.slice(0, 500), filePath };
+			}
+		}
+
+		// Priority 2: paragraph around cursor
+		const cursor = editor.getCursor();
+		const lineCount = editor.lineCount();
+
+		// If cursor is in frontmatter, use the first body paragraph instead
+		let start = cursor.line < bodyStart ? bodyStart : cursor.line;
+
+		// Walk backward to find paragraph start (but never above bodyStart)
+		let paraStart = start;
+		while (paraStart > bodyStart && editor.getLine(paraStart - 1).trim() !== '') {
+			paraStart--;
+		}
+
+		// Walk forward to find paragraph end
+		let paraEnd = start;
+		while (paraEnd < lineCount - 1 && editor.getLine(paraEnd + 1).trim() !== '') {
+			paraEnd++;
+		}
+
+		const lines: string[] = [];
+		for (let i = paraStart; i <= paraEnd; i++) {
+			lines.push(editor.getLine(i));
+		}
+		const text = lines.join('\n').trim();
+
+		if (text.length < 2) return null;
+
+		return { text: text.slice(0, 500), filePath };
+	}
+
+	private findBodyStart(editor: import('obsidian').Editor): number {
+		if (editor.getLine(0).trim() !== '---') return 0;
+		for (let i = 1; i < editor.lineCount(); i++) {
+			if (editor.getLine(i).trim() === '---') {
+				// Skip blank lines after frontmatter
+				let start = i + 1;
+				while (start < editor.lineCount() && editor.getLine(start).trim() === '') {
+					start++;
+				}
+				return start;
+			}
+		}
+		return 0; // No closing ---, treat whole file as body
+	}
+
+	private stripFrontmatter(text: string): string {
+		return text.replace(/^---\n[\s\S]*?\n---\n*/, '');
+	}
+
+	private simpleHash(text: string): string {
+		let hash = 5381;
+		for (let i = 0; i < text.length; i++) {
+			hash = ((hash << 5) + hash) + text.charCodeAt(i);
+			hash = hash & hash;
+		}
+		return hash.toString(36);
+	}
+
+	// ===== Display Helpers =====
+
 	private showLoading(): void {
 		this.resultsContainer.empty();
 		this.resultsContainer.createEl('div', {
@@ -535,10 +795,12 @@ export class WitnessSearchView extends ItemView {
 		});
 	}
 
-	private showEmpty(): void {
+	private showEmpty(message?: string): void {
 		this.resultsContainer.empty();
 		this.resultsContainer.createEl('div', {
-			text: 'Type a query to search your vault',
+			text: message ?? (this.contextualMode
+				? 'Navigate to a file to see related content'
+				: 'Type a query to search your vault'),
 			cls: 'witness-search-empty',
 		});
 	}

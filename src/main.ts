@@ -354,6 +354,27 @@ export default class WitnessPlugin extends Plugin {
 			},
 		});
 
+		// Add command to toggle contextual search mode
+		this.addCommand({
+			id: 'toggle-contextual-search',
+			name: 'Toggle contextual search',
+			callback: async () => {
+				let leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SEARCH);
+				if (leaves.length === 0) {
+					const leaf = this.app.workspace.getRightLeaf(false);
+					if (leaf) {
+						await leaf.setViewState({ type: VIEW_TYPE_SEARCH, active: true });
+						this.app.workspace.revealLeaf(leaf);
+					}
+					leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SEARCH);
+				}
+				if (leaves.length > 0) {
+					const view = leaves[0].view as WitnessSearchView;
+					view.toggleContextualMode();
+				}
+			},
+		});
+
 		// Add reindex vault command
 		this.addCommand({
 			id: 'reindex-vault',
@@ -2001,6 +2022,22 @@ export default class WitnessPlugin extends Plugin {
 				// Use Obsidian's processFrontMatter for safe frontmatter updates
 				await this.app.fileManager.processFrontMatter(file, (fm) => {
 					fm.triage = triageValue;
+				});
+
+				// Wait for metadata cache to reflect the change — without this,
+				// an immediate get_next_chaos call may read stale frontmatter
+				await new Promise<void>((resolve) => {
+					const ref = this.app.metadataCache.on('changed', (changedFile) => {
+						if (changedFile.path === file.path) {
+							this.app.metadataCache.offref(ref);
+							resolve();
+						}
+					});
+					// Timeout after 2s to avoid hanging if the event never fires
+					setTimeout(() => {
+						this.app.metadataCache.offref(ref);
+						resolve();
+					}, 2000);
 				});
 
 				this.logger.mcp(`mark_triage: set triage=${triageValue} on ${filePath}`);
