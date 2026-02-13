@@ -1907,6 +1907,11 @@ export default class WitnessPlugin extends Plugin {
 					const fm = cache?.frontmatter;
 					const triageValue = fm?.triage;
 
+					// Debug: log triage values to diagnose cache issues
+					if (triageValue !== undefined && triageValue !== null && triageValue !== '') {
+						this.logger.debug(`get_next_chaos: ${file.path} triage=${JSON.stringify(triageValue)} (type=${typeof triageValue})`);
+					}
+
 					if (triageValue === undefined || triageValue === null || triageValue === '') {
 						// No triage field — untriaged
 						const dateStr = fm?.created || fm?.date || null;
@@ -2019,28 +2024,43 @@ export default class WitnessPlugin extends Plugin {
 					triageValue = 'acknowledged';
 				}
 
-				// Use Obsidian's processFrontMatter for safe frontmatter updates
-				await this.app.fileManager.processFrontMatter(file, (fm) => {
-					fm.triage = triageValue;
-				});
-
-				// Wait for metadata cache to reflect the change — without this,
-				// an immediate get_next_chaos call may read stale frontmatter
-				await new Promise<void>((resolve) => {
+				// Register the cache listener BEFORE writing — if we register after,
+				// the changed event may fire during processFrontMatter and we miss it
+				const cacheUpdated = new Promise<void>((resolve) => {
 					const ref = this.app.metadataCache.on('changed', (changedFile) => {
 						if (changedFile.path === file.path) {
 							this.app.metadataCache.offref(ref);
 							resolve();
 						}
 					});
-					// Timeout after 2s to avoid hanging if the event never fires
 					setTimeout(() => {
 						this.app.metadataCache.offref(ref);
 						resolve();
-					}, 2000);
+					}, 3000);
 				});
 
-				this.logger.mcp(`mark_triage: set triage=${triageValue} on ${filePath}`);
+				// Use Obsidian's processFrontMatter for safe frontmatter updates
+				this.logger.mcp(`mark_triage: about to call processFrontMatter on ${filePath} with triage=${triageValue}`);
+				await this.app.fileManager.processFrontMatter(file, (fm) => {
+					this.logger.mcp(`mark_triage: inside callback, fm.triage BEFORE=${JSON.stringify(fm.triage)}, setting to ${triageValue}`);
+					fm.triage = triageValue;
+					this.logger.mcp(`mark_triage: inside callback, fm.triage AFTER=${JSON.stringify(fm.triage)}`);
+				});
+
+				// Wait for metadata cache to reflect the change
+				await cacheUpdated;
+
+				// Verify: read the raw file to confirm the write happened
+				const rawContent = await this.app.vault.read(file);
+				const fmMatch = rawContent.match(/^---\n([\s\S]*?)\n---/);
+				const rawFrontmatter = fmMatch ? fmMatch[1] : '(no frontmatter found)';
+				const triageLine = rawFrontmatter.split('\n').find((l: string) => l.startsWith('triage:')) || '(no triage line)';
+				this.logger.mcp(`mark_triage: raw file verification — ${triageLine}`);
+
+				// Also verify the cache
+				const verifyCache = this.app.metadataCache.getFileCache(file);
+				const cachedTriage = verifyCache?.frontmatter?.triage;
+				this.logger.mcp(`mark_triage: cache verification — triage=${JSON.stringify(cachedTriage)} (type=${typeof cachedTriage})`);
 
 				return {
 					content: [{
