@@ -1084,6 +1084,43 @@ export default class WitnessPlugin extends Plugin {
 		return this.settings.coreToolDescriptions[toolName] || defaultDescription;
 	}
 
+	/**
+	 * Normalise smart/curly punctuation to ASCII equivalents.
+	 * Used for fuzzy path matching when AI clients send ASCII versions
+	 * of filenames that contain Unicode typography characters.
+	 */
+	private normalisePath(p: string): string {
+		return p
+			.replace(/[\u2018\u2019\u201A]/g, "'")   // ' ' ‚ → '
+			.replace(/[\u201C\u201D\u201E]/g, '"')    // " " „ → "
+			.replace(/\u2013/g, '-')                   // – → -
+			.replace(/\u2014/g, '-')                   // — → -
+			.replace(/\u2026/g, '...');                // … → ...
+	}
+
+	/**
+	 * Look up a file by path, with fallback for smart-quote mismatches.
+	 * AI clients often send ASCII apostrophes for filenames that use
+	 * curly quotes (e.g. Kirk's → Kirk's). This tries the exact path
+	 * first, then falls back to a normalised comparison.
+	 */
+	resolveFile(path: string): TFile | null {
+		// Exact match first (fast path)
+		const exact = this.app.vault.getAbstractFileByPath(path);
+		if (exact instanceof TFile) return exact;
+
+		// Normalised fallback — compare against all files
+		const normalised = this.normalisePath(path);
+		const allFiles = this.app.vault.getFiles();
+		for (const file of allFiles) {
+			if (this.normalisePath(file.path) === normalised) {
+				return file;
+			}
+		}
+
+		return null;
+	}
+
 	private registerTools() {
 		if (!this.mcpServer) return;
 
@@ -1100,12 +1137,11 @@ export default class WitnessPlugin extends Plugin {
 			},
 			async ({ path, render }) => {
 				this.logger.mcp(`read_file called with path: "${path}", render: ${render}`);
-				const file = this.app.vault.getAbstractFileByPath(path);
-				this.logger.mcp(`File lookup:`, file ? `Found: ${file.path}` : 'NOT FOUND');
+				const file = this.resolveFile(path);
 				if (!file) {
-					throw new Error('File not found');
+					throw new Error(`File not found: ${path}`);
 				}
-				let content = await this.app.vault.read(file as any);
+				let content = await this.app.vault.read(file);
 
 				if (render) {
 					content = await this.resolveDataviewBlocks(content);
@@ -1203,11 +1239,11 @@ export default class WitnessPlugin extends Plugin {
 				destructiveHint: true,
 			},
 			async ({ path, find, replace }) => {
-				const file = this.app.vault.getAbstractFileByPath(path);
+				const file = this.resolveFile(path);
 				if (!file) {
-					throw new Error('File not found');
+					throw new Error(`File not found: ${path}`);
 				}
-				const content = await this.app.vault.read(file as any);
+				const content = await this.app.vault.read(file);
 
 				// Check if find text exists
 				if (!content.includes(find)) {
@@ -1495,7 +1531,7 @@ export default class WitnessPlugin extends Plugin {
 			},
 			async ({ from, to }) => {
 				this.logger.mcp(`move_file called: "${from}" -> "${to}"`);
-				const file = this.app.vault.getAbstractFileByPath(from);
+				const file = this.resolveFile(from);
 
 				if (!file) {
 					this.logger.error(`move_file: source not found: ${from}`);
@@ -1610,7 +1646,7 @@ export default class WitnessPlugin extends Plugin {
 			async ({ path, recursive = false, trash = true }) => {
 				this.logger.mcp(`delete called: "${path}" (recursive: ${recursive}, trash: ${trash})`);
 
-				const file = this.app.vault.getAbstractFileByPath(path);
+				const file = this.resolveFile(path) || this.app.vault.getAbstractFileByPath(path);
 				if (!file) {
 					throw new Error(`Path not found: ${path}`);
 				}
@@ -1660,7 +1696,7 @@ export default class WitnessPlugin extends Plugin {
 			async ({ source, destination, overwrite = false }) => {
 				this.logger.mcp(`copy_file called: "${source}" -> "${destination}" (overwrite: ${overwrite})`);
 
-				const sourceFile = this.app.vault.getAbstractFileByPath(source);
+				const sourceFile = this.resolveFile(source);
 				if (!sourceFile) {
 					throw new Error(`Source file not found: ${source}`);
 				}
@@ -2009,8 +2045,8 @@ export default class WitnessPlugin extends Plugin {
 					throw new Error('defer_until date is required when action is "deferred". Provide a YYYY-MM-DD date.');
 				}
 
-				const file = this.app.vault.getAbstractFileByPath(filePath);
-				if (!file || !(file instanceof TFile)) {
+				const file = this.resolveFile(filePath);
+				if (!file) {
 					throw new Error(`File not found: ${filePath}`);
 				}
 
