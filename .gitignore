@@ -38,6 +38,8 @@ test/vault/.smart-env/
 test/vault/.obsidian/plugins/witness/main.js
 test/vault/.obsidian/plugins/witness/manifest.json
 test/vault/.obsidian/plugins/witness/styles.css
+test/vault/.obsidian/plugins/witness/orama-worker.js
+test/vault/.obsidian/plugins/witness/embedding-worker.js
 
 # Test vault runtime data
 test/vault/.obsidian/plugins/witness/data.json
