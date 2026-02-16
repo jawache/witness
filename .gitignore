@@ -46,3 +46,6 @@ test/vault/.obsidian/plugins/witness/data.json
 test/vault/.obsidian/plugins/witness/logs/
 test/vault/.obsidian/community-plugins.json
 test/vault/.witness/
+
+# Private feature specs (not for public repo)
+docs/.private/
