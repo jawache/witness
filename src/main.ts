@@ -252,6 +252,21 @@ interface WitnessSettings {
 	rerankModel: string;
 }
 
+// Returns a stable, human-readable machine name.
+// On macOS, os.hostname() is unreliable — it changes with network state (e.g.
+// "Orion.local" vs "mac.lan" after sleep/wake). scutil --get ComputerName
+// returns the name set in System Preferences, which never changes.
+// On Windows/Linux, os.hostname() is stable so we use it as a fallback.
+function getStableHostname(): string {
+	try {
+		return require('child_process')
+			.execSync('scutil --get ComputerName')
+			.toString().trim();
+	} catch {
+		return os.hostname();
+	}
+}
+
 // Helper function to generate random credentials
 function generateRandomId(length: number = 32): string {
 	const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -323,6 +338,17 @@ export default class WitnessPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+
+		// Migrate unstable hostname in tunnelPrimaryHost (e.g. "Orion.local" or "mac.lan")
+		// to stable ComputerName (e.g. "Orion"). Auto-migrate if the stable name matches.
+		if (this.settings.tunnelPrimaryHost && /\.(local|lan)$/i.test(this.settings.tunnelPrimaryHost)) {
+			const stableHost = getStableHostname();
+			const storedBase = this.settings.tunnelPrimaryHost.replace(/\.(local|lan)$/i, '');
+			if (storedBase.toLowerCase() === stableHost.toLowerCase()) {
+				this.settings.tunnelPrimaryHost = stableHost;
+				await this.saveSettings();
+			}
+		}
 
 		// Initialize loggers
 		this.logger = new FileLogger(this.app, this.manifest.id);
@@ -2430,7 +2456,7 @@ export default class WitnessPlugin extends Plugin {
 			// Unknown session
 			this.logger.error(`Unknown/expired session: ${sessionId}`);
 			this.logger.error(`Available sessions:`, Array.from(this.transports.keys()));
-			res.writeHead(400, { 'Content-Type': 'application/json' });
+			res.writeHead(404, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ error: 'Invalid or expired session' }));
 		} catch (err) {
 			this.logger.error('Error handling request:', err);
@@ -2569,7 +2595,7 @@ export default class WitnessPlugin extends Plugin {
 		}
 
 		// Primary host check: only start tunnel on the designated machine
-		const currentHost = os.hostname();
+		const currentHost = getStableHostname();
 		if (this.settings.tunnelPrimaryHost && this.settings.tunnelPrimaryHost !== currentHost) {
 			this.logger.info(`Tunnel skipped: this machine (${currentHost}) is not the primary host (${this.settings.tunnelPrimaryHost})`);
 			this.tunnelStatus = 'disconnected';
@@ -3254,7 +3280,7 @@ class WitnessSettingTab extends PluginSettingTab {
 					text.inputEl.style.width = '300px';
 				});
 
-			const currentHost = os.hostname();
+			const currentHost = getStableHostname();
 			const isPrimary = !this.plugin.settings.tunnelPrimaryHost || this.plugin.settings.tunnelPrimaryHost === currentHost;
 			const primaryDesc = this.plugin.settings.tunnelPrimaryHost
 				? `Primary: ${this.plugin.settings.tunnelPrimaryHost}` + (isPrimary ? ' (this machine)' : ` (this machine: ${currentHost})`)

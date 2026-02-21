@@ -439,6 +439,57 @@ Additional log locations:
    node --version  # Should be 20.x or higher
    ```
 
+### MCP server drops connection (macOS sleep)
+
+If the MCP server becomes unreachable after periods of inactivity, your Mac is likely sleeping and dropping network connections. Check your current power settings:
+
+```bash
+pmset -g
+```
+
+The key setting is `networkoversleep` — if it's `0`, macOS drops all network connections during sleep, killing the MCP server for remote clients.
+
+#### Fix: Enable network access during sleep
+
+```bash
+sudo pmset -a networkoversleep 1
+```
+
+Other useful power settings for keeping the server reachable:
+
+```bash
+# Prevent system sleep on AC power
+sudo pmset -c sleep 0
+
+# Enable Wake on LAN (allows remote wake)
+sudo pmset -c womp 1
+
+# Disable Power Nap (can interfere with network stability)
+sudo pmset -c powernap 0
+```
+
+#### Quick fix: Keep awake temporarily
+
+If you don't want to change system settings permanently, run `caffeinate` in a terminal:
+
+```bash
+# Prevent idle and system sleep (Ctrl+C to stop)
+caffeinate -si
+
+# Or run in the background
+caffeinate -si &
+```
+
+#### Key pmset settings
+
+| Setting              | Value | Effect                                 |
+| -------------------- | ----- | -------------------------------------- |
+| `networkoversleep`   | `1`   | Keep network alive during sleep        |
+| `womp`               | `1`   | Wake on LAN enabled                    |
+| `tcpkeepalive`       | `1`   | Maintain TCP connections during sleep  |
+| `sleep`              | `0`   | Disable system sleep (AC power: `-c`)  |
+| `powernap`           | `0`   | Disable Power Nap                      |
+
 ### Port already in use
 
 If port 3000 is taken:
