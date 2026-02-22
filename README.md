@@ -30,6 +30,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - **Primary Machine**: Designate which machine runs the tunnel when syncing across multiple devices
 - **Token Authentication**: Protect your remote endpoint with a simple token
 - **Chaos Triage**: AI-assisted processing of unread chaos items with queue management and safe frontmatter updates
+- **Chaos Queue Panel**: Visual sidebar for browsing and triaging chaos items — card-based UI with hover actions, bulk edit mode, keyboard shortcuts, and file explorer context menu
 - **LLM Re-ranking**: Optional two-stage search — fast hybrid results shown instantly, then re-ranked by a local LLM for higher precision
 - **Contextual Search**: Toggle a mode where the search panel automatically shows related notes based on your cursor position, selection, or current paragraph — no typing needed
 - **Page Preview**: Cmd+hover on any search result to preview the note without leaving the panel
@@ -51,7 +52,7 @@ The plugin helps you move information from chaos to order, with AI assistance to
 - `get_vault_context` - Load your vault's context document (auto-renders Dataview)
 - `dataview_query` - Execute Dataview queries, get structured vault data (requires Dataview plugin)
 - `get_next_chaos` - Get next unprocessed chaos item for triage (single or list mode)
-- `mark_triage` - Record triage decision (processed, deferred, acknowledged)
+- `mark_triage` - Record triage decision (processed, deferred, acknowledged, next, reset)
 - `copy-obsidian-url` - Copy the internal Obsidian URL for the current file
 
 ### Coming Soon
@@ -557,10 +558,22 @@ This is different from other Obsidian MCP servers that run externally and connec
 
 ### Chaos Triage ✅
 
-- [x] `get_next_chaos` tool (single + list mode, queue counts)
-- [x] `mark_triage` tool (processed, deferred, acknowledged)
+- [x] `get_next_chaos` tool (single + list mode, queue counts, priority sorting)
+- [x] `mark_triage` tool (processed, deferred, acknowledged, next, reset)
 - [x] Safe frontmatter updates via `processFrontMatter` API
 - [x] AI guardrails: create-only `write_file`, improved `edit_file` errors
+
+### Chaos Queue Panel ✅
+
+- [x] Visual sidebar with card-based UI (title, path, smart snippets)
+- [x] "Next Up" and "Queue" groups with collapsible sections
+- [x] Hover-only action buttons (acknowledge, mark next, move to death, reset)
+- [x] Bulk Edit mode with select all, bulk acknowledge, bulk move-to-death
+- [x] 10 keyboard commands (triage actions, sibling navigation, panel toggles)
+- [x] Inline hotkey capture in settings with conflict detection
+- [x] File explorer context menu for chaos files and folders
+- [x] Post-action navigation (next sibling file after move-to-death)
+- [x] Live vault event listeners (deleted/renamed files removed from panel)
 
 ### Phase 4: Intelligence
 

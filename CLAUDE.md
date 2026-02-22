@@ -183,28 +183,69 @@ Total: 16 MCP tools registered and available
 
 ### Chaos Triage Tools
 
-Two tools for processing unread chaos items:
+Two MCP tools for processing unread chaos items, plus a visual panel:
 
 - **`get_next_chaos`** — Scans `1-chaos/` for untriaged items. Filters out processed, acknowledged, and future-deferred items. Two modes:
   - Single mode (default): Returns full file content of the next item
-  - List mode (`list: true`): Returns compact `{path, title, date}` for up to 10 items
-  - Every response includes `queue: {total, in_path}` counts
+  - List mode (`list: true`): Returns compact `{path, title, date, priority}` for up to 10 items
+  - `triage: next` items appear first with `priority: 'next'`
+  - Every response includes `queue: {total, in_path, next}` counts
 
-- **`mark_triage`** — Records triage decisions via `processFrontMatter` API. Three actions:
+- **`mark_triage`** — Records triage decisions via `processFrontMatter` API. Five actions:
   - `processed`: Sets `triage: YYYY-MM-DD` (today's date)
   - `deferred`: Sets `triage: deferred YYYY-MM-DD` (requires `defer_until` param)
   - `acknowledged`: Sets `triage: acknowledged`
+  - `next`: Sets `triage: next` (prioritised in queue)
+  - `reset`: Removes `triage` field entirely (returns to queue)
 
 **Triage frontmatter convention:**
 - `triage: 2026-02-08` → Processed on that date
 - `triage: deferred 2026-03-01` → Resurfaces when date passes
 - `triage: acknowledged` → Reviewed, no action needed
+- `triage: next` → Prioritised, appears in "Next Up" group
 - No `triage` field → Untriaged, appears in queue
 
 **AI Safety Guardrails:**
 - `write_file` is create-only — errors on existing files with guidance toward `edit_file`
 - `edit_file` error messages truncate search text, suggest re-reading, warn against delete+recreate
 - `mark_triage` uses `processFrontMatter` to avoid AI fumbling with YAML
+
+### Chaos Queue Panel
+
+Visual side panel (`src/chaos-queue-view.ts`) for browsing and triaging chaos items manually.
+
+**Key files:**
+- `src/chaos-queue-view.ts` — `WitnessChaosQueueView extends ItemView`, card-based UI
+- `src/main.ts` — `getChaosQueue()` shared function, commands, context menu, settings
+
+**Architecture:**
+- `getChaosQueue()` is the single source of truth — shared between the panel and MCP tools
+- Items grouped into "Next Up" (triage: next) and "Queue" (untriaged), each sorted newest-first
+- Cards show title, folder path (chaos prefix stripped), and smart snippet (frontmatter summary/description first, then markdown-stripped body)
+- Action buttons overlay on hover (absolute positioned, no layout shift)
+
+**Commands (10 total):**
+- `toggle-chaos-queue` / `toggle-search-panel` — sidebar toggles
+- `acknowledge-current-file` / `mark-next-current-file` / `move-current-to-death` / `reset-current-file` — triage actions (scoped to chaos files via `checkCallback`)
+- `next-sibling-file` / `prev-sibling-file` — navigate between files in same folder
+- `toggle-contextual-search` / `reindex-vault` — search commands
+
+**Move-to-death behaviour:**
+- Single file: no confirmation, shows notice, navigates to next sibling file
+- Bulk/folder: confirmation modal with file count
+- `moveFileToDeath()` preserves full path: `1-chaos/external/article.md` → `4-death/1-chaos/external/article.md`
+- `navigateAfterRemoval()` opens next sibling (or previous if last, or closes tab if empty)
+
+**Inline hotkey capture (settings):**
+- Click hotkey tag → capture mode (accent pulse animation) → press key combo → saved
+- Escape or X button to cancel, Backspace/Delete to clear binding
+- Conflict detection: warns via Notice but allows override (matches Obsidian's behaviour)
+- Uses `hotkeyManager.setHotkeys()`, `.removeHotkeys()`, `.save()` (undocumented API)
+- On macOS: `e.metaKey` → `Mod` (Cmd), `e.ctrlKey` → `Ctrl` (Control) — properly distinct
+
+**Vault event listeners:**
+- Panel listens for vault `delete` and `rename` events to remove stale cards
+- Click guard checks `vault.getAbstractFileByPath()` before opening — prevents phantom file creation
 
 ### Markdown Chunking
 
@@ -664,6 +705,71 @@ curl -X POST https://tunnel-url/mcp \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -d '...'
 ```
+
+## Obsidian CLI
+
+Obsidian has a built-in CLI accessible via the app binary. **Always prefer the CLI over AppleScript** for plugin development — it's faster, more reliable, and doesn't require UI interaction.
+
+**Binary location:** `/Applications/Obsidian.app/Contents/MacOS/Obsidian`
+
+**Key commands for plugin development:**
+
+```bash
+# Reload plugin without restarting Obsidian (hot reload)
+/Applications/Obsidian.app/Contents/MacOS/Obsidian plugin:reload id=witness
+
+# Check plugin status
+/Applications/Obsidian.app/Contents/MacOS/Obsidian plugin id=witness
+
+# Check for runtime errors
+/Applications/Obsidian.app/Contents/MacOS/Obsidian dev:errors
+
+# View console output (filtered by level)
+/Applications/Obsidian.app/Contents/MacOS/Obsidian dev:console level=error
+/Applications/Obsidian.app/Contents/MacOS/Obsidian dev:console limit=20
+
+# Take a screenshot
+/Applications/Obsidian.app/Contents/MacOS/Obsidian dev:screenshot path=/tmp/obsidian.png
+
+# Execute arbitrary JavaScript in Obsidian
+/Applications/Obsidian.app/Contents/MacOS/Obsidian eval code="app.plugins.plugins.witness.settings.mcpPort"
+
+# List all installed plugins
+/Applications/Obsidian.app/Contents/MacOS/Obsidian plugins filter=community
+
+# Vault info
+/Applications/Obsidian.app/Contents/MacOS/Obsidian vault
+```
+
+**Preferred development workflow:**
+
+```bash
+# 1. Build
+npm run build
+
+# 2. Copy to vault
+cp main.js manifest.json styles.css /Users/jawache/Documents/Obsidian/main/.obsidian/plugins/witness/
+
+# 3. Hot-reload plugin (no restart needed!)
+/Applications/Obsidian.app/Contents/MacOS/Obsidian plugin:reload id=witness
+
+# 4. Check for errors
+/Applications/Obsidian.app/Contents/MacOS/Obsidian dev:errors
+```
+
+**Other useful commands:**
+
+| Command | Description |
+|---|---|
+| `plugin:enable id=witness` | Enable plugin |
+| `plugin:disable id=witness` | Disable plugin |
+| `reload` | Reload entire vault |
+| `dev:console clear` | Clear console buffer |
+| `dev:dom selector=".witness-chaos-container"` | Inspect DOM elements |
+| `dev:cdp method=<CDP.method> params=<json>` | Chrome DevTools Protocol |
+| `devtools` | Toggle Electron dev tools |
+
+**Full help:** `/Applications/Obsidian.app/Contents/MacOS/Obsidian --help`
 
 ## Obsidian Automation Guide
 
