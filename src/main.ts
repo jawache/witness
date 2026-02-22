@@ -14,6 +14,7 @@ import { OramaSearchEngine } from './vector-store';
 import type { SearchResult } from './search-engine';
 import { WitnessSearchView, VIEW_TYPE_SEARCH } from './search-view';
 import { WitnessChaosQueueView, VIEW_TYPE_CHAOS_QUEUE, ConfirmModal } from './chaos-queue-view';
+import { stripMarkdown, truncateAtWord } from './text-utils';
 
 /**
  * Logger that writes to both console and file.
@@ -857,7 +858,7 @@ export default class WitnessPlugin extends Plugin {
 			// Prefer frontmatter summary or description
 			const fmSnippet = fm?.summary || fm?.description;
 			if (fmSnippet && typeof fmSnippet === 'string') {
-				return this.truncateAtWord(fmSnippet.trim(), maxLength);
+				return truncateAtWord(fmSnippet.trim(), maxLength);
 			}
 
 			const content = await this.app.vault.cachedRead(file);
@@ -872,59 +873,11 @@ export default class WitnessPlugin extends Plugin {
 				bodyStart = charCount;
 			}
 			const body = content.substring(bodyStart).trim();
-			const plainText = this.stripMarkdown(body);
-			return this.truncateAtWord(plainText, maxLength);
+			const plainText = stripMarkdown(body);
+			return truncateAtWord(plainText, maxLength);
 		} catch {
 			return '';
 		}
-	}
-
-	/**
-	 * Strip markdown syntax to produce plain text.
-	 */
-	private stripMarkdown(text: string): string {
-		return text
-			// Remove headings (# ## ### etc.)
-			.replace(/^#{1,6}\s+/gm, '')
-			// Remove bold/italic markers
-			.replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
-			.replace(/_{1,3}([^_]+)_{1,3}/g, '$1')
-			// Remove strikethrough
-			.replace(/~~([^~]+)~~/g, '$1')
-			// Remove inline code
-			.replace(/`([^`]+)`/g, '$1')
-			// Remove code blocks
-			.replace(/```[\s\S]*?```/g, '')
-			// Remove images ![alt](url)
-			.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
-			// Remove links [text](url) → text
-			.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-			// Remove wiki links [[target|alias]] → alias, [[target]] → target
-			.replace(/\[\[([^|\]]*)\|([^\]]*)\]\]/g, '$2')
-			.replace(/\[\[([^\]]*)\]\]/g, '$1')
-			// Remove blockquotes
-			.replace(/^>\s+/gm, '')
-			// Remove horizontal rules
-			.replace(/^[-*_]{3,}\s*$/gm, '')
-			// Remove list markers (- * + and numbered)
-			.replace(/^[\s]*[-*+]\s+/gm, '')
-			.replace(/^[\s]*\d+\.\s+/gm, '')
-			// Remove HTML tags
-			.replace(/<[^>]+>/g, '')
-			// Remove highlight markers
-			.replace(/==([^=]+)==/g, '$1')
-			// Collapse multiple newlines/spaces
-			.replace(/\n{2,}/g, ' ')
-			.replace(/\n/g, ' ')
-			.replace(/\s{2,}/g, ' ')
-			.trim();
-	}
-
-	private truncateAtWord(text: string, maxLength: number): string {
-		if (text.length <= maxLength) return text;
-		const truncated = text.substring(0, maxLength);
-		const lastSpace = truncated.lastIndexOf(' ');
-		return (lastSpace > maxLength * 0.7 ? truncated.substring(0, lastSpace) : truncated) + '…';
 	}
 
 	/**
