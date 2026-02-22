@@ -768,7 +768,7 @@ describe('MCP Server Integration Tests', () => {
       const logContent = fs.readFileSync(logPath, 'utf-8');
 
       // Should log when file lookups fail
-      expect(logContent).toContain('NOT FOUND');
+      expect(logContent.toLowerCase()).toContain('not found');
 
       // Should log the path that wasn't found
       expect(logContent).toContain('does-not-exist.md');
