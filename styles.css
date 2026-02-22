@@ -295,3 +295,375 @@
 	color: var(--text-faint);
 	font-size: var(--font-ui-small);
 }
+
+/* ===== Chaos Queue Panel ===== */
+
+.witness-chaos-container {
+	padding: 8px;
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+
+.witness-chaos-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 8px;
+	padding-bottom: 8px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.witness-chaos-header-title {
+	font-size: var(--font-ui-medium);
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.witness-chaos-edit-btn {
+	padding: 4px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	background: var(--background-primary);
+	color: var(--text-muted);
+	cursor: pointer;
+	font-size: var(--font-ui-smaller);
+}
+
+.witness-chaos-edit-btn:hover {
+	color: var(--text-normal);
+	background: var(--background-modifier-hover);
+}
+
+.witness-chaos-edit-btn.is-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	border-color: var(--interactive-accent);
+}
+
+/* Edit mode toolbar */
+
+.witness-chaos-edit-toolbar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-wrap: wrap;
+	padding: 6px 0;
+	margin-bottom: 8px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.witness-chaos-toolbar-btn {
+	padding: 4px 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	background: var(--background-primary);
+	color: var(--text-normal);
+	cursor: pointer;
+	font-size: var(--font-ui-smaller);
+}
+
+.witness-chaos-toolbar-btn:hover {
+	background: var(--background-modifier-hover);
+}
+
+/* Bulk action icon buttons in toolbar */
+
+.witness-chaos-toolbar-icon {
+	width: 28px;
+	height: 28px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	background: var(--background-primary);
+	color: var(--text-muted);
+	cursor: pointer;
+	padding: 0;
+}
+
+.witness-chaos-toolbar-icon:hover {
+	background: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+.witness-chaos-toolbar-icon-death:hover {
+	color: var(--text-error);
+	border-color: var(--text-error);
+}
+
+.witness-chaos-toolbar-icon svg {
+	width: 16px;
+	height: 16px;
+}
+
+.witness-chaos-selection-count {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	margin: 0 4px;
+}
+
+/* Scrollable content area */
+
+.witness-chaos-scroll {
+	flex: 1;
+	overflow-y: auto;
+	min-height: 0;
+}
+
+/* Group headers */
+
+.witness-chaos-group-header {
+	font-size: var(--font-ui-small);
+	font-weight: 600;
+	color: var(--text-muted);
+	padding: 6px 0;
+	margin-bottom: 4px;
+}
+
+.witness-chaos-group-next {
+	color: var(--text-accent);
+}
+
+/* Empty hint for Next Up */
+
+.witness-chaos-empty-hint {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	font-style: italic;
+	padding: 4px 0 8px 0;
+}
+
+/* Divider between groups */
+
+.witness-chaos-divider {
+	height: 1px;
+	background: var(--background-modifier-border);
+	margin: 8px 0;
+}
+
+/* Item cards */
+
+.witness-chaos-card {
+	position: relative;
+	padding: 6px 8px;
+	margin-bottom: 2px;
+	border-radius: 4px;
+	border: 1px solid transparent;
+}
+
+.witness-chaos-card:hover {
+	background: var(--background-modifier-hover);
+	border-color: var(--background-modifier-border);
+}
+
+.witness-chaos-card-body {
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+}
+
+.witness-chaos-checkbox {
+	margin: 4px 0 0 0;
+	flex-shrink: 0;
+}
+
+.witness-chaos-card-content {
+	flex: 1;
+	min-width: 0;
+	cursor: pointer;
+}
+
+.witness-chaos-card-title {
+	font-size: var(--font-ui-small);
+	font-weight: 600;
+	color: var(--text-normal);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	margin-bottom: 2px;
+}
+
+.witness-chaos-card-path {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	font-style: italic;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	margin-bottom: 2px;
+}
+
+.witness-chaos-card-snippet {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	line-height: 1.4;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+
+/* Action buttons — overlay on hover, positioned over card content */
+
+.witness-chaos-card-actions {
+	display: flex;
+	gap: 1px;
+	position: absolute;
+	right: 4px;
+	top: 4px;
+	padding: 2px 4px;
+	border-radius: 4px;
+	background: var(--background-primary);
+	box-shadow: -4px 0 8px var(--background-primary);
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity 0.1s ease;
+}
+
+.witness-chaos-card:hover .witness-chaos-card-actions {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+.witness-chaos-action-btn {
+	width: 22px;
+	height: 22px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border: none;
+	background: none;
+	border-radius: 4px;
+	cursor: pointer;
+	color: var(--text-muted);
+	padding: 0;
+}
+
+.witness-chaos-action-btn svg {
+	width: 14px;
+	height: 14px;
+}
+
+.witness-chaos-action-btn:hover {
+	background: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+.witness-chaos-action-death:hover {
+	color: var(--text-error);
+}
+
+/* Footer */
+
+.witness-chaos-footer {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	padding-top: 8px;
+	border-top: 1px solid var(--background-modifier-border);
+	text-align: center;
+}
+
+/* ===== Settings: Hotkey Tags ===== */
+
+.witness-hotkey-row {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	margin-right: 4px;
+}
+
+.witness-hotkey-cancel {
+	width: 24px;
+	height: 24px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border: none;
+	background: none;
+	border-radius: 4px;
+	cursor: pointer;
+	color: var(--text-muted);
+	padding: 0;
+}
+
+.witness-hotkey-cancel:hover {
+	background: var(--background-modifier-hover);
+	color: var(--text-error);
+}
+
+.witness-hotkey-cancel svg {
+	width: 14px;
+	height: 14px;
+}
+
+.witness-hotkey-tag {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	background: var(--background-modifier-hover);
+	padding: 4px 10px;
+	border-radius: 4px;
+	border: 1px solid var(--background-modifier-border);
+	font-family: var(--font-monospace);
+	white-space: nowrap;
+	margin-right: 4px;
+	cursor: pointer;
+	min-width: 60px;
+	text-align: center;
+}
+
+.witness-hotkey-tag:hover {
+	border-color: var(--interactive-accent);
+	color: var(--text-normal);
+}
+
+.witness-hotkey-tag.is-empty {
+	color: var(--text-faint);
+	font-style: italic;
+	font-family: var(--font-interface);
+}
+
+.witness-hotkey-tag.is-capturing {
+	border-color: var(--interactive-accent);
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	font-style: italic;
+	font-family: var(--font-interface);
+	animation: witness-pulse 1.5s ease-in-out infinite;
+}
+
+.witness-hotkey-tag.is-conflict {
+	border-color: var(--text-error);
+	background: var(--background-modifier-error);
+	color: var(--text-error);
+	font-style: normal;
+	font-family: var(--font-interface);
+	font-size: var(--font-ui-smaller);
+	min-width: auto;
+	animation: none;
+}
+
+@keyframes witness-pulse {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0.7; }
+}
+
+.witness-command-id {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	font-family: var(--font-monospace);
+}
+
+/* Confirmation modal */
+
+.witness-confirm-modal p {
+	margin-bottom: 16px;
+	white-space: pre-line;
+}
+
+.witness-confirm-buttons {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+}

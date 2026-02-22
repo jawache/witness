@@ -574,6 +574,36 @@ describe('MCP Server Integration Tests', () => {
       expect(data.items).toBeDefined();
       expect(data.items.length).toBe(0);
     });
+
+    it('should show next items first in list mode', async () => {
+      const result = await client.callTool('get_next_chaos', { path: '1-chaos/', list: true });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      const items = data.items;
+
+      // Find the next-up-item (has triage: next in test vault)
+      const nextItem = items.find((i: any) => i.path === '1-chaos/next-up-item.md');
+      expect(nextItem).toBeDefined();
+      expect(nextItem.priority).toBe('next');
+
+      // Next items should appear before normal items
+      const nextIdx = items.indexOf(nextItem);
+      const normalItems = items.filter((i: any) => i.priority !== 'next');
+      if (normalItems.length > 0) {
+        const firstNormalIdx = items.indexOf(normalItems[0]);
+        expect(nextIdx).toBeLessThan(firstNormalIdx);
+      }
+    });
+
+    it('should include next count in queue stats', async () => {
+      const result = await client.callTool('get_next_chaos', { path: '1-chaos/', list: true });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.queue.next).toBeDefined();
+      expect(data.queue.next).toBeGreaterThanOrEqual(1);
+    });
   });
 
   describe('mark_triage', () => {
@@ -642,6 +672,45 @@ describe('MCP Server Integration Tests', () => {
       expect(getTextContent(result)).toContain('defer_until');
     });
 
+    it('should mark an item as next', async () => {
+      const result = await client.callTool('mark_triage', {
+        path: triageFile,
+        action: 'next',
+      });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.action).toBe('next');
+      expect(data.triage).toBe('next');
+
+      // Verify in file
+      const readResult = await client.callTool('read_file', { path: triageFile });
+      expect(getTextContent(readResult)).toContain('triage: next');
+    });
+
+    it('should reset triage (remove field)', async () => {
+      // First set triage to something
+      await client.callTool('mark_triage', {
+        path: triageFile,
+        action: 'acknowledged',
+      });
+
+      // Then reset
+      const result = await client.callTool('mark_triage', {
+        path: triageFile,
+        action: 'reset',
+      });
+      expect(result.isError).not.toBe(true);
+
+      const data = JSON.parse(getTextContent(result));
+      expect(data.action).toBe('reset');
+
+      // Verify triage field is removed from file
+      const readResult = await client.callTool('read_file', { path: triageFile });
+      const content = getTextContent(readResult);
+      expect(content).not.toMatch(/triage:/);
+    });
+
     it('should error for non-existent file', async () => {
       const result = await client.callTool('mark_triage', {
         path: '1-chaos/does-not-exist.md',
@@ -699,7 +768,7 @@ describe('MCP Server Integration Tests', () => {
       const logContent = fs.readFileSync(logPath, 'utf-8');
 
       // Should log when file lookups fail
-      expect(logContent).toContain('NOT FOUND');
+      expect(logContent.toLowerCase()).toContain('not found');
 
       // Should log the path that wasn't found
       expect(logContent).toContain('does-not-exist.md');

@@ -185,7 +185,7 @@ export class WitnessSearchView extends ItemView {
 	}
 
 	getIcon(): string {
-		return 'search';
+		return 'radar';
 	}
 
 	async onOpen(): Promise<void> {

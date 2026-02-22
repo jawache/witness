@@ -2125,3 +2125,85 @@ The metadata cache race condition was satisfying to diagnose. The symptoms (same
 ---
 
 *End of log entry*
+
+## 2026-02-22 - Chaos Queue Panel: From MCP-Only to Visual Triage
+
+**Objective**: Build a visual side panel for chaos triage — turning the MCP-only one-at-a-time workflow into a browsable, actionable queue with keyboard shortcuts, bulk actions, and file explorer integration.
+
+### What We Built
+
+- **Chaos Queue Panel** (`src/chaos-queue-view.ts`, 514 lines) — a full ItemView sidebar showing all untriaged chaos items, grouped into "Next Up" and "Queue" sections
+- **Shared `getChaosQueue()` function** — extracted from the MCP tool so panel and AI always see the same ordering
+- **Card-based UI** with title, folder path (chaos prefix stripped, italic with `›` prefix), and smart snippets (frontmatter summary/description first, then markdown-stripped body text)
+- **Hover-only action buttons** — overlay pattern (absolute positioned) so buttons don't reserve horizontal space
+- **Single-item actions**: Acknowledge, Mark Next, Move to Death, Reset — all instant with notice, no confirmation modal
+- **Bulk Edit mode** — toggle shows checkboxes, select all/deselect all, bulk acknowledge and bulk move-to-death (with confirmation modal for bulk only)
+- **`mark_triage` expanded** — added `next` and `reset` actions to the MCP tool
+- **10 keyboard commands** registered in Obsidian's command system:
+  - Toggle chaos queue, toggle search panel
+  - Acknowledge, mark next, move to death, reset triage (all scoped to chaos files)
+  - Next/previous sibling file navigation
+  - Toggle contextual search, reindex vault
+- **Inline hotkey capture** in Witness settings — click to capture, Escape or X to cancel, Backspace to clear, conflict detection with notice
+- **File explorer context menu** — right-click chaos files/folders for acknowledge, mark next, move to death (folder actions show confirmation)
+- **Move-to-death navigation** — after moving a file, editor navigates to the next sibling (or previous if last, or closes tab if folder empty)
+- **Vault event listeners** — deleted/renamed files automatically removed from the chaos queue panel
+- **Radar icon** for Witness Search — replaced the generic magnifying glass
+
+### The Journey
+
+This was a marathon session of iterative UX refinement. The initial implementation came together quickly — the `getChaosQueue()` extraction, the `ItemView` panel, the card rendering. But then came the real work: making it feel right.
+
+The action buttons went through three iterations. First they were always visible in a flex row, eating horizontal space. Then we moved to hover-only with absolute positioning and a background overlay — much cleaner. The user could see the full card content and only interact when hovering.
+
+Snippets needed thought. Raw markdown in a preview card looks terrible. We built `stripMarkdown()` — a chain of regexes removing headings, bold/italic, links, wiki-links, code blocks, blockquotes, list markers, HTML tags, and highlights. But the real insight was checking frontmatter `summary` or `description` first — many imported articles have these, and they're already clean prose.
+
+The hotkey capture feature was the most complex UI piece. Obsidian's `hotkeyManager` has `setHotkeys()`, `removeHotkeys()`, and `save()` — undocumented but discoverable via `Object.getOwnPropertyNames()`. We built a full capture flow: click the tag to enter capture mode (pulsing accent animation), press a key combo to save, Escape or X to cancel, Backspace to clear. Conflict detection went through three iterations: first a red box with click-to-override (confusing), then reject entirely (too strict), finally just save it with a warning notice (matching Obsidian's own behaviour).
+
+The Ctrl vs Cmd distinction on macOS was an interesting detour. Obsidian uses `Mod` as a cross-platform abstraction (Cmd on Mac, Ctrl on Windows), but also supports `Ctrl` as a separate modifier for the actual Control key on Mac. We initially collapsed both into `Mod`, then separated them so users can bind Ctrl+Shift+A and Cmd+Shift+A independently.
+
+The move-to-death UX evolved through user feedback. Initially it showed a confirmation modal every time — too much friction for rapid triage. We removed it for single files (just show a notice) but kept it for bulk actions. Then the user noticed that after moving a file, they were still staring at it in the editor. We added `navigateAfterRemoval()` to jump to the next sibling file, and then generalised it into `navigateToSibling()` as its own command pair.
+
+### Technical Achievements
+
+- **DOM-efficient updates**: Single actions remove/move DOM elements and update count text without re-rendering the entire list
+- **Click guard**: Before opening a file from the queue, checks `vault.getAbstractFileByPath()` — prevents creating phantom files when clicking stale cards
+- **Vault event cleanup**: `EventRef` array with proper cleanup in `onClose()` prevents memory leaks
+- **Cross-platform hotkey capture**: `navigator.platform` check to correctly distinguish Ctrl from Cmd on macOS
+- **Smart snippets**: Frontmatter-first with markdown stripping fallback, word-boundary-aware truncation
+
+### Key Learnings
+
+- **Obsidian's `hotkeyManager`** is a powerful undocumented API — `setHotkeys(cmdId, [])` overrides defaults with nothing, `customKeys` and `defaultKeys` are inspectable for conflict detection
+- **Absolute positioning for hover overlays** works better than flex-based action columns — no layout shift, cards use full width
+- **Confirmation modals are friction** — for single reversible actions, a notice is enough. Reserve modals for bulk/destructive operations
+- **`navigator.platform`** is the simplest way to detect macOS in Obsidian's Electron environment (no need to import Platform from obsidian)
+- **Sibling navigation** is surprisingly useful for triage workflows — lets you process files sequentially without touching the file explorer
+
+### Statistics
+
+- 1 new file: `src/chaos-queue-view.ts` (514 lines)
+- 1 new feature spec: `docs/features/chaos-queue-panel.md` (305 lines)
+- 3 modified files: `src/main.ts` (+800 lines), `styles.css` (+372 lines), `src/search-view.ts` (icon change)
+- ~1,155 lines added across all files
+- 10 commands registered
+- 5 MCP tool enhancements (`mark_triage` gains `next`/`reset`, `get_next_chaos` gains priority sorting)
+
+### Next Steps
+
+- Test bulk operations on larger selections
+- Consider drag-and-drop reordering in the Next Up section
+- Explore undo for move-to-death (restore from death folder)
+- Add badge count on ribbon icon showing queue size
+
+### Reflections
+
+This session was a masterclass in the gap between "feature works" and "feature feels right". The core chaos queue panel was perhaps 30% of the work. The other 70% was UX polish driven by real-time user feedback: hover-only buttons, smart snippets, inline hotkey capture, conflict detection, sibling navigation, post-action navigation. Each small refinement made the triage workflow more fluid.
+
+The hotkey capture feature is a good example of building a mini-app within a settings tab. It has its own state machine (idle → capturing → conflict → saved), its own event listeners, its own CSS animations. Getting all the edge cases right (Escape, X button, Backspace to clear, click outside) required careful attention to event handler lifecycle.
+
+The move-to-death navigation improvement was the most impactful single change. Such a small thing — navigating to the next file — but it transforms the workflow from "click, move, hunt for next file" to "click, move, already looking at the next file". Triage becomes a flow state.
+
+---
+
+*End of log entry*

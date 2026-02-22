@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, SettingGroup, SecretComponent, Modal, SuggestModal, normalizePath, Notice, TFile, TFolder, ItemView, WorkspaceLeaf } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, SettingGroup, SecretComponent, Modal, SuggestModal, normalizePath, Notice, TFile, TFolder, ItemView, WorkspaceLeaf, setIcon } from 'obsidian';
 import * as http from 'http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -13,6 +13,8 @@ import { OllamaProvider, type EmbeddingModelInfo } from './ollama-provider';
 import { OramaSearchEngine } from './vector-store';
 import type { SearchResult } from './search-engine';
 import { WitnessSearchView, VIEW_TYPE_SEARCH } from './search-view';
+import { WitnessChaosQueueView, VIEW_TYPE_CHAOS_QUEUE, ConfirmModal } from './chaos-queue-view';
+import { stripMarkdown, truncateAtWord } from './text-utils';
 
 /**
  * Logger that writes to both console and file.
@@ -197,6 +199,16 @@ interface CustomCommandConfig {
 	enabled: boolean;       // Can disable without removing
 }
 
+export interface ChaosQueueItem {
+	file: TFile;
+	path: string;
+	title: string;
+	date: string;
+	snippet: string;
+	folder: string;
+	priority: 'next' | 'normal';
+}
+
 interface WitnessSettings {
 	mcpPort: number;
 	mcpEnabled: boolean;
@@ -366,9 +378,17 @@ export default class WitnessPlugin extends Plugin {
 		// Register search panel view
 		this.registerView(VIEW_TYPE_SEARCH, (leaf) => new WitnessSearchView(leaf, this));
 
+		// Register chaos queue panel view
+		this.registerView(VIEW_TYPE_CHAOS_QUEUE, (leaf) => new WitnessChaosQueueView(leaf, this));
+
 		// Add ribbon icon to toggle search panel
-		this.addRibbonIcon('search', 'Witness Search', () => {
+		this.addRibbonIcon('radar', 'Witness Search', () => {
 			this.toggleSearchPanel();
+		});
+
+		// Add ribbon icon to toggle chaos queue panel
+		this.addRibbonIcon('inbox', 'Chaos Queue', () => {
+			this.toggleChaosQueue();
 		});
 
 		// Add command to toggle search panel
@@ -379,6 +399,206 @@ export default class WitnessPlugin extends Plugin {
 				this.toggleSearchPanel();
 			},
 		});
+
+		// Add command to toggle chaos queue panel
+		this.addCommand({
+			id: 'toggle-chaos-queue',
+			name: 'Toggle chaos queue panel',
+			callback: () => {
+				this.toggleChaosQueue();
+			},
+		});
+
+		// Chaos triage keyboard shortcuts (editor-scoped via checkCallback)
+		this.addCommand({
+			id: 'acknowledge-current-file',
+			name: 'Acknowledge current chaos item',
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file?.path.startsWith(this.settings.chaosFolder + '/')) return false;
+				if (!checking) {
+					this.app.fileManager.processFrontMatter(file, (fm) => {
+						fm.triage = 'acknowledged';
+					});
+					new Notice(`Acknowledged: ${file.basename}`);
+					this.refreshChaosQueue();
+				}
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: 'mark-next-current-file',
+			name: 'Mark current chaos item as next up',
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file?.path.startsWith(this.settings.chaosFolder + '/')) return false;
+				if (!checking) {
+					this.app.fileManager.processFrontMatter(file, (fm) => {
+						fm.triage = 'next';
+					});
+					new Notice(`Marked as next: ${file.basename}`);
+					this.refreshChaosQueue();
+				}
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: 'move-current-to-death',
+			name: 'Move current chaos item to death',
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file?.path.startsWith(this.settings.chaosFolder + '/')) return false;
+				if (!checking) {
+					const removedPath = file.path;
+					this.moveFileToDeath(file).then(async () => {
+						new Notice(`Moved to death: ${file.basename}`);
+						await this.navigateAfterRemoval(removedPath);
+						this.refreshChaosQueue();
+					});
+				}
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: 'reset-current-file',
+			name: 'Reset triage on current chaos item',
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file?.path.startsWith(this.settings.chaosFolder + '/')) return false;
+				if (!checking) {
+					this.app.fileManager.processFrontMatter(file, (fm) => {
+						delete fm.triage;
+					});
+					new Notice(`Reset triage: ${file.basename}`);
+					this.refreshChaosQueue();
+				}
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: 'next-sibling-file',
+			name: 'Navigate to next sibling file',
+			callback: () => {
+				this.navigateToSibling(1);
+			},
+		});
+
+		this.addCommand({
+			id: 'prev-sibling-file',
+			name: 'Navigate to previous sibling file',
+			callback: () => {
+				this.navigateToSibling(-1);
+			},
+		});
+
+		// File explorer context menu for chaos items
+		this.registerEvent(this.app.workspace.on('file-menu', (menu, abstractFile) => {
+			const chaosPrefix = this.settings.chaosFolder + '/';
+			if (!abstractFile.path.startsWith(chaosPrefix)) return;
+
+			if (abstractFile instanceof TFolder) {
+				menu.addItem((item) => {
+					item.setTitle('Acknowledge all in folder')
+						.setIcon('check-circle')
+						.onClick(() => {
+							const files = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(abstractFile.path + '/'));
+							// Count untriaged files only
+							let untriagedCount = 0;
+							for (const f of files) {
+								const triage = this.app.metadataCache.getFileCache(f)?.frontmatter?.triage;
+								if (triage === undefined || triage === null || triage === '') {
+									untriagedCount++;
+								}
+							}
+							if (untriagedCount === 0) {
+								new Notice('No untriaged files in this folder');
+								return;
+							}
+							new ConfirmModal(
+								this.app,
+								`Acknowledge all files in ${abstractFile.path}?\n\nThis will mark ${untriagedCount} untriaged file${untriagedCount > 1 ? 's' : ''} as acknowledged. They will no longer appear in the triage queue.`,
+								'Acknowledge All',
+								async () => {
+									let count = 0;
+									for (const f of files) {
+										const triage = this.app.metadataCache.getFileCache(f)?.frontmatter?.triage;
+										if (triage === undefined || triage === null || triage === '') {
+											await this.app.fileManager.processFrontMatter(f, (fm) => {
+												fm.triage = 'acknowledged';
+											});
+											count++;
+										}
+									}
+									new Notice(`Acknowledged ${count} files`);
+									this.refreshChaosQueue();
+								}
+							).open();
+						});
+				});
+
+				menu.addItem((item) => {
+					item.setTitle('Move folder to death')
+						.setIcon('trash')
+						.onClick(() => {
+							const files = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(abstractFile.path + '/'));
+							new ConfirmModal(
+								this.app,
+								`Move ${abstractFile.path} to death?\n\nThis will move ${files.length} file${files.length > 1 ? 's' : ''} to ${this.settings.deathFolder}/${abstractFile.path}/. This can be undone by moving the files back manually.`,
+								'Move to Death',
+								async () => {
+									for (const f of files) {
+										await this.moveFileToDeath(f);
+									}
+									new Notice(`Moved ${files.length} files to death`);
+									this.refreshChaosQueue();
+								}
+							).open();
+						});
+				});
+			}
+
+			if (abstractFile instanceof TFile) {
+				menu.addItem((item) => {
+					item.setTitle('Acknowledge')
+						.setIcon('check')
+						.onClick(async () => {
+							await this.app.fileManager.processFrontMatter(abstractFile, (fm) => {
+								fm.triage = 'acknowledged';
+							});
+							new Notice(`Acknowledged: ${abstractFile.basename}`);
+							this.refreshChaosQueue();
+						});
+				});
+
+				menu.addItem((item) => {
+					item.setTitle('Mark as next up')
+						.setIcon('star')
+						.onClick(async () => {
+							await this.app.fileManager.processFrontMatter(abstractFile, (fm) => {
+								fm.triage = 'next';
+							});
+							new Notice(`Marked as next: ${abstractFile.basename}`);
+							this.refreshChaosQueue();
+						});
+				});
+
+				menu.addItem((item) => {
+					item.setTitle('Move to death')
+						.setIcon('trash')
+						.onClick(async () => {
+							const removedPath = abstractFile.path;
+							await this.moveFileToDeath(abstractFile);
+							new Notice(`Moved to death: ${abstractFile.basename}`);
+							await this.navigateAfterRemoval(removedPath);
+							this.refreshChaosQueue();
+						});
+				});
+			}
+		}));
 
 		// Add command to toggle contextual search mode
 		this.addCommand({
@@ -538,6 +758,227 @@ export default class WitnessPlugin extends Plugin {
 			const leaf = this.app.workspace.getRightLeaf(false);
 			if (leaf) {
 				await leaf.setViewState({ type: VIEW_TYPE_SEARCH, active: true });
+				this.app.workspace.revealLeaf(leaf);
+			}
+		}
+	}
+
+	/**
+	 * Get the chaos queue — all untriaged/pending chaos items, sorted by priority then date.
+	 * Used by both the Chaos Queue panel and the get_next_chaos MCP tool.
+	 */
+	getChaosQueue(options?: { path?: string; limit?: number }): ChaosQueueItem[] {
+		const defaultChaosPath = this.settings.chaosFolder ? `${this.settings.chaosFolder}/` : '1-chaos/';
+		const basePath = options?.path || defaultChaosPath;
+		const today = new Date().toISOString().slice(0, 10);
+
+		const allFiles = this.app.vault.getMarkdownFiles();
+		const chaosFiles = allFiles.filter(f => f.path.startsWith(basePath));
+
+		const items: ChaosQueueItem[] = [];
+		for (const file of chaosFiles) {
+			const cache = this.app.metadataCache.getFileCache(file);
+			const fm = cache?.frontmatter;
+			const triageValue = fm?.triage;
+
+			let priority: 'next' | 'normal' | null = null;
+
+			if (triageValue === undefined || triageValue === null || triageValue === '') {
+				priority = 'normal';
+			} else if (triageValue === 'next') {
+				priority = 'next';
+			} else if (typeof triageValue === 'string' && triageValue.startsWith('deferred ')) {
+				const deferDate = triageValue.replace('deferred ', '').trim();
+				if (deferDate <= today) {
+					priority = 'normal';
+				}
+			}
+			// Otherwise: processed (date), acknowledged — skip
+
+			if (priority === null) continue;
+
+			const dateStr = fm?.created || fm?.date || null;
+			const date = dateStr ? String(dateStr) : new Date(file.stat.mtime).toISOString().slice(0, 10);
+
+			// Extract snippet: first ~150 chars of body after frontmatter
+			let snippet = '';
+			const fmPos = cache?.frontmatterPosition;
+			if (fmPos) {
+				// We'll populate snippet lazily via async if needed, for now use empty
+				// The panel will call getSnippet() separately
+			}
+
+			items.push({
+				file,
+				path: file.path,
+				title: fm?.title || file.basename,
+				date,
+				snippet,
+				folder: file.path.substring(0, file.path.lastIndexOf('/')),
+				priority,
+			});
+		}
+
+		// Sort: next items first, then normal; within each group, newest first
+		items.sort((a, b) => {
+			if (a.priority !== b.priority) {
+				return a.priority === 'next' ? -1 : 1;
+			}
+			return b.date.localeCompare(a.date);
+		});
+
+		if (options?.limit) {
+			return items.slice(0, options.limit);
+		}
+		return items;
+	}
+
+	/**
+	 * Get total counts for the chaos queue.
+	 */
+	getChaosQueueCounts(options?: { path?: string }): { total: number; next: number; inPath: number } {
+		const allItems = this.getChaosQueue();
+		const pathItems = options?.path ? this.getChaosQueue({ path: options.path }) : allItems;
+		return {
+			total: allItems.length,
+			next: allItems.filter(i => i.priority === 'next').length,
+			inPath: pathItems.length,
+		};
+	}
+
+	/**
+	 * Get a text snippet for a file.
+	 * Priority: frontmatter summary/description → first ~150 chars of body with markdown stripped.
+	 */
+	async getFileSnippet(file: TFile, maxLength = 150): Promise<string> {
+		try {
+			const cache = this.app.metadataCache.getFileCache(file);
+			const fm = cache?.frontmatter;
+
+			// Prefer frontmatter summary or description
+			const fmSnippet = fm?.summary || fm?.description;
+			if (fmSnippet && typeof fmSnippet === 'string') {
+				return truncateAtWord(fmSnippet.trim(), maxLength);
+			}
+
+			const content = await this.app.vault.cachedRead(file);
+			const fmEnd = cache?.frontmatterPosition?.end;
+			let bodyStart = 0;
+			if (fmEnd) {
+				const lines = content.split('\n');
+				let charCount = 0;
+				for (let i = 0; i <= fmEnd.line && i < lines.length; i++) {
+					charCount += lines[i].length + 1;
+				}
+				bodyStart = charCount;
+			}
+			const body = content.substring(bodyStart).trim();
+			const plainText = stripMarkdown(body);
+			return truncateAtWord(plainText, maxLength);
+		} catch {
+			return '';
+		}
+	}
+
+	/**
+	 * Move a file to the death folder, preserving its full path.
+	 * e.g. 1-chaos/external/article.md → 4-death/1-chaos/external/article.md
+	 */
+	async moveFileToDeath(file: TFile): Promise<void> {
+		const deathPath = this.settings.deathFolder + '/' + file.path;
+		const parentDir = deathPath.substring(0, deathPath.lastIndexOf('/'));
+		await this.ensureFolderExists(parentDir);
+		await this.app.vault.rename(file, deathPath);
+	}
+
+	/**
+	 * Navigate to the next sibling file after a file has been removed.
+	 * Picks the next file down in the same folder, or previous if last, or closes the leaf.
+	 */
+	async navigateAfterRemoval(removedPath: string): Promise<void> {
+		const folderPath = removedPath.substring(0, removedPath.lastIndexOf('/'));
+		const folder = this.app.vault.getAbstractFileByPath(folderPath);
+		if (folder instanceof TFolder) {
+			const siblings = folder.children
+				.filter((f): f is TFile => f instanceof TFile && f.extension === 'md')
+				.sort((a, b) => a.name.localeCompare(b.name));
+			if (siblings.length > 0) {
+				// Find where the removed file would have been in the sorted list
+				const removedName = removedPath.substring(removedPath.lastIndexOf('/') + 1);
+				let idx = siblings.findIndex(f => f.name >= removedName);
+				if (idx === -1) idx = siblings.length - 1; // was last, go to new last
+				await this.app.workspace.getLeaf(false).openFile(siblings[idx]);
+				return;
+			}
+		}
+		// No siblings — close the active leaf
+		const leaf = this.app.workspace.getActiveViewOfType(ItemView)?.leaf
+			?? this.app.workspace.getMostRecentLeaf();
+		if (leaf) leaf.detach();
+	}
+
+	/**
+	 * Navigate to the next or previous sibling file in the same folder.
+	 * direction: 1 = next, -1 = previous
+	 */
+	async navigateToSibling(direction: 1 | -1): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		if (!file) return;
+		const folderPath = file.path.substring(0, file.path.lastIndexOf('/'));
+		const folder = this.app.vault.getAbstractFileByPath(folderPath);
+		if (!(folder instanceof TFolder)) return;
+		const siblings = folder.children
+			.filter((f): f is TFile => f instanceof TFile && f.extension === 'md')
+			.sort((a, b) => a.name.localeCompare(b.name));
+		const currentIdx = siblings.findIndex(f => f.path === file.path);
+		if (currentIdx === -1) return;
+		const nextIdx = currentIdx + direction;
+		if (nextIdx < 0 || nextIdx >= siblings.length) {
+			new Notice(direction === 1 ? 'Last file in folder' : 'First file in folder');
+			return;
+		}
+		await this.app.workspace.getLeaf(false).openFile(siblings[nextIdx]);
+	}
+
+	/**
+	 * Ensure a folder path exists, creating intermediate directories as needed.
+	 */
+	async ensureFolderExists(folderPath: string): Promise<void> {
+		if (this.app.vault.getAbstractFileByPath(folderPath)) return;
+		// Create parent first (recursive)
+		const parent = folderPath.substring(0, folderPath.lastIndexOf('/'));
+		if (parent && !this.app.vault.getAbstractFileByPath(parent)) {
+			await this.ensureFolderExists(parent);
+		}
+		try {
+			await this.app.vault.createFolder(folderPath);
+		} catch {
+			// Folder may have been created concurrently
+		}
+	}
+
+	/**
+	 * Refresh the chaos queue panel if it's open.
+	 */
+	refreshChaosQueue(): void {
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CHAOS_QUEUE);
+		if (leaves.length > 0) {
+			const view = leaves[0].view as WitnessChaosQueueView;
+			view.refreshQueue();
+		}
+	}
+
+	/**
+	 * Toggle the chaos queue panel open/closed in the right sidebar.
+	 */
+	async toggleChaosQueue(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_CHAOS_QUEUE);
+		if (existing.length > 0) {
+			existing[0].detach();
+		} else {
+			const leaf = this.app.workspace.getRightLeaf(false);
+			if (leaf) {
+				await leaf.setViewState({ type: VIEW_TYPE_CHAOS_QUEUE, active: true });
 				this.app.workspace.revealLeaf(leaf);
 			}
 		}
@@ -1937,7 +2378,7 @@ export default class WitnessPlugin extends Plugin {
 			'get_next_chaos',
 			'Get the next unprocessed chaos item for triage review. Returns full file content by default, or a list of pending items with metadata. ' +
 			'Filters out items already triaged (processed, acknowledged, or deferred with a future date). ' +
-			'Includes deferred items whose defer date has passed.',
+			'Includes deferred items whose defer date has passed. Items marked as "next" (high priority) appear first.',
 			{
 				path: z.string().optional().describe('Limit to a subfolder within the chaos folder. Defaults to the configured chaos folder path.'),
 				list: z.boolean().optional().describe('When true, return a list of all pending items with metadata instead of the next single item with full content.'),
@@ -1948,99 +2389,45 @@ export default class WitnessPlugin extends Plugin {
 			async ({ path: chaosPath, list }) => {
 				const defaultChaosPath = this.settings.chaosFolder ? `${this.settings.chaosFolder}/` : '1-chaos/';
 				this.logger.mcp(`get_next_chaos called: path=${chaosPath || defaultChaosPath}, list=${!!list}`);
-				const basePath = chaosPath || defaultChaosPath;
-				const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
-				// Get all markdown files under the chaos path
-				const allFiles = this.app.vault.getMarkdownFiles();
-				const chaosFiles = allFiles.filter(f => f.path.startsWith(basePath));
+				const items = this.getChaosQueue({ path: chaosPath || undefined });
+				const counts = this.getChaosQueueCounts({ path: chaosPath || undefined });
+				const queue = { total: counts.total, next: counts.next, in_path: counts.inPath };
 
-				if (chaosFiles.length === 0) {
+				if (items.length === 0) {
 					return {
-						content: [{ type: 'text', text: JSON.stringify({ items: [], queue: { total: 0, in_path: 0 }, message: `No markdown files found in ${basePath}` }) }],
-						isError: false,
-					};
-				}
-
-				// Filter to untriaged items
-				const pending: { file: TFile; date: string | null; frontmatter: Record<string, any> }[] = [];
-				for (const file of chaosFiles) {
-					const cache = this.app.metadataCache.getFileCache(file);
-					const fm = cache?.frontmatter;
-					const triageValue = fm?.triage;
-
-					// Debug: log triage values to diagnose cache issues
-					if (triageValue !== undefined && triageValue !== null && triageValue !== '') {
-						this.logger.debug(`get_next_chaos: ${file.path} triage=${JSON.stringify(triageValue)} (type=${typeof triageValue})`);
-					}
-
-					if (triageValue === undefined || triageValue === null || triageValue === '') {
-						// No triage field — untriaged
-						const dateStr = fm?.created || fm?.date || null;
-						pending.push({ file, date: dateStr ? String(dateStr) : null, frontmatter: fm ? { ...fm } : {} });
-					} else if (typeof triageValue === 'string' && triageValue.startsWith('deferred ')) {
-						// Deferred — check if defer date has passed
-						const deferDate = triageValue.replace('deferred ', '').trim();
-						if (deferDate <= today) {
-							const dateStr = fm?.created || fm?.date || null;
-							pending.push({ file, date: dateStr ? String(dateStr) : null, frontmatter: fm ? { ...fm } : {} });
-						}
-					}
-					// Otherwise: processed (date), acknowledged — skip
-				}
-
-				// Sort by date descending (newest first), falling back to mtime
-				pending.sort((a, b) => {
-					const dateA = a.date || new Date(a.file.stat.mtime).toISOString().slice(0, 10);
-					const dateB = b.date || new Date(b.file.stat.mtime).toISOString().slice(0, 10);
-					return dateB.localeCompare(dateA);
-				});
-
-				// Count total untriaged across all chaos
-				const allChaosFiles = allFiles.filter(f => f.path.startsWith(defaultChaosPath));
-				let totalPending = 0;
-				for (const file of allChaosFiles) {
-					const cache = this.app.metadataCache.getFileCache(file);
-					const triageValue = cache?.frontmatter?.triage;
-					if (triageValue === undefined || triageValue === null || triageValue === '') {
-						totalPending++;
-					} else if (typeof triageValue === 'string' && triageValue.startsWith('deferred ') && triageValue.replace('deferred ', '').trim() <= today) {
-						totalPending++;
-					}
-				}
-
-				const queue = { total: totalPending, in_path: pending.length };
-
-				if (pending.length === 0) {
-					return {
-						content: [{ type: 'text', text: JSON.stringify({ items: [], queue, message: `No untriaged items in ${basePath}` }) }],
+						content: [{ type: 'text', text: JSON.stringify({ items: [], queue, message: `No untriaged items in ${chaosPath || defaultChaosPath}` }) }],
 						isError: false,
 					};
 				}
 
 				if (list) {
-					// List mode — compact: path, title, date only, max 10 items
-					const items = pending.slice(0, 10).map(p => ({
-						path: p.file.path,
-						title: p.frontmatter.title || p.file.basename,
-						date: p.date,
+					// List mode — compact: path, title, date, priority, max 10 items
+					const listItems = items.slice(0, 10).map(item => ({
+						path: item.path,
+						title: item.title,
+						date: item.date,
+						priority: item.priority,
 					}));
 					return {
-						content: [{ type: 'text', text: JSON.stringify({ items, queue }) }],
+						content: [{ type: 'text', text: JSON.stringify({ items: listItems, queue }) }],
 						isError: false,
 					};
 				} else {
 					// Single mode — return full content of next item
-					const next = pending[0];
+					const next = items[0];
 					const fileContent = await this.app.vault.read(next.file);
-					const { position, ...fm } = next.frontmatter;
+					const cache = this.app.metadataCache.getFileCache(next.file);
+					const fm = cache?.frontmatter;
+					const frontmatter = fm ? (() => { const { position, ...rest } = fm; return Object.keys(rest).length > 0 ? rest : undefined; })() : undefined;
 					return {
 						content: [{
 							type: 'text',
 							text: JSON.stringify({
-								path: next.file.path,
+								path: next.path,
 								content: fileContent,
-								frontmatter: Object.keys(fm).length > 0 ? fm : undefined,
+								frontmatter,
+								priority: next.priority,
 								queue,
 							}, null, 2),
 						}],
@@ -2055,10 +2442,11 @@ export default class WitnessPlugin extends Plugin {
 			'mark_triage',
 			'Record a triage decision for a chaos item. Sets the triage frontmatter field — no need to manually parse or edit YAML. ' +
 			'Actions: "processed" (knowledge extracted, marks with today\'s date), "deferred" (come back later, requires defer_until date), ' +
-			'"acknowledged" (reviewed, no action needed).',
+			'"acknowledged" (reviewed, no action needed), "next" (flag as high priority for processing next), ' +
+			'"reset" (remove triage field entirely, putting item back in the untriaged queue).',
 			{
 				path: z.string().describe('Path to the chaos file to triage'),
-				action: z.enum(['processed', 'deferred', 'acknowledged']).describe('Triage action: processed, deferred, or acknowledged'),
+				action: z.enum(['processed', 'deferred', 'acknowledged', 'next', 'reset']).describe('Triage action: processed, deferred, acknowledged, next, or reset'),
 				defer_until: z.string().optional().describe('Required for "deferred" action. Date string YYYY-MM-DD for when to resurface the item.'),
 			},
 			{
@@ -2077,11 +2465,15 @@ export default class WitnessPlugin extends Plugin {
 				}
 
 				// Determine triage value
-				let triageValue: string;
+				let triageValue: string | null;
 				if (action === 'processed') {
 					triageValue = new Date().toISOString().slice(0, 10); // Today's date
 				} else if (action === 'deferred') {
 					triageValue = `deferred ${defer_until}`;
+				} else if (action === 'next') {
+					triageValue = 'next';
+				} else if (action === 'reset') {
+					triageValue = null; // Will delete the field
 				} else {
 					triageValue = 'acknowledged';
 				}
@@ -2105,7 +2497,11 @@ export default class WitnessPlugin extends Plugin {
 				this.logger.mcp(`mark_triage: about to call processFrontMatter on ${filePath} with triage=${triageValue}`);
 				await this.app.fileManager.processFrontMatter(file, (fm) => {
 					this.logger.mcp(`mark_triage: inside callback, fm.triage BEFORE=${JSON.stringify(fm.triage)}, setting to ${triageValue}`);
-					fm.triage = triageValue;
+					if (triageValue === null) {
+						delete fm.triage;
+					} else {
+						fm.triage = triageValue;
+					}
 					this.logger.mcp(`mark_triage: inside callback, fm.triage AFTER=${JSON.stringify(fm.triage)}`);
 				});
 
@@ -2124,13 +2520,16 @@ export default class WitnessPlugin extends Plugin {
 				const cachedTriage = verifyCache?.frontmatter?.triage;
 				this.logger.mcp(`mark_triage: cache verification — triage=${JSON.stringify(cachedTriage)} (type=${typeof cachedTriage})`);
 
+				// Refresh chaos queue panel if open
+				this.refreshChaosQueue();
+
 				return {
 					content: [{
 						type: 'text',
 						text: JSON.stringify({
 							path: filePath,
 							action,
-							triage: triageValue,
+							triage: triageValue ?? '(removed)',
 						}),
 					}],
 					isError: false,
@@ -2981,7 +3380,7 @@ class WitnessSettingTab extends PluginSettingTab {
 		const header = containerEl.createDiv({cls: 'witness-tab-header'});
 		const tabs: {id: WitnessTab; label: string}[] = [
 			{id: 'server', label: 'Server'},
-			{id: 'commands', label: 'Custom Commands'},
+			{id: 'commands', label: 'Commands'},
 			{id: 'remote', label: 'Remote Access'},
 			{id: 'search', label: 'Semantic Search'},
 		];
@@ -3011,6 +3410,48 @@ class WitnessSettingTab extends PluginSettingTab {
 
 		// Show active pane
 		panes[this.activeTab].addClass('witness-tab-visible');
+	}
+
+	private formatHotkey(assigned: any[] | undefined): string {
+		if (!assigned?.length) return 'Not set';
+		return assigned.map((h: any) => {
+			const parts: string[] = [];
+			if (h.modifiers?.includes('Mod')) parts.push('Cmd');
+			if (h.modifiers?.includes('Shift')) parts.push('Shift');
+			if (h.modifiers?.includes('Alt')) parts.push('Alt');
+			if (h.modifiers?.includes('Ctrl')) parts.push('Ctrl');
+			parts.push(h.key?.length === 1 ? h.key.toUpperCase() : h.key || '?');
+			return parts.join('+');
+		}).join(', ');
+	}
+
+	/**
+	 * Check if a hotkey combo is already assigned to another command.
+	 * Returns the conflicting command name, or null if no conflict.
+	 */
+	private findHotkeyConflict(hm: any, modifiers: string[], key: string, excludeCommandId: string): string | null {
+		const allCommands = (this.app as any).commands?.commands || {};
+		const sources: Record<string, any[]> = { ...hm.defaultKeys, ...hm.customKeys };
+
+		const matchesHotkey = (h: any) => {
+			if (h.key !== key) return false;
+			const hMods = (h.modifiers || []).sort().join('+');
+			const inputMods = [...modifiers].sort().join('+');
+			return hMods === inputMods;
+		};
+
+		for (const [cmdId, keys] of Object.entries(sources)) {
+			if (cmdId === excludeCommandId) continue;
+			if (!Array.isArray(keys)) continue;
+			for (const h of keys) {
+				if (matchesHotkey(h)) {
+					// Return a friendly name
+					const cmdObj = allCommands[cmdId];
+					return cmdObj?.name || cmdId;
+				}
+			}
+		}
+		return null;
 	}
 
 	// ===== SERVER TAB =====
@@ -3116,8 +3557,154 @@ class WitnessSettingTab extends PluginSettingTab {
 		}
 	}
 
-	// ===== CUSTOM COMMANDS TAB =====
+	// ===== COMMANDS TAB =====
 	private renderCommandsTab(pane: HTMLElement): void {
+		// --- Keyboard Shortcuts section ---
+		const kbGroup = new SettingGroup(pane).setHeading('Keyboard Shortcuts');
+
+		const commands: { id: string; name: string; desc: string }[] = [
+			{ id: 'witness:toggle-search-panel', name: 'Toggle search panel', desc: 'Open/close the Witness Search sidebar' },
+			{ id: 'witness:toggle-chaos-queue', name: 'Toggle chaos queue', desc: 'Open/close the Chaos Queue sidebar' },
+			{ id: 'witness:acknowledge-current-file', name: 'Acknowledge current file', desc: 'Set triage: acknowledged on active chaos file' },
+			{ id: 'witness:mark-next-current-file', name: 'Mark as next up', desc: 'Set triage: next on active chaos file' },
+			{ id: 'witness:move-current-to-death', name: 'Move to death', desc: 'Move active chaos file to death folder' },
+			{ id: 'witness:reset-current-file', name: 'Reset triage', desc: 'Remove triage status from active chaos file' },
+			{ id: 'witness:next-sibling-file', name: 'Next sibling file', desc: 'Navigate to the next file in the same folder' },
+			{ id: 'witness:prev-sibling-file', name: 'Previous sibling file', desc: 'Navigate to the previous file in the same folder' },
+			{ id: 'witness:toggle-contextual-search', name: 'Toggle contextual search', desc: 'Auto-search based on editor context' },
+			{ id: 'witness:reindex-vault', name: 'Reindex vault', desc: 'Trigger a full re-index of the vault' },
+		];
+
+		const hm = (this.app as any).hotkeyManager;
+		const customKeys = hm?.customKeys || {};
+		const defaultKeys = hm?.defaultKeys || {};
+
+		for (const cmd of commands) {
+			kbGroup.addSetting(s => {
+				const descFragment = createFragment(frag => {
+					frag.appendText(cmd.desc);
+					frag.createEl('br');
+					const code = frag.createEl('code', { cls: 'witness-command-id' });
+					code.textContent = cmd.id;
+				});
+
+				s.setName(cmd.name)
+				 .setDesc(descFragment);
+
+				// Hotkey capture tag
+				const isCustom = !!customKeys[cmd.id];
+				const assigned = customKeys[cmd.id] || defaultKeys[cmd.id];
+				const hotkeyRow = s.controlEl.createDiv({ cls: 'witness-hotkey-row' });
+				const tag = hotkeyRow.createEl('button', { cls: 'witness-hotkey-tag' });
+				tag.textContent = this.formatHotkey(assigned);
+				if (!assigned?.length) tag.addClass('is-empty');
+
+				// Cancel button — hidden by default, shown during capture
+				const cancelBtn = hotkeyRow.createEl('button', { cls: 'witness-hotkey-cancel', attr: { 'aria-label': 'Cancel' } });
+				setIcon(cancelBtn, 'x');
+				cancelBtn.style.display = 'none';
+
+				let capturing = false;
+				let keydownHandler: ((e: KeyboardEvent) => void) | null = null;
+
+				const startCapture = () => {
+					if (capturing) return;
+					capturing = true;
+					tag.textContent = 'Press shortcut…';
+					tag.addClass('is-capturing');
+					cancelBtn.style.display = '';
+
+					keydownHandler = (e: KeyboardEvent) => {
+						// Ignore bare modifier keys
+						if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+
+						e.preventDefault();
+						e.stopPropagation();
+
+						if (e.key === 'Escape') {
+							stopCapture();
+							return;
+						}
+
+						// Backspace/Delete clears the binding
+						if (e.key === 'Backspace' || e.key === 'Delete') {
+							hm.setHotkeys(cmd.id, []);
+							hm.save();
+							stopCapture();
+							this.display();
+							return;
+						}
+
+						// Build modifiers array (Obsidian convention)
+						// Mod = Cmd (Mac) / Ctrl (Win/Linux), Ctrl = Control key on Mac
+						const isMac = navigator.platform.startsWith('Mac');
+						const modifiers: string[] = [];
+						if (isMac) {
+							if (e.metaKey) modifiers.push('Mod');
+							if (e.ctrlKey) modifiers.push('Ctrl');
+						} else {
+							if (e.ctrlKey) modifiers.push('Mod');
+						}
+						if (e.shiftKey) modifiers.push('Shift');
+						if (e.altKey) modifiers.push('Alt');
+
+						const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+						const hotkey = [{ modifiers, key }];
+						const hotkeyDisplay = this.formatHotkey(hotkey);
+
+						// Warn about conflicts but allow override (matches Obsidian's default behaviour)
+						const conflict = this.findHotkeyConflict(hm, modifiers, key, cmd.id);
+						if (conflict) {
+							new Notice(`${hotkeyDisplay} conflicts with "${conflict}" — overriding`);
+						}
+
+						hm.setHotkeys(cmd.id, hotkey);
+						hm.save();
+
+						stopCapture();
+						this.display();
+					};
+
+					document.addEventListener('keydown', keydownHandler, { capture: true });
+				};
+
+				const stopCapture = () => {
+					capturing = false;
+					tag.removeClass('is-capturing');
+					tag.textContent = this.formatHotkey(customKeys[cmd.id] || defaultKeys[cmd.id]);
+					if (!assigned?.length) tag.addClass('is-empty');
+					cancelBtn.style.display = 'none';
+					if (keydownHandler) {
+						document.removeEventListener('keydown', keydownHandler, { capture: true });
+						keydownHandler = null;
+					}
+				};
+
+				tag.addEventListener('click', startCapture);
+				cancelBtn.addEventListener('click', (e) => {
+					e.stopPropagation();
+					stopCapture();
+				});
+
+				// Clear button — show when there's any binding (custom or default)
+				const hasBinding = assigned?.length > 0;
+				if (hasBinding) {
+					s.addExtraButton(btn => btn
+						.setIcon('x')
+						.setTooltip('Clear shortcut')
+						.onClick(() => {
+							// Set empty array to override default with nothing
+							hm.setHotkeys(cmd.id, []);
+							hm.save();
+							this.display();
+						}));
+				}
+			});
+		}
+
+		// --- MCP Custom Commands section ---
+		new SettingGroup(pane).setHeading('MCP Custom Commands');
+
 		pane.createEl('p', {
 			text: 'Expose specific Obsidian commands as MCP tools with custom names and descriptions.',
 			cls: 'setting-item-description'
